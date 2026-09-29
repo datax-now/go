@@ -95,8 +95,9 @@ responses. Stable runtime URLs are not marked immutable.
 
 The service worker leaves cross-origin requests (including Google Fonts) to the
 browser and does not cache unsuccessful same-origin responses. On Read the Docs,
-it retries challenged web-manifest requests from the Vercel mirror and retries
-fingerprinted kernel runtime assets there with their SHA-256 integrity checks.
+it retries challenged web-manifest requests from the GitHub Pages mirror and
+retries fingerprinted kernel runtime assets there with their SHA-256 integrity
+checks.
 A cached asset can still be served while background revalidation fails; the host
 must recover before uncached requests can succeed.
 
@@ -128,23 +129,22 @@ A background runtime fetch cannot complete an interactive HTML challenge.
 
 For a 429, Cloudflare challenge, or browser-level network failure from a
 `*.readthedocs.io` URL, the service worker retries fingerprinted files under
-`/xeus/` from the Vercel mirror at `https://datax.now`. These requests use CORS
+`/xeus/` from the GitHub Pages mirror at `https://datax-now.github.io/go/`. These requests use CORS
 without credentials and are integrity-checked against the SHA-256 recorded in
 the mirror's `deployment.json` (builds on different hosts embed their own
 paths and repack timestamps, so the bytes of a file differ between hosts; the
 build's own digest is used only if the mirror manifest is unavailable). It also
-retries `/manifest.webmanifest` from the mirror; that optional metadata request
+retries `manifest.webmanifest` from the mirror; that optional metadata request
 does not gate kernel startup. Other resources and other 429 responses are not
-retried. The client network must permit access to `datax.now`; this fallback
+retried. The client network must permit access to `datax-now.github.io`; this fallback
 does not remove the hosting provider's protection.
-The selected Vercel deployment must include CORS headers for `/xeus/`,
-`/deployment.json` and the web manifest, and must contain the same runtime
-package filenames (a package version that floated between builds is missing on
-the mirror). For a staged deployment, set
-`DATAX_RUNTIME_MIRROR_ORIGIN` at build time to its origin until that deployment
-list the same package filenames before promotion
-`scripts/deployment-manifest.mjs verify` to confirm the RTD and mirror builds
-match before promotion; SRI intentionally rejects archives from a stale mirror.
+The Pages mirror must include CORS headers for `/go/xeus/`,
+`/go/deployment.json` and `/go/manifest.webmanifest`, and must contain the same
+runtime package filenames (a package version that floated between builds is
+missing on the mirror). Set `DATAX_RUNTIME_MIRROR_ORIGIN` at build time to
+override the mirror base URL. Use `scripts/deployment-manifest.mjs verify` to
+confirm the RTD and mirror builds match before promotion; SRI intentionally
+rejects archives from a stale mirror.
 
 URL-alias retries remain disabled for 429 responses, Cloudflare challenges,
 server errors, and network/integrity failures. Only ordinary 403/404 responses

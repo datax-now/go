@@ -2,16 +2,17 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-function installRuntimeCache(hashes, mirrorOrigin = 'https://datax.now') {
+function installRuntimeCache(hashes, mirrorOrigin = 'https://datax-now.github.io/go/') {
   const original = maybeFromCache;
   const scope = new URL('./', self.location.href);
+  const mirrorBase = new URL(mirrorOrigin.endsWith('/') ? mirrorOrigin : `${mirrorOrigin}/`);
   const enabled = new URL(self.location.href).searchParams.get('enableCache') === 'true';
   const cacheName = 'datax-runtime-sha256-v2';
   const pending = new Map();
   let mirrorFiles;
   // Builds on different hosts embed their own paths in runtime files, so bytes differ between hosts.
   function loadMirrorFiles() {
-    mirrorFiles ??= fetch(new Request(new URL('/deployment.json', mirrorOrigin).href, {
+    mirrorFiles ??= fetch(new Request(new URL('deployment.json', mirrorBase).href, {
       mode: 'cors', credentials: 'omit', cache: 'no-cache',
     })).then(response => response.ok ? response.json() : null)
       .then(manifest => manifest?.files ?? null)
@@ -35,7 +36,7 @@ function installRuntimeCache(hashes, mirrorOrigin = 'https://datax.now') {
       ? runtimePath[1]
       : isManifest ? '/manifest.webmanifest' : null;
     if (!isReadTheDocs || !mirrorPath) return fetchOriginal();
-    const mirrorUrl = new URL(mirrorPath, mirrorOrigin);
+    const mirrorUrl = new URL(mirrorPath.slice(1), mirrorBase);
     mirrorUrl.search = url.search;
     let response;
     try {
@@ -109,7 +110,7 @@ function installRuntimeCache(hashes, mirrorOrigin = 'https://datax.now') {
   };
 }
 
-function fingerprintRuntime(directory, mirrorOrigin = 'https://datax.now') {
+function fingerprintRuntime(directory, mirrorOrigin = 'https://datax-now.github.io/go/') {
   const runtime = path.join(directory, 'xeus');
   const worker = path.join(directory, 'service-worker.js');
   const marker = '\n;/* datax-runtime-fingerprints */\n';
@@ -134,5 +135,5 @@ function fingerprintRuntime(directory, mirrorOrigin = 'https://datax.now') {
 
 module.exports = { fingerprintRuntime, installRuntimeCache };
 if (require.main === module) {
-  fingerprintRuntime(process.argv[2] || 'dist', process.env.DATAX_RUNTIME_MIRROR_ORIGIN || 'https://datax.now');
+  fingerprintRuntime(process.argv[2] || 'dist', process.env.DATAX_RUNTIME_MIRROR_ORIGIN || 'https://datax-now.github.io/go/');
 }

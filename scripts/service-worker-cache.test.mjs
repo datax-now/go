@@ -257,10 +257,10 @@ test("RTD challenges retry fingerprinted runtime assets and the web manifest", a
         if (failRtdRequest) throw new TypeError("Failed to fetch");
         return new Response("RTD rate limit", { status: 429 });
       }
-      if (new URL(request.url).pathname === "/manifest.webmanifest") {
+      if (new URL(request.url).pathname === "/go/manifest.webmanifest") {
         return new Response('{"name":"DataX.now"}', { status: 200 });
       }
-      if (new URL(request.url).pathname === "/deployment.json") {
+      if (new URL(request.url).pathname === "/go/deployment.json") {
         return new Response(JSON.stringify({ files: { [packagePath]: { sha256: mirrorPackageHash } } }));
       }
       const body = request.url.endsWith(packagePath) ? "mirror build package" : "verified package";
@@ -272,7 +272,7 @@ test("RTD challenges retry fingerprinted runtime assets and the web manifest", a
   vm.runInContext("maybeFromCache = async event => fetch(event.request)", context);
   context.self = context;
   context.hashes = { [packagePath]: packageHash, [runtimePath]: packageHash };
-  vm.runInContext(`(${fingerprints.installRuntimeCache.toString()})(hashes, "https://datax.now")`, context);
+  vm.runInContext(`(${fingerprints.installRuntimeCache.toString()})(hashes, "https://datax-now.github.io/go/")`, context);
 
   const response = await context.maybeFromCache({ request: new Request(
     `https://datax-now.readthedocs.io/en/latest/_static/${packagePath}`,
@@ -284,9 +284,9 @@ test("RTD challenges retry fingerprinted runtime assets and the web manifest", a
   assert.equal(response.status, 200);
   assert.equal(await response.text(), "mirror build package");
   assert.equal(requests.length, 3);
-  assert.equal(new URL(requests[1].url).href, "https://datax.now/deployment.json");
+  assert.equal(new URL(requests[1].url).href, "https://datax-now.github.io/go/deployment.json");
   assert.equal(new URL(requests[2].url).href,
-    "https://datax.now/xeus/xeus-python-wasm-host/kernel_packages/openssl-4.0.2-hb2bca66_0.tar.gz");
+    "https://datax-now.github.io/go/xeus/xeus-python-wasm-host/kernel_packages/openssl-4.0.2-hb2bca66_0.tar.gz");
   assert.equal(requests[2].mode, "cors");
   assert.equal(requests[2].credentials, "omit");
   assert.equal(requests[2].headers.has("Authorization"), false);
@@ -298,7 +298,7 @@ test("RTD challenges retry fingerprinted runtime assets and the web manifest", a
   });
   assert.equal(manifest.status, 200);
   assert.equal(await manifest.text(), '{"name":"DataX.now"}');
-  assert.equal(new URL(requests[4].url).href, "https://datax.now/manifest.webmanifest");
+  assert.equal(new URL(requests[4].url).href, "https://datax-now.github.io/go/manifest.webmanifest");
   assert.equal(requests[4].credentials, "omit");
   assert.equal(requests[4].integrity, "", "manifest fallback does not claim runtime integrity");
 
@@ -309,7 +309,7 @@ test("RTD challenges retry fingerprinted runtime assets and the web manifest", a
     waitUntil() {},
   });
   assert.equal(runtime.status, 200);
-  assert.equal(new URL(requests[6].url).href, "https://datax.now/xeus/xeus-python-wasm-host/xpython.wasm");
+  assert.equal(new URL(requests[6].url).href, "https://datax-now.github.io/go/xeus/xeus-python-wasm-host/xpython.wasm");
   assert.equal(requests[6].integrity, packageIntegrity, "runtime mirror response remains integrity-checked");
 
   const unrelated = await context.maybeFromCache({
@@ -328,21 +328,9 @@ test("RTD challenges retry fingerprinted runtime assets and the web manifest", a
   });
   assert.equal(failedNetworkRequest.status, 200);
   assert.equal(requests.length, 10, "a rejected RTD fetch should retry once on the mirror");
-  assert.equal(new URL(requests[9].url).origin, "https://datax.now");
-
-  const vercel = JSON.parse(readFileSync(new URL("vercel.json", root), "utf8"));
-  assert.ok(vercel.headers.some(({ source, headers }) =>
-    source === "/xeus/(.*)" &&
-    headers.some(({ key, value }) => key === "Access-Control-Allow-Origin" && value === "*"),
-  ));
-  assert.ok(vercel.headers.some(({ source, headers }) =>
-    source === "/manifest.webmanifest" &&
-    headers.some(({ key, value }) => key === "Access-Control-Allow-Origin" && value === "*"),
-  ));
-  assert.ok(vercel.headers.some(({ source, headers }) =>
-    source === "/deployment.json" &&
-    headers.some(({ key, value }) => key === "Access-Control-Allow-Origin" && value === "*"),
-  ));
+  assert.equal(new URL(requests[9].url).origin, "https://datax-now.github.io");
+  assert.equal(new URL(requests[9].url).pathname,
+    "/go/xeus/xeus-python-wasm-host/kernel_packages/openssl-4.0.2-hb2bca66_0.tar.gz");
 });
 
 test("range requests bypass both runtime and upstream caches", async () => {
