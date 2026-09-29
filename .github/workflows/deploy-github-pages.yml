@@ -43,6 +43,21 @@ jobs:
           commit="$(jq -er '.commit' dist/deployment.json)"
           echo "commit=${commit}" >> "$GITHUB_OUTPUT"
 
+      - name: Check the site size against the GitHub Pages limit
+        shell: bash
+        run: |
+          set -euo pipefail
+          limit=1073741824
+          bytes="$(find dist -type f -printf '%s\n' | awk '{ total += $1 } END { print total + 0 }')"
+          echo "dist is ${bytes} of ${limit} bytes"
+          if [ "$bytes" -gt "$limit" ]; then
+            echo "::error::dist exceeds the 1 GB GitHub Pages site limit; the deployment would be rejected"
+            exit 1
+          fi
+          if [ "$bytes" -gt $((limit / 100 * 95)) ]; then
+            echo "::warning::dist uses over 95% of the 1 GB GitHub Pages limit (${bytes} bytes)"
+          fi
+
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
 

@@ -2,65 +2,95 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-function installRuntimeCache(hashes, mirrorOrigin = 'https://datax-now.github.io/go/') {
+// Ordered by priority: a host later in the list is only tried after every earlier one failed.
+const DEFAULT_MIRROR_ORIGINS = [
+  'https://datax-now.readthedocs.io/en/latest/_static/',
+  'https://datax-now.github.io/go/',
+  'https://datax.now/',
+  'https://datax-now.pages.dev/',
+];
+
+function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null) {
   const original = maybeFromCache;
   const scope = new URL('./', self.location.href);
-  const mirrorBase = new URL(mirrorOrigin.endsWith('/') ? mirrorOrigin : `${mirrorOrigin}/`);
+  const mirrors = [].concat(mirrorOrigins || []).filter(Boolean)
+    .map(origin => new URL(origin.endsWith('/') ? origin : `${origin}/`));
   const enabled = new URL(self.location.href).searchParams.get('enableCache') === 'true';
   const cacheName = 'datax-runtime-sha256-v2';
   const pending = new Map();
-  let mirrorFiles;
+  const manifests = new Map();
+  const coolingUntil = new Map();
+  const cooldownMs = 60000;
+  const integrityOf = hex => 'sha256-' + btoa(String.fromCharCode(...hex.match(/../g).map(byte => parseInt(byte, 16))));
+  const isCooling = origin => (coolingUntil.get(origin) ?? 0) > Date.now();
+  const cool = origin => coolingUntil.set(origin, Date.now() + cooldownMs);
+  const isBlocked = response => [429, 502, 503, 504].includes(response.status)
+    || response.headers.get('cf-mitigated') === 'challenge';
   // Builds on different hosts embed their own paths in runtime files, so bytes differ between hosts.
-  function loadMirrorFiles() {
-    mirrorFiles ??= fetch(new Request(new URL('deployment.json', mirrorBase).href, {
-      mode: 'cors', credentials: 'omit', cache: 'no-cache',
-    })).then(response => response.ok ? response.json() : null)
-      .then(manifest => manifest?.files ?? null)
-      .catch(() => null)
-      .then(files => { if (!files) mirrorFiles = undefined; return files; });
-    return mirrorFiles;
+  function loadMirrorManifest(base) {
+    if (!manifests.has(base.href)) {
+      manifests.set(base.href, fetch(new Request(new URL('deployment.json', base).href, {
+        mode: 'cors', credentials: 'omit', cache: 'no-cache',
+      })).then(response => response.ok ? response.json() : null)
+        .catch(() => null)
+        .then(manifest => { if (!manifest?.files) manifests.delete(base.href); return manifest?.files ? manifest : null; }));
+    }
+    return manifests.get(base.href);
   }
-  async function fetchReadTheDocsAssetWithMirror(request, fetchOriginal) {
-    if (!mirrorOrigin || request.method !== 'GET' || request.headers.has('Range')) {
+  async function fetchWithMirrors(request, fetchOriginal) {
+    if (!mirrors.length || request.method !== 'GET' || request.headers.has('Range')) {
       return fetchOriginal();
     }
     const url = new URL(request.url);
     const runtimePath = url.pathname.match(/(\/xeus\/.+)$/);
     const runtimeHash = runtimePath && hashes[runtimePath[1].slice(1)];
-    const runtimeIntegrity = runtimeHash
-      ? 'sha256-' + btoa(String.fromCharCode(...runtimeHash.match(/../g).map(byte => parseInt(byte, 16))))
-      : null;
     const isManifest = url.pathname.endsWith('/manifest.webmanifest');
-    const isReadTheDocs = url.hostname === 'readthedocs.io' || url.hostname.endsWith('.readthedocs.io');
-    const mirrorPath = runtimePath && runtimeIntegrity
+    const isDeployment = url.hostname === 'readthedocs.io' || url.hostname.endsWith('.readthedocs.io')
+      || mirrors.some(base => base.origin === url.origin);
+    const mirrorPath = runtimeHash
       ? runtimePath[1]
       : isManifest ? '/manifest.webmanifest' : null;
-    if (!isReadTheDocs || !mirrorPath) return fetchOriginal();
-    const mirrorUrl = new URL(mirrorPath.slice(1), mirrorBase);
-    mirrorUrl.search = url.search;
-    let response;
-    try {
-      response = await fetchOriginal();
-      if (response.status !== 429 && response.headers.get('cf-mitigated') !== 'challenge') return response;
-    } catch (error) {
-      if (error?.name !== 'TypeError') throw error;
+    if (!isDeployment || !mirrorPath) return fetchOriginal();
+    let failedResponse = null;
+    let failedError = null;
+    if (!isCooling(url.origin)) {
+      try {
+        const response = await fetchOriginal();
+        if (!isBlocked(response)) return response;
+        failedResponse = response;
+      } catch (error) {
+        if (error?.name !== 'TypeError') throw error;
+        failedError = error;
+      }
+      cool(url.origin);
     }
-    const mirrorRequest = {
-      method: 'GET',
-      mode: 'cors',
-      credentials: 'omit',
-      cache: 'no-cache',
-    };
-    if (runtimeIntegrity) {
-      const mirrorHash = (await loadMirrorFiles())?.[decodeURIComponent(runtimePath[1].slice(1))]?.sha256;
-      mirrorRequest.integrity = mirrorHash
-        ? 'sha256-' + btoa(String.fromCharCode(...mirrorHash.match(/../g).map(byte => parseInt(byte, 16))))
-        : runtimeIntegrity;
+    for (const base of mirrors) {
+      if (base.origin === url.origin || isCooling(base.origin)) continue;
+      const mirrorUrl = new URL(mirrorPath.slice(1), base);
+      mirrorUrl.search = url.search;
+      const mirrorRequest = { method: 'GET', mode: 'cors', credentials: 'omit', cache: 'no-cache' };
+      if (runtimeHash) {
+        const manifest = await loadMirrorManifest(base);
+        // A mirror still serving another release would mix runtime files from two builds.
+        if (manifest && buildCommit && manifest.commit !== buildCommit) continue;
+        const mirrorHash = manifest?.files[decodeURIComponent(runtimePath[1].slice(1))]?.sha256;
+        mirrorRequest.integrity = integrityOf(mirrorHash ?? runtimeHash);
+      }
+      try {
+        const response = await fetch(new Request(mirrorUrl.href, mirrorRequest));
+        if (response.ok) return response;
+        if (isBlocked(response)) cool(base.origin);
+      } catch (error) {
+        if (error?.name !== 'TypeError') throw error;
+        cool(base.origin);
+      }
     }
-    return fetch(new Request(mirrorUrl.href, mirrorRequest));
+    if (failedResponse) return failedResponse;
+    if (failedError) throw failedError;
+    return fetchOriginal();
   }
   async function fetchRuntime(request) {
-    return fetchReadTheDocsAssetWithMirror(request, () => fetch(request));
+    return fetchWithMirrors(request, () => fetch(request));
   }
   maybeFromCache = async function(event) {
     const request = event.request;
@@ -70,7 +100,7 @@ function installRuntimeCache(hashes, mirrorOrigin = 'https://datax-now.github.io
       ? hashes[relative] : null;
     if (request.headers.has('Range')) return fetch(request);
     if (!hash || request.method !== 'GET' || !enabled) {
-      const response = fetchReadTheDocsAssetWithMirror(request, () => original(event));
+      const response = fetchWithMirrors(request, () => original(event));
       // The manifest is optional metadata; a blocked fetch must not surface as an uncaught rejection.
       return url.pathname.endsWith('/manifest.webmanifest')
         ? response.catch(() => new Response(null, { status: 503 }))
@@ -78,7 +108,7 @@ function installRuntimeCache(hashes, mirrorOrigin = 'https://datax-now.github.io
     }
     const key = new URL(relative, scope);
     key.searchParams.set('sha256', hash);
-    const integrity = 'sha256-' + btoa(String.fromCharCode(...hash.match(/../g).map(byte => parseInt(byte, 16))));
+    const integrity = integrityOf(hash);
     const verifiedRequest = new Request(request, { integrity, cache: 'no-cache' });
     let cache;
     try {
@@ -110,7 +140,7 @@ function installRuntimeCache(hashes, mirrorOrigin = 'https://datax-now.github.io
   };
 }
 
-function fingerprintRuntime(directory, mirrorOrigin = 'https://datax-now.github.io/go/') {
+function fingerprintRuntime(directory, mirrorOrigins = DEFAULT_MIRROR_ORIGINS, buildCommit = null) {
   const runtime = path.join(directory, 'xeus');
   const worker = path.join(directory, 'service-worker.js');
   const marker = '\n;/* datax-runtime-fingerprints */\n';
@@ -128,12 +158,17 @@ function fingerprintRuntime(directory, mirrorOrigin = 'https://datax-now.github.
   }
   visit(runtime);
   const source = fs.readFileSync(worker, 'utf8').split(marker)[0];
-  fs.writeFileSync(worker, source + marker + `(${installRuntimeCache.toString()})(${JSON.stringify(hashes)}, ${JSON.stringify(mirrorOrigin)});\n`);
+  fs.writeFileSync(worker, source + marker + `(${installRuntimeCache.toString()})(${JSON.stringify(hashes)}, ${JSON.stringify(mirrorOrigins)}, ${JSON.stringify(buildCommit)});\n`);
   console.log(`Fingerprinted ${Object.keys(hashes).length} runtime files for cache-first reuse`);
   return hashes;
 }
 
-module.exports = { fingerprintRuntime, installRuntimeCache };
+module.exports = { DEFAULT_MIRROR_ORIGINS, fingerprintRuntime, installRuntimeCache };
 if (require.main === module) {
-  fingerprintRuntime(process.argv[2] || 'dist', process.env.DATAX_RUNTIME_MIRROR_ORIGIN || 'https://datax-now.github.io/go/');
+  // Comma-separated, in priority order; an empty value disables failover.
+  const configured = process.env.DATAX_RUNTIME_MIRROR_ORIGIN;
+  const mirrorOrigins = configured === undefined
+    ? DEFAULT_MIRROR_ORIGINS
+    : configured.split(',').map(origin => origin.trim()).filter(Boolean);
+  fingerprintRuntime(process.argv[2] || 'dist', mirrorOrigins, process.env.DATAX_BUILD_COMMIT || null);
 }

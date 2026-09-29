@@ -52,26 +52,40 @@ Generated web-manifest shortcuts use relative URLs so they stay within the
 deployment path on Read the Docs and GitHub Pages.
 
 Each build writes `dist/deployment.json` with its checked-out Git commit and a
-SHA-256 inventory of the static assets. Compare the active Vercel and Cloudflare
-mirrors with:
+SHA-256 inventory of the static assets. Compare the active GitHub Pages, Vercel
+and Cloudflare deployments, listed in priority order, with:
 
 ```bash
 node scripts/deployment-manifest.mjs verify - \
+  https://datax-now.github.io/go/ \
   https://datax.now/ \
   https://datax-now.pages.dev/
 ```
 
-To include Read the Docs, add its static-assets base URL ending in
-`/_static/`. The verifier reports a mismatch if mirrors differ by commit or
+To include Read the Docs, put its static-assets base URL ending in
+`/_static/` first. The verifier reports a mismatch if mirrors differ by commit or
 asset bytes. `deployment.json` itself and the generated ZIP are excluded from
-the inventory to avoid a self-referential archive hash.
+the inventory to avoid a self-referential archive hash. The recorded commit is
+the checked-out Git `HEAD`; `VERCEL_GIT_COMMIT_SHA` or `GITHUB_SHA` is used only
+when there is no checkout.
 
-The launch page links the existing RTD, Vercel, and Cloudflare deployments as
-separate choices, not as an automatic redirect or cross-origin load balancer.
-Select one origin for each session: browser storage and notebook files do not
-move when switching hosts. GitHub Pages also serves the app; its service worker
-supplies the isolation headers on controlled navigations, while Vercel and
-Cloudflare set them directly.
+## Deployment priority
+
+The four deployments are ranked by importance, and every ordered list in the
+project follows this ranking. When hosts are otherwise equivalent, prefer the
+one listed first:
+
+1. Read the Docs
+2. GitHub Pages
+3. Vercel
+4. Cloudflare Pages
+
+The launch page links them in this order as separate choices, not as an
+automatic redirect or cross-origin load balancer. Select one origin for each
+session: browser storage and notebook files do not move when switching hosts.
+GitHub Pages supplies isolation headers through its service worker on controlled
+navigations, while Vercel and Cloudflare set them directly. The
+sections below follow the same order.
 
 ### Browser caching
 
@@ -94,10 +108,10 @@ The Cloudflare Worker also handles conditional requests with body-free `304`
 responses. Stable runtime URLs are not marked immutable.
 
 The service worker leaves cross-origin requests (including Google Fonts) to the
-browser and does not cache unsuccessful same-origin responses. On Read the Docs,
-it retries challenged web-manifest requests from the GitHub Pages mirror and
-retries fingerprinted kernel runtime assets there with their SHA-256 integrity
-checks.
+browser and does not cache unsuccessful same-origin responses. When a
+deployment host is blocked or unavailable, it retries the web manifest and
+fingerprinted kernel runtime assets on the other hosts in priority order with
+their SHA-256 integrity checks (see below).
 A cached asset can still be served while background revalidation fails; the host
 must recover before uncached requests can succeed.
 
@@ -127,24 +141,38 @@ forwarded by the worker. A direct check of the reported runtime URL returned
 serving a challenge instead of the runtime file. This is not HTTP 419.
 A background runtime fetch cannot complete an interactive HTML challenge.
 
-For a 429, Cloudflare challenge, or browser-level network failure from a
-`*.readthedocs.io` URL, the service worker retries fingerprinted files under
-`/xeus/` from the GitHub Pages mirror at `https://datax-now.github.io/go/`. These requests use CORS
+For a 429, Cloudflare challenge, 502-504 response, or browser-level network
+failure from any deployment host (`*.readthedocs.io`, GitHub Pages, Vercel or
+Cloudflare Pages), the service worker retries fingerprinted files under
+`/xeus/` on the other hosts in priority order: Read the Docs
+(`https://datax-now.readthedocs.io/en/latest/_static/`), GitHub Pages
+(`https://datax-now.github.io/go/`), Vercel (`https://datax.now/`), then
+Cloudflare Pages (`https://datax-now.pages.dev/`). The current host is skipped,
+and hosts outside this set (such as `localhost`) never fail over. A host that
+failed is not contacted again for 60 seconds, so a blocked host costs one round
+trip rather than one per file. A mirror whose `deployment.json` reports a
+different commit than this build is skipped so runtime files from two releases
+are never mixed.
+
+These requests use CORS
 without credentials and are integrity-checked against the SHA-256 recorded in
 the mirror's `deployment.json` (builds on different hosts embed their own
 paths and repack timestamps, so the bytes of a file differ between hosts; the
 build's own digest is used only if the mirror manifest is unavailable). It also
-retries `manifest.webmanifest` from the mirror; that optional metadata request
+retries `manifest.webmanifest` from the mirrors; that optional metadata request
 does not gate kernel startup. Other resources and other 429 responses are not
-retried. The client network must permit access to `datax-now.github.io`; this fallback
+retried. The client network must permit access to the mirror hosts; this fallback
 does not remove the hosting provider's protection.
-The Pages mirror must include CORS headers for `/go/xeus/`,
-`/go/deployment.json` and `/go/manifest.webmanifest`, and must contain the same
+Every mirror must include CORS headers for `/xeus/`, `/deployment.json` and
+`/manifest.webmanifest`, and must contain the same
 runtime package filenames (a package version that floated between builds is
-missing on the mirror). Set `DATAX_RUNTIME_MIRROR_ORIGIN` at build time to
-override the mirror base URL. Use `scripts/deployment-manifest.mjs verify` to
-confirm the RTD and mirror builds match before promotion; SRI intentionally
-rejects archives from a stale mirror.
+missing on the mirror). GitHub Pages and Cloudflare Pages send
+`Access-Control-Allow-Origin: *` by default; do not repeat it in the Cloudflare
+`_headers` file, which would duplicate the value. Set
+`DATAX_RUNTIME_MIRROR_ORIGIN` at build time to a comma-separated list of base
+URLs in priority order (an empty value disables failover). Use
+`scripts/deployment-manifest.mjs verify` to confirm the hosts match before
+promotion.
 
 URL-alias retries remain disabled for 429 responses, Cloudflare challenges,
 server errors, and network/integrity failures. Only ordinary 403/404 responses
@@ -157,8 +185,9 @@ over.
 - Open the documentation page normally and complete any challenge presented.
   Keep browser caching enabled and avoid clearing site data as a routine fix:
   doing so forces runtime downloads again.
-- If blocking persists, use the existing application deployment at
-  <https://datax.now/lab/> or <https://datax-now.pages.dev/lab/>.
+- If blocking persists, use the next deployment in priority order:
+  <https://datax-now.github.io/go/lab/>, <https://datax.now/lab/> or
+  <https://datax-now.pages.dev/lab/>.
   Browser notebooks and storage are origin-specific, so export important work
   before switching hosts; it will not appear there automatically.
 - Ask Read the Docs support to review the block, supplying the failing URL,
@@ -168,6 +197,32 @@ over.
 Read the Docs documents its protection and automated-access guidance at
 <https://docs.readthedocs.com/platform/stable/automated-access.html>.
 Its API rate limits are separate from documentation asset hosting limits.
+
+## GitHub Pages deployment
+
+The `.github/workflows/deploy-github-pages.yml` workflow builds and publishes
+the complete `dist/` directory to GitHub Pages when `master` changes. It can
+also be started manually with **Run workflow** and a `release_ref`. In the repository settings,
+set **Pages > Build and deployment > Source** to **GitHub Actions**.
+
+GitHub Pages sites may not exceed 1 GB. The workflow fails before upload above
+1 GiB and warns above 95%; the ZIP is roughly a third of the site, so growth in
+the runtime is the first thing to trim.
+
+The workflow also places a ZIP of the complete deployment at the site root:
+
+```text
+https://<owner>.github.io/<repository>/datax-now.zip
+```
+
+The exact Pages URL and ZIP URL are printed in the deployment job summary after
+each successful run. Vercel publishes the same archive at `/datax-now.zip`, and
+Read the Docs publishes it at `/_static/datax-now.zip`. GitHub Pages does not
+let the workflow configure custom COOP/COEP response headers. The app's service
+worker adds both policies to controlled navigations and reloads the first visit
+after taking control; use a browser with service worker support. Read the Docs,
+Vercel, and Cloudflare provide server headers or a service-worker fallback as
+well.
 
 ## Vercel deployment
 
@@ -201,28 +256,6 @@ For a manually initiated build, stage it explicitly with
 `vercel --prod --skip-domain` before reviewing and promoting it. The production
 domains `datax.now` and `www.datax.now` are assigned to this project; do not use
 either production domain to test an unpromoted deployment.
-
-## GitHub Pages deployment
-
-The `.github/workflows/deploy-github-pages.yml` workflow builds and publishes
-the complete `dist/` directory to GitHub Pages when `master` changes. It can
-also be started manually with **Run workflow** and a `release_ref`. In the repository settings,
-set **Pages > Build and deployment > Source** to **GitHub Actions**.
-
-The workflow also places a ZIP of the complete deployment at the site root:
-
-```text
-https://<owner>.github.io/<repository>/datax-now.zip
-```
-
-The exact Pages URL and ZIP URL are printed in the deployment job summary after
-each successful run. Vercel publishes the same archive at `/datax-now.zip`, and
-Read the Docs publishes it at `/_static/datax-now.zip`. GitHub Pages does not
-let the workflow configure custom COOP/COEP response headers. The app's service
-worker adds both policies to controlled navigations and reloads the first visit
-after taking control; use a browser with service worker support. Read the Docs,
-Vercel, and Cloudflare provide server headers or a service-worker fallback as
-well.
 
 ## Cloudflare deployment
 

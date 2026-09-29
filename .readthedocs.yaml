@@ -15,3 +15,12 @@ sphinx:
   builder: html
   configuration: docs/conf.py
   fail_on_warning: true
+
+# The bundled application under _static/ holds thousands of HTML/JSON files that are not documentation.
+search:
+  ignore:
+    - "_static/*"
+    - search.html
+    - search/index.html
+    - 404.html
+    - 404/index.html

@@ -242,8 +242,10 @@ test("RTD challenges retry fingerprinted runtime assets and the web manifest", a
   const packagePath = "xeus/xeus-python-wasm-host/kernel_packages/openssl-4.0.2-hb2bca66_0.tar.gz";
   const runtimePath = "xeus/xeus-python-wasm-host/xpython.wasm";
   let failRtdRequest = false;
+  let clock = 0;
   const context = vm.createContext({
     URL, Request, Response, Headers, btoa,
+    Date: { now: () => clock },
     location: { href: "https://datax-now.readthedocs.io/en/latest/_static/service-worker.js" },
     caches: { async open() { return {
       async match() { return null; },
@@ -292,6 +294,7 @@ test("RTD challenges retry fingerprinted runtime assets and the web manifest", a
   assert.equal(requests[2].headers.has("Authorization"), false);
   assert.equal(requests[2].integrity, mirrorPackageIntegrity, "mirror bytes are checked against the mirror's own manifest");
 
+  clock += 61000;
   const manifest = await context.maybeFromCache({
     request: new Request("https://datax-now.readthedocs.io/en/latest/_static/manifest.webmanifest"),
     waitUntil() {},
@@ -302,6 +305,7 @@ test("RTD challenges retry fingerprinted runtime assets and the web manifest", a
   assert.equal(requests[4].credentials, "omit");
   assert.equal(requests[4].integrity, "", "manifest fallback does not claim runtime integrity");
 
+  clock += 61000;
   const runtime = await context.maybeFromCache({
     request: new Request(
       `https://datax-now.readthedocs.io/en/latest/_static/${runtimePath}`,
@@ -319,6 +323,7 @@ test("RTD challenges retry fingerprinted runtime assets and the web manifest", a
   assert.equal(unrelated.status, 429);
   assert.equal(requests.length, 8, "unrelated RTD rate limits must not retry on the mirror");
 
+  clock += 61000;
   failRtdRequest = true;
   const failedNetworkRequest = await context.maybeFromCache({
     request: new Request(
@@ -331,6 +336,83 @@ test("RTD challenges retry fingerprinted runtime assets and the web manifest", a
   assert.equal(new URL(requests[9].url).origin, "https://datax-now.github.io");
   assert.equal(new URL(requests[9].url).pathname,
     "/go/xeus/xeus-python-wasm-host/kernel_packages/openssl-4.0.2-hb2bca66_0.tar.gz");
+});
+
+test("failed hosts fail over in priority order, skipping stale mirrors and cooling hosts", async () => {
+  const release = "a".repeat(40);
+  const runtimePath = "xeus/xeus-python-wasm-host/xpython.wasm";
+  const bytes = "runtime bytes";
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  const requests = [];
+  let clock = 0;
+  const manifests = {
+    "https://datax.now/deployment.json": { commit: "b".repeat(40), files: { [runtimePath]: { sha256 } } },
+    "https://datax-now.pages.dev/deployment.json": { commit: release, files: { [runtimePath]: { sha256 } } },
+  };
+  const context = vm.createContext({
+    URL, Request, Response, Headers, btoa,
+    Date: { now: () => clock },
+    location: { href: "https://datax-now.github.io/go/service-worker.js" },
+    caches: { async open() { throw new Error("cache disabled"); } },
+    async fetch(request) {
+      requests.push(request.url);
+      const url = new URL(request.url);
+      if (url.origin === "https://datax-now.github.io" && clock < 61000) return new Response("", { status: 503 });
+      if (url.origin === "https://datax-now.readthedocs.io") return new Response("", { status: 429 });
+      if (manifests[request.url]) return new Response(JSON.stringify(manifests[request.url]));
+      return fetch(`data:application/octet-stream,${encodeURIComponent(bytes)}`, { integrity: request.integrity });
+    },
+  });
+  vm.runInContext("maybeFromCache = async event => fetch(event.request)", context);
+  context.self = context;
+  context.hashes = { [runtimePath]: sha256 };
+  context.mirrors = fingerprints.DEFAULT_MIRROR_ORIGINS;
+  vm.runInContext(`(${fingerprints.installRuntimeCache.toString()})(hashes, mirrors, "${release}")`, context);
+  const load = () => context.maybeFromCache({
+    request: new Request(`https://datax-now.github.io/go/${runtimePath}`),
+    waitUntil() {},
+  });
+
+  assert.equal(await (await load()).text(), bytes);
+  assert.deepEqual(requests, [
+    `https://datax-now.github.io/go/${runtimePath}`,
+    "https://datax-now.readthedocs.io/en/latest/_static/deployment.json",
+    `https://datax-now.readthedocs.io/en/latest/_static/${runtimePath}`,
+    "https://datax.now/deployment.json",
+    "https://datax-now.pages.dev/deployment.json",
+    `https://datax-now.pages.dev/${runtimePath}`,
+  ], "priority order is RTD, Vercel, Cloudflare after GitHub Pages fails; the stale Vercel release is never used");
+
+  requests.length = 0;
+  assert.equal(await (await load()).text(), bytes);
+  assert.deepEqual(requests, [`https://datax-now.pages.dev/${runtimePath}`],
+    "hosts in cooldown are skipped without another round trip");
+
+  requests.length = 0;
+  clock += 61000;
+  assert.equal(await (await load()).text(), bytes);
+  assert.deepEqual(requests, [`https://datax-now.github.io/go/${runtimePath}`],
+    "the preferred host is used again once its cooldown expires");
+});
+
+test("hosts outside the deployment set never fail over", async () => {
+  const requests = [];
+  const context = vm.createContext({
+    URL, Request, Response, Headers, btoa,
+    location: { href: "http://localhost:8000/service-worker.js" },
+    async fetch(request) { requests.push(request.url); return new Response("", { status: 503 }); },
+  });
+  vm.runInContext("maybeFromCache = async event => fetch(event.request)", context);
+  context.self = context;
+  context.hashes = { "xeus/runtime.wasm": "a".repeat(64) };
+  context.mirrors = fingerprints.DEFAULT_MIRROR_ORIGINS;
+  vm.runInContext(`(${fingerprints.installRuntimeCache.toString()})(hashes, mirrors)`, context);
+  const response = await context.maybeFromCache({
+    request: new Request("http://localhost:8000/xeus/runtime.wasm"),
+    waitUntil() {},
+  });
+  assert.equal(response.status, 503);
+  assert.deepEqual(requests, ["http://localhost:8000/xeus/runtime.wasm"]);
 });
 
 test("range requests bypass both runtime and upstream caches", async () => {

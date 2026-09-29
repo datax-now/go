@@ -3679,6 +3679,8 @@ if [ "$VERIFY_FAIL" -ne 0 ]; then
   exit 1
 fi
 
+DATAX_BUILD_COMMIT="$(node "$REPO_ROOT/scripts/deployment-manifest.mjs" commit "$REPO_ROOT")"
+export DATAX_BUILD_COMMIT
 node "$REPO_ROOT/scripts/fingerprint-runtime.cjs" dist
 
   # Include the local CORS server and package the complete deployment for static

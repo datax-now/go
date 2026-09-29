@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -15,9 +16,23 @@ test("uses the Vercel commit SHA when building without a Git checkout", async t 
   assert.equal(resolveCommit({ VERCEL_GIT_COMMIT_SHA: commit }, directory), commit);
 });
 
-test("uses GitHub's commit SHA and rejects malformed build metadata", async () => {
-  assert.equal(resolveCommit({ GITHUB_SHA: commit }), commit);
-  assert.throws(() => resolveCommit({ VERCEL_GIT_COMMIT_SHA: "not-a-commit" }), /invalid Git commit SHA/);
+test("uses GitHub's commit SHA and rejects malformed build metadata", async t => {
+  const directory = await mkdtemp(join(tmpdir(), "deployment-no-git-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+
+  assert.equal(resolveCommit({ GITHUB_SHA: commit }, directory), commit);
+  assert.throws(() => resolveCommit({ VERCEL_GIT_COMMIT_SHA: "not-a-commit" }, directory), /invalid Git commit SHA/);
+  assert.throws(() => resolveCommit({}, directory), /Could not determine build commit/);
+});
+
+test("the checked-out commit wins over the dispatching ref's GITHUB_SHA", async t => {
+  const directory = await mkdtemp(join(tmpdir(), "deployment-git-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const git = (...args) => execFileSync("git", args, { cwd: directory, encoding: "utf8" }).trim();
+  git("init", "-q");
+  git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "release");
+
+  assert.equal(resolveCommit({ GITHUB_SHA: commit }, directory), git("rev-parse", "HEAD"));
 });
 
 test("manifest hashes deployment files and excludes generated metadata/archive", async t => {

@@ -4,13 +4,17 @@ Run JupyterLab directly in your browser with the DataX.now workspace.
 
 ## Open the workspace
 
-- [Launch DataX.now](https://datax.now) — the fastest option. Some company networks
-  may block it.
+Hosts are listed in priority order; use the first one that works for your network.
+
 - <a href="_static/lab/index.html">Open the Read the Docs JupyterLab build</a> — a
   same-origin option for networks that allow this documentation site.
-- <a href="https://datax-now.helloway.workers.dev/lab/">Open the Cloudflare mirror</a> —
+- <a href="https://datax-now.github.io/go/">Open the GitHub Pages deployment</a> — an
+  independent application host.
+- <a href="https://datax.now">Open the Vercel deployment (datax.now)</a> — the fastest
+  host to download from. Some company networks may block it.
+- <a href="https://datax-now.pages.dev/lab/">Open the Cloudflare Pages mirror</a> —
   an independent application host.
-- <a href="_static/datax-now.zip">Download the local DataX.now deployment</a> — for faster access, use <a href="https://datax.now">datax.now</a> instead.
+- <a href="_static/datax-now.zip">Download the local DataX.now deployment</a> — for faster access, use one of the hosts above instead.
 
 Choose one host for a session. Notebook files and browser storage are separate
 on each origin; export important work before switching hosts.

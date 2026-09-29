@@ -25,5 +25,5 @@ temp/
 # Generated runtime package cache
 vendor/kernel-bundle/
 vendor/xeus-x-kernel/
-.vercel
+.vercel/
 .env*

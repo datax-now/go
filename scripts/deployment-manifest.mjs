@@ -41,19 +41,19 @@ export async function createDeploymentManifest(directory, commit) {
 
 export function resolveCommit(env = process.env, cwd = process.cwd()) {
   const environmentCommit = env.VERCEL_GIT_COMMIT_SHA || env.GITHUB_SHA;
-  if (environmentCommit) {
-    if (!/^[a-f0-9]{40,64}$/i.test(environmentCommit)) {
-      throw new Error("Build environment supplied an invalid Git commit SHA");
-    }
-    return environmentCommit;
+  if (environmentCommit && !/^[a-f0-9]{40,64}$/i.test(environmentCommit)) {
+    throw new Error("Build environment supplied an invalid Git commit SHA");
   }
 
+  // The checkout is authoritative: GITHUB_SHA names the dispatching ref, not a manually selected release_ref.
   try {
     return execFileSync("git", ["rev-parse", "HEAD"], {
       cwd,
       encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
     }).trim();
   } catch {
+    if (environmentCommit) return environmentCommit;
     throw new Error("Could not determine build commit; set VERCEL_GIT_COMMIT_SHA or GITHUB_SHA outside a Git checkout");
   }
 }
@@ -125,6 +125,11 @@ async function main() {
     return;
   }
 
+  if (command === "commit" && args.length === 1) {
+    console.log(resolveCommit(process.env, resolve(args[0])));
+    return;
+  }
+
   if (command === "verify" && args.length >= 2) {
     const expectedCommit = args[0] === "-" ? null : args[0];
     const deployments = await verifyDeployments(args.slice(1), expectedCommit);
@@ -135,7 +140,7 @@ async function main() {
   }
 
   throw new Error(
-    "Usage: deployment-manifest.mjs write <dist-dir> | verify <expected-commit|-> <base-url> [base-url ...]",
+    "Usage: deployment-manifest.mjs write <dist-dir> | commit <repo-dir> | verify <expected-commit|-> <base-url> [base-url ...]",
   );
 }
 
