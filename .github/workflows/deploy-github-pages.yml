@@ -1,0 +1,85 @@
+name: Deploy JupyterLite to GitHub Pages
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: Git ref to publish (use the same ref for each mirror)
+        required: true
+        default: master
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      release_commit: ${{ steps.release.outputs.commit }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.release_ref || github.sha }}
+
+      - name: Build JupyterLite deployment
+        run: bash ./build.sh -c
+
+      - name: Verify complete deployment and record release
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s dist/datax-now.zip
+          test -f dist/cors_server.py
+          commit="$(jq -er '.commit' dist/deployment.json)"
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Report public deployment URLs
+        env:
+          EXPECTED_COMMIT: ${{ needs.build.outputs.release_commit }}
+        run: |
+          set -euo pipefail
+          page_url="${{ steps.deployment.outputs.page_url }}"
+          page_url="${page_url%/}/"
+          deployed_commit="$(curl --fail --silent --show-error "${page_url}deployment.json" | jq -er '.commit')"
+          test "$deployed_commit" = "$EXPECTED_COMMIT"
+          echo "JupyterLite: ${page_url}"
+          echo "ZIP: ${page_url}datax-now.zip"
+          {
+            echo "## JupyterLite deployment"
+            echo
+            echo "- Release: ${deployed_commit}"
+            echo "- Site: ${page_url}"
+            echo "- ZIP: ${page_url}datax-now.zip"
+          } >> "$GITHUB_STEP_SUMMARY"

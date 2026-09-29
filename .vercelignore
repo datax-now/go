@@ -1,0 +1,31 @@
+# Temporary / dev files
+.venv/
+node_modules/
+micromamba/
+dist/
+_output/
+bin/
+archive/
+temp/
+.tmp/
+.jupyterlite.doit.db
+.envrc
+.env
+.env.*
+.vercel/
+.claude/
+__pycache__/
+*.pyc
+.git/
+.github/
+
+# Local verification artifacts
+verify-ai-ui.png
+verify-ai-ui-after-click.png
+tmp_verify_ai_ui.js
+
+# Keep these deployment inputs in the Vercel build context:
+# built-in-wheels/
+# built-in-conda/
+# built-in-runtime-wheels/
+# notebooks/

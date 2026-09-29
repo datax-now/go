@@ -1,0 +1,7 @@
+# Python dependencies for JupyterLite build
+# These are installed into the local build environment on every build run.
+# This ensures packages listed here are always present even when the conda environment
+# is reused from cache and the environment manifests are not re-applied.
+jupyterlite-ai==0.19.0
+jupyterlab-ai-commands>=0.3.1,<0.4
+jupyterlab-plugin-playground==1.0.0

@@ -1,0 +1,44 @@
+{
+  "@jupyterlab/filebrowser-extension:browser": {
+    "showHiddenFiles": true
+  },
+  "@jupyterlab/notebook-extension:tracker": {
+    "windowingMode": "contentVisibility",
+    "autoStartDefaultKernel": true,
+    "autoRenderMarkdownCells": false
+  },
+  "@jupyterlab/toc-extension:registry": {
+    "includeOutput": false
+  },
+  "@jupyter-widgets/jupyterlab-manager:plugin": {
+    "saveState": true
+  },
+  "datax-now-front:plugin": {
+    "startupNotebook": "00_agent_features.ipynb"
+  },
+  "@jupyterlite/ai:settings-model": {
+    "useSecretsManager": false,
+    "providers": [
+      {
+        "id": "Agnes",
+        "name": "Agnes",
+        "provider": "generic",
+        "model": "agnes-3.0-flash",
+        "baseURL": "https://apihub.agnes-ai.com/v1",
+        "apiKey": "sk-TdAVacub06AZj594f4E5HOMt4GhQGMBTpfDIIpBIqf7LXuK8"
+      }
+    ],
+    "defaultProvider": "Agnes",
+    "useSameProviderForChatAndCompleter": false
+  },
+  "shortcuts": [
+    {
+      "command": "inline-completer:accept",
+      "keys": [
+        "Tab"
+      ],
+      "selector": ".jp-mod-inline-completer-active",
+      "disabled": true
+    }
+  ]
+}

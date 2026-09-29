@@ -1,0 +1,65 @@
+name: jupyterlite-deploy
+channels:
+  - https://repo.prefix.dev/emscripten-forge-4x
+  - conda-forge
+dependencies:
+  # Build tools (no cmake/emscripten — kernel is pre-built)
+  - python=3.13
+  - sqlite
+  # Node 18 is tied to ICU <76 and cannot coexist with R 4.5.3
+  # (which requires ICU 78). The deployment script only needs Node for
+  # build-time asset checks, so use the current ICU-compatible major.
+  - nodejs=26
+  - click
+  # R build dependencies (for hera package installation into wasm-host)
+  # Versions pinned to match the local wasm host environment contract
+  - r-base==4.5.3
+  - r-rlang==1.1.7
+  - r-jsonlite
+  - r-base64enc==0.1_6
+  - r-digest==0.6.39
+  - r-fastmap
+  - r-htmltools==0.5.9
+  - r-cli
+  - r-glue
+  - r-vctrs==0.7.1
+  # JupyterLite
+  - jupyter_server
+  - jupyterlab_server
+  - jupyterlab-kernelspy
+  - ipywidgets
+  - anywidget=0.11.*
+  - jupyterlab_widgets
+  - jiter
+  # Apache Arrow / columnar data support
+  - pyarrow
+  # Optional performance / build deps
+  - python-libarchive-c
+  - zstandard  
+  - pip:
+    - jsonschema
+    # Use the PyPI wheel: the current conda package metadata is 0.8.3 but
+    # still contains the JupyterLite 0.7.6 application archive.
+    - jupyterlite-core==0.8.3
+    - jupyterlab-open-url-parameter
+    - jupyterlab-plugin-playground==1.0.0
+    # Pre-bundle transitive pip-only deps to avoid slow PyPI downloads on clean builds
+    - built-in-wheels/datax_now_front-0.2.70-py3-none-any.whl
+    - built-in-wheels/jupyterlab_eventlistener-0.4.0-py3-none-any.whl
+    - built-in-wheels/jupyterlab_cell_input_footer-0.3.2-py3-none-any.whl
+    - built-in-wheels/jupyterlab_diff-0.6.1-py3-none-any.whl
+    - built-in-wheels/jupyterlab_examples_pivot_explorer-0.1.7-py3-none-any.whl
+    # jupyterlite_ai 0.19.0 requires jupyterlab-ai-commands>=0.3.1,<0.4.
+    # Resolve from PyPI until a matching built-in wheel is bundled locally.
+    - jupyterlab-ai-commands>=0.3.1,<0.4
+    - built-in-wheels/jupyter_secrets_manager-0.5.0-py3-none-any.whl
+    - built-in-wheels/jupyterlite_ai-0.19.0-py3-none-any.whl
+    - built-in-wheels/xeus_x_ai_agents-0.7.4-py3-none-any.whl
+    # xeus-x kernel wheel — produced by xeus-x/build-kernel.sh or build-wheel.sh
+    # and published into built-in-wheels/
+    # The version is updated automatically by update_wheel_references.py
+    # jupyterlite_xeus must be explicit to use the bundled custom build with
+    # the variable-inspector worker API; otherwise pip resolves from PyPI.
+    - built-in-wheels/jupyterlite_xeus-5.0.3-py3-none-any.whl
+    - built-in-wheels/jupyterlite_xeus_x-20260916.1470.0-py3-none-any.whl
+    - built-in-wheels/variable_inspector-1.4.4-py3-none-any.whl

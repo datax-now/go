@@ -1,0 +1,43 @@
+{
+  "info": {
+    "subdir": "emscripten-wasm32"
+  },
+  "packages": {
+    "pydantic-core-2.46.4-py313h1e85631_0.tar.bz2": {
+      "name": "pydantic-core",
+      "version": "2.46.4",
+      "build": "py313h1e85631_0",
+      "build_number": 0,
+      "depends": [
+        "typing_extensions",
+        "emscripten-abi >=4,<5.0a0",
+        "python_abi 3.13.* *_cp313"
+      ],
+      "subdir": "emscripten-wasm32",
+      "md5": "80e301371a8a31b7574a69216ed936a2",
+      "sha256": "a387f8c9f8c15764b1ba3f068f1b17324296bc3cdb294414ba144867b97d6628",
+      "size": 1166214,
+      "license": "MIT",
+      "timestamp": 1778208178123
+    },
+    "python-duckdb-1.4.4-py313ha26e73d_0.tar.bz2": {
+      "name": "python-duckdb",
+      "version": "1.4.4",
+      "build": "py313ha26e73d_0",
+      "build_number": 0,
+      "depends": [
+        "python",
+        "emscripten-abi >=4,<5.0a0",
+        "python_abi 3.13.* *_cp313"
+      ],
+      "subdir": "emscripten-wasm32",
+      "md5": "f236b59b98a8e46125201e3988ea1330",
+      "sha256": "6a7892af862f69ce06debaf35be6d91665d5d63e41ed340d8da2251ca4830cc0",
+      "size": 1054556,
+      "license": "MIT",
+      "timestamp": 1773200257260
+    }
+  },
+  "packages.conda": {},
+  "repodata_version": 1
+}

@@ -1,0 +1,123 @@
+{
+  "info": {
+    "subdir": "noarch"
+  },
+  "packages": {},
+  "packages.conda": {
+    "annotated-types-0.7.0-pyhd8ed1ab_1.conda": {
+      "name": "annotated-types",
+      "version": "0.7.0",
+      "build": "pyhd8ed1ab_1",
+      "build_number": 1,
+      "depends": [
+        "python >=3.9",
+        "typing-extensions >=4.0.0"
+      ],
+      "subdir": "noarch",
+      "md5": "2934f256a8acfe48f6ebb4fce6cde29c",
+      "sha256": "e0ea1ba78fbb64f17062601edda82097fcf815012cf52bb704150a2668110d48",
+      "size": 18074,
+      "license": "MIT",
+      "timestamp": 1733247158254,
+      "noarch": "python"
+    },
+    "astor-0.8.1-pyhd8ed1ab_1.conda": {
+      "name": "astor",
+      "version": "0.8.1",
+      "build": "pyhd8ed1ab_1",
+      "build_number": 1,
+      "depends": [
+        "python >=3.9"
+      ],
+      "subdir": "noarch",
+      "md5": "860c9e08463a3af84d7da76bc0baf84b",
+      "sha256": "2e4e6d0d3aaee26415f910658ed55a53cc3210e8c30ae9a0dd35826cf7a3423f",
+      "size": 29393,
+      "license": "BSD-3-Clause",
+      "timestamp": 1733838731992,
+      "noarch": "python"
+    },
+    "pydantic-2.13.4-pyhcf101f3_0.conda": {
+      "name": "pydantic",
+      "version": "2.13.4",
+      "build": "pyhcf101f3_0",
+      "build_number": 0,
+      "depends": [
+        "typing-inspection >=0.4.2",
+        "typing_extensions >=4.14.1",
+        "python >=3.10",
+        "annotated-types >=0.6.0",
+        "pydantic-core ==2.46.4",
+        "python"
+      ],
+      "subdir": "noarch",
+      "md5": "729843edafc0899b3348bd3f19525b9d",
+      "sha256": "69700e31165df070e9716315e042196aa92525dae5deb5107785847ab9f4189f",
+      "size": 346511,
+      "license": "MIT",
+      "timestamp": 1778103405862,
+      "noarch": "python"
+    },
+    "pygwalker-0.2.1-pyhd8ed1ab_4.conda": {
+      "name": "pygwalker",
+      "version": "0.2.1",
+      "build": "pyhd8ed1ab_4",
+      "build_number": 4,
+      "depends": [
+        "astor",
+        "ipython",
+        "ipywidgets",
+        "jinja2",
+        "pandas",
+        "pydantic",
+        "python >=3.6,<4.0",
+        "typing_extensions"
+      ],
+      "subdir": "noarch",
+      "md5": "d2291bc047e9602a0d97de2d2d88f4e7",
+      "sha256": "a455ada551747ba03db7f634f0475a524b9c97f74d03a83042b86c9b42f77ccf",
+      "size": 768733,
+      "license": "Apache-2.0",
+      "timestamp": 1690539221100,
+      "noarch": "python"
+    },
+    "quak-0.3.4-pyhd8ed1ab_0.conda": {
+      "name": "quak",
+      "version": "0.3.4",
+      "build": "pyhd8ed1ab_0",
+      "build_number": 0,
+      "depends": [
+        "anywidget >=0.9.0",
+        "pyarrow >=16.0.0",
+        "python >=3.10",
+        "python-duckdb >=1.0.0"
+      ],
+      "subdir": "noarch",
+      "md5": "a94e6b7f3cb938f470489d64ecd3e8c4",
+      "sha256": "c1b494a30ea5f4fb7026cc00bb4bb5647ee1350e36d83ca92a142b34c0b4b605",
+      "size": 171306,
+      "license": "MIT",
+      "timestamp": 1769872471368,
+      "noarch": "python"
+    },
+    "typing-inspection-0.4.2-pyhcf101f3_2.conda": {
+      "name": "typing-inspection",
+      "version": "0.4.2",
+      "build": "pyhcf101f3_2",
+      "build_number": 2,
+      "depends": [
+        "python >=3.10",
+        "typing_extensions >=4.12.0",
+        "python"
+      ],
+      "subdir": "noarch",
+      "md5": "53f5409c5cfd6c5a66417d68e3f0a864",
+      "sha256": "8b90d2f19f9458b8c58a55e1fcdc1d90c1603a847a47654d8a454549413ba60a",
+      "size": 20935,
+      "license": "MIT",
+      "timestamp": 1777105465795,
+      "noarch": "python"
+    }
+  },
+  "repodata_version": 1
+}

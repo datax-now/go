@@ -1,0 +1,90 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://datax.dev/schemas/runtime-package-manifest.v1.json",
+  "title": "RuntimePackageManifest",
+  "description": "Schema for the built-in local package manifest consumed by RuntimePackageService. This is the canonical definition; both the build-time generator (build.sh) and the runtime consumer (RuntimePackageService) must conform to this schema.",
+  "type": "object",
+  "required": ["version", "conda", "pip"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version. Currently only version 1 is supported."
+    },
+    "conda": {
+      "type": "object",
+      "required": ["bundledChannel", "packages"],
+      "additionalProperties": false,
+      "properties": {
+        "bundledChannel": {
+          "type": "string",
+          "description": "Relative URL to the bundled conda channel directory (e.g. './conda')."
+        },
+        "packages": {
+          "$ref": "#/definitions/PackageMap"
+        }
+      }
+    },
+    "pip": {
+      "type": "object",
+      "required": ["packages"],
+      "additionalProperties": false,
+      "properties": {
+        "packages": {
+          "$ref": "#/definitions/PackageMap"
+        }
+      }
+    }
+  },
+  "definitions": {
+    "PackageRecord": {
+      "type": "object",
+      "required": ["filename"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Package name."
+        },
+        "version": {
+          "type": "string",
+          "description": "Package version string."
+        },
+        "build": {
+          "type": "string",
+          "description": "Conda build string (conda packages only)."
+        },
+        "subdir": {
+          "type": "string",
+          "description": "Conda subdir (e.g. 'noarch', 'emscripten-wasm32')."
+        },
+        "filename": {
+          "type": "string",
+          "description": "Filename of the package archive."
+        },
+        "sha256": {
+          "type": "string",
+          "description": "SHA-256 hash of the archive file."
+        },
+        "size": {
+          "type": "integer",
+          "description": "Size in bytes of the archive file."
+        }
+      }
+    },
+    "PackageMap": {
+      "type": "object",
+      "description": "Map from package name to a single record or an array of records (for multi-version packages).",
+      "additionalProperties": {
+        "oneOf": [
+          { "$ref": "#/definitions/PackageRecord" },
+          {
+            "type": "array",
+            "items": { "$ref": "#/definitions/PackageRecord" }
+          }
+        ]
+      }
+    }
+  }
+}

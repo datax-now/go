@@ -1,0 +1,62 @@
+name: xeus-python-wasm-host
+channels:
+  - https://repo.prefix.dev/emscripten-forge-4x
+  - conda-forge
+dependencies:
+  # Host dependencies
+  - ipython
+  - pybind11 <3
+  - jedi
+  - nlohmann_json
+  - nlohmann_json-abi
+  - pybind11_json
+  # Scientific computing and data analysis
+  - numpy
+  - pandas <3.0.0
+  - pyarrow  # Apache Arrow columnar data; two-phase .so loading handled by build.sh
+  # Interactive widgets
+  - ipywidgets
+  # Utilities
+  - requests
+  - pillow
+  # Jupyter extensions
+  - xeus-lite
+  - xeus
+  - xeus-python-shell==0.6.4
+  # R runtime and libraries for WASM
+  - r-base==4.5.3
+  - r-evaluate=1.0.5=r45*
+  - r-rlang==1.1.7
+  - r-jsonlite
+  - r-glue
+  - r-cli >=3.6.3
+  - r-repr=1.1.7=r45*
+  - r-irdisplay=1.1=r45*
+  - r-r6
+  - r-dplyr
+  - r-base64enc==0.1_6
+  # r-arrow: optional — used by xeus-x FFI bridge for Arrow-IPC tabular
+  # transport. If the package is not yet available in emscripten-forge,
+  # R falls back to dict-of-lists (lossier but functional).
+  # - r-arrow
+  - r-digest==0.6.39
+  - r-htmltools==0.5.9
+  - r-vctrs==0.7.1
+  - r-ggplot2=4.0.1=r45*
+  - pcre2>=10.43
+  - zlib>=1.2.13
+  - xz
+  - bzip2
+  - libiconv
+  - pyjs >=4,<5
+  - libpython
+  - zstd
+  - openssl
+  - anywidget=0.11.*
+  - jupyterlab_widgets
+  - quak=0.3.4
+  # Keep the wasm-host spec aligned with the last known-good deploy output.
+  # Several newer notebook extras currently do not resolve on
+  # emscripten-forge for `emscripten-wasm32`.
+  - matplotlib==3.10.8 # pinned: 3.10.9 is currently unsatisfiable here.
+  - plotly

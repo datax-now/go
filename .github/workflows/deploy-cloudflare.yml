@@ -1,0 +1,105 @@
+name: Deploy JupyterLite to Cloudflare
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: Git ref to publish (use the same ref for each mirror)
+        required: true
+        default: master
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: cloudflare-production
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.release_ref }}
+
+      - name: Build JupyterLite deployment
+        run: bash ./build.sh -c
+
+      - name: Prepare Cloudflare Pages assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          pages_dir="$(mktemp -d "${RUNNER_TEMP}/datax-now-pages.XXXXXX")"
+          cp -a dist/. "$pages_dir/"
+          cp cloudflare/_headers "$pages_dir/_headers"
+          rm "$pages_dir/datax-now.zip"
+          compressed_files=0
+          while IFS= read -r -d '' asset; do
+            compressed="${asset}.gzip"
+            gzip -1 -c -- "$asset" > "$compressed"
+            compressed_bytes="$(stat -c %s "$compressed")"
+            if [ "$compressed_bytes" -gt 26214400 ]; then
+              echo "Asset remains above the Cloudflare Pages 25 MiB limit after gzip: ${asset#"$pages_dir"/} (${compressed_bytes} bytes)" >&2
+              exit 1
+            fi
+            mv "$compressed" "$asset"
+            relative_path="${asset#"$pages_dir"/}"
+            printf '\n/%s\n  Content-Encoding: gzip\n' "$relative_path" >> "$pages_dir/_headers"
+            compressed_files=$((compressed_files + 1))
+          done < <(find "$pages_dir" -type f -size +26214400c -print0)
+          echo "PAGES_DIR=$pages_dir" >> "$GITHUB_ENV"
+          echo "COMPRESSED_FILES=$compressed_files" >> "$GITHUB_ENV"
+
+      - name: Verify release and Pages limits
+        run: |
+          set -euo pipefail
+          test -s dist/deployment.json
+          test -s dist/datax-now.zip
+          test -s "$PAGES_DIR/deployment.json"
+          test ! -e "$PAGES_DIR/datax-now.zip"
+          release_commit="$(jq -er '.commit' dist/deployment.json)"
+          checked_out_commit="$(git rev-parse HEAD)"
+          test "$release_commit" = "$checked_out_commit"
+          file_count="$(find "$PAGES_DIR" -type f | wc -l)"
+          if [ "$file_count" -gt 20000 ]; then
+            echo "Cloudflare Pages Free allows up to 20,000 files; found $file_count" >&2
+            exit 1
+          fi
+          oversized_files="$(find "$PAGES_DIR" -type f -printf '%s %p\n' | awk '$1 > 26214400')"
+          if [ -n "$oversized_files" ]; then
+            echo "Cloudflare Pages assets must not exceed 25 MiB (26,214,400 bytes):" >&2
+            printf '%s\n' "$oversized_files" >&2
+            exit 1
+          fi
+          echo "RELEASE_COMMIT=$release_commit" >> "$GITHUB_ENV"
+          echo "FILE_COUNT=$file_count" >> "$GITHUB_ENV"
+
+      - name: Deploy to Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx --yes wrangler@4.139.0 pages deploy "$PAGES_DIR" --project-name=datax-now --branch=master --commit-hash="${RELEASE_COMMIT}"
+
+      - name: Verify live Pages deployment
+        run: |
+          set -euo pipefail
+          site_url="https://datax-now.pages.dev/"
+          deployed_commit="$(curl --fail --silent --show-error "${site_url}deployment.json" | jq -er '.commit')"
+          test "$deployed_commit" = "$RELEASE_COMMIT"
+          headers="$(curl --fail --silent --show-error --head "${site_url}lab/")"
+          grep -iq '^Cross-Origin-Embedder-Policy: require-corp' <<< "$headers"
+          grep -iq '^Cross-Origin-Opener-Policy: same-origin' <<< "$headers"
+          {
+            echo "## Cloudflare deployment"
+            echo
+            echo "- Release: ${deployed_commit}"
+            echo "- Files: ${FILE_COUNT} (Free limit: 20,000)"
+            echo "- Gzip-compressed runtime assets: ${COMPRESSED_FILES}"
+            echo "- Largest asset limit: 25 MiB"
+            echo "- Site: ${site_url}"
+          } >> "$GITHUB_STEP_SUMMARY"

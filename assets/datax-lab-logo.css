@@ -1,0 +1,7 @@
+#jp-MainLogo {
+  background: center / contain no-repeat url("./icon-512x512.png");
+}
+
+#jp-MainLogo > svg {
+  visibility: hidden;
+}

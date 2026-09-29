@@ -1,0 +1,29 @@
+# Build output
+dist/
+_output/
+
+# Local build tools and environments
+bin/
+micromamba/
+.venv/
+.wrangler/
+__pycache__/
+*.pyc
+
+# JupyterLite build state
+.jupyterlite.doit.db
+temp/
+*.tmp
+
+# Editor files
+.vscode/
+
+# Local secrets
+.env
+.env.*
+
+# Generated runtime package cache
+vendor/kernel-bundle/
+vendor/xeus-x-kernel/
+.vercel
+.env*
