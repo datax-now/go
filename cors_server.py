@@ -120,29 +120,6 @@ class CORSRequestHandler(http.server.SimpleHTTPRequestHandler):
         super().end_headers()
     
     def do_GET(self):
-        # Handle manifest.webmanifest specially to avoid redirect issues
-        if self.path.endswith('manifest.webmanifest'):
-            try:
-                # Serve a simple, static manifest
-                manifest_content = '''{
-  "name": "DataX.now",
-  "short_name": "DataX.now",
-  "description": "JupyterLite with DataX.now kernel",
-  "start_url": ".",
-  "display": "standalone",
-  "theme_color": "#ffffff",
-  "background_color": "#ffffff",
-  "icons": []
-}'''
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/manifest+json')
-                self.send_header('Content-Length', len(manifest_content))
-                self.end_headers()
-                self.wfile.write(manifest_content.encode())
-                return
-            except Exception as e:
-                self.log_error('Error serving manifest: %s', str(e))
-        
         # JupyterLite uses prebuilt indexes at /api/contents/**/all.json.
         # In dev mode we may not have per-directory all.json files, but returning
         # HTML 404s can break clients (JSON parse errors) and can even deadlock

@@ -8,6 +8,7 @@ import vm from "node:vm";
 import test from "node:test";
 import fingerprints from "./fingerprint-runtime.cjs";
 import startup from "./patch-wasm-startup.cjs";
+import offline from "./offline-cache.cjs";
 
 const root = new URL("../", import.meta.url);
 test("duplicate libraries are removed only after worker fetch aliases are installed", async () => {
@@ -94,6 +95,8 @@ const staticHostBootstrapPatch = build.split('echo "Patching static-host app boo
   .split("python3 << 'EOFPATCH'\n")[1].split("\nEOFPATCH")[0];
 const brandingPatch = build.split('echo "🎨 Applying DataX.now branding..."')[1]
   .split("python3 <<'PY'\n")[1].split("\nPY")[0];
+const runtimeConfigPatch = build.split('echo "Restoring custom runtime config into built jupyter-lite.json files..."')[1]
+  .split("python3 << 'EOFPATCH'\n")[1].split("\nEOFPATCH")[0];
 const upstream = `const CACHE="precache";let enableCache=!1;
 function onActivate(e){enableCache="true"===new URL(location.href).searchParams.get("enableCache"),e.waitUntil(self.clients.claim())}
 async function onFetch(event){event.respondWith(maybeFromCache(event))}
@@ -102,6 +105,23 @@ async function openCache(){return await caches.open("precache")}
 async function fromCache(e){let a=await openCache(),t=await a.match(e);return t&&404!==t.status?t:null}
 async function updateCache(request,response){return (await openCache()).put(request,response)}
 async function refetch(e){let a=await fetch(e);return await updateCache(e,a),a}`;
+
+test("built app configs preserve service-worker caching from the source config", () => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-offline-config-"));
+  try {
+    mkdirSync(join(directory, "temp/jupyterlite-lite-dir"), { recursive: true });
+    mkdirSync(join(directory, "dist/lab"), { recursive: true });
+    writeFileSync(join(directory, "temp/jupyterlite-lite-dir/jupyter-lite.json"), readFileSync(new URL("jupyter-lite.json", root)));
+    for (const relative of ["dist/jupyter-lite.json", "dist/lab/jupyter-lite.json"]) writeFileSync(join(directory, relative), "{}");
+    const result = spawnSync("python3", ["-c", runtimeConfigPatch], { cwd: directory, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    for (const relative of ["dist/jupyter-lite.json", "dist/lab/jupyter-lite.json"]) {
+      const config = JSON.parse(readFileSync(join(directory, relative), "utf8"));
+      assert.equal(config.enableServiceWorkerCache, true);
+      assert.equal(config["jupyter-config-data"].enableServiceWorkerCache, true);
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
 
 test("manifest shortcuts stay within the deployment subpath", () => {
   const directory = mkdtempSync(join(tmpdir(), "datax-manifest-scope-"));
@@ -274,7 +294,7 @@ test("runtime cache rejects mismatched bytes and retries without poisoning the h
     fingerprints.fingerprintRuntime(directory);
     const context = vm.createContext({
       URL, Request, Response, btoa,
-      self: { location: { href: "https://example.com/service-worker.js?enableCache=true" } },
+      self: { addEventListener() {}, location: { href: "https://example.com/service-worker.js?enableCache=true" } },
       caches: { async open() { return {
         async match(key) { return stored.get(key)?.clone(); },
         async put(key, response) { stored.set(key, response.clone()); },
@@ -603,7 +623,7 @@ test("fingerprints reuse runtime bodies after restart and invalidate binary-only
     const context = vm.createContext({
       URL, Request, Response, btoa,
       enableCache: false,
-      self: { location: { href: "https://example.com/_static/service-worker.js?enableCache=true" } },
+      self: { addEventListener() {}, location: { href: "https://example.com/_static/service-worker.js?enableCache=true" } },
       caches: { async open() { return cache; } },
       async maybeFromCache() { fallbackCalls++; return new Response("fallback"); },
       async fetch(request) {
@@ -716,6 +736,209 @@ test("runtime URL rewrites preserve validators and do not amplify rate limits or
     requests.length = 0;
     await assert.rejects(context.fetch(new Request("https://example.com/xeus/library.so")), /fetch failed/);
     assert.equal(requests.length, 1, "network or integrity failures must not trigger alias retries");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("offline downloads resume, verify every asset, and survive worker restarts", async () => {
+  const stored = new Map();
+  const bodies = { "lab/index.html": "app shell", "extensions/%40jupyterlite/widget.js": "widget", "api/contents/all.json": "notebook", "xeus/runtime.wasm": "runtime", "xeus/xeus-python-wasm-host/meriyah.umd.min.js": "parser" };
+  const assets = Object.fromEntries(Object.entries(bodies).map(([relative, body]) => [relative, {
+    sha256: createHash("sha256").update(body).digest("hex"), size: body.length,
+  }]));
+  let online = true;
+  let fail = "extensions/%40jupyterlite/widget.js";
+  let rejectWrites = false;
+  const downloads = [];
+  const scope = "https://example.com/en/latest/_static/";
+  const cache = {
+    async match(key) { return stored.get(key)?.clone(); },
+    async put(key, response) { if (rejectWrites) throw new Error("Quota exceeded"); stored.set(key, response.clone()); },
+    async keys() { return [...stored.keys()].map(key => new Request(key)); },
+    async delete(request) { return stored.delete(request.url); },
+  };
+  function startWorker() {
+    let message;
+    const context = vm.createContext({
+      URL, Request, Response, btoa, assets,
+      self: { location: { href: scope + "service-worker.js?enableCache=true" }, addEventListener(type, listener) { message = listener; } },
+      caches: { async open() { return cache; } },
+      async maybeFromCache(event) { return context.fetch(event.request); },
+      async fetch(request) {
+        if (!online) throw new TypeError("Network is offline");
+        const relative = new URL(request.url).pathname.slice(new URL(scope).pathname.length);
+        downloads.push(relative);
+        if (relative === fail) return new Response("unavailable", { status: 503 });
+        assert.equal(request.integrity, "sha256-" + Buffer.from(assets[relative].sha256, "hex").toString("base64"));
+        return new Response(bodies[relative]);
+      },
+    });
+    context.hashes = Object.fromEntries(Object.entries(assets).filter(([relative]) => relative.startsWith("xeus/")).map(([relative, asset]) => [relative, asset.sha256]));
+    vm.runInContext(`function shouldDrop(request, url) { return url.pathname.includes('/api/'); }
+      (${fingerprints.installRuntimeCache.toString()})(hashes);(${offline.installOfflineCache.toString()})(assets);`, context);
+    return {
+      context,
+      async send(type, source = scope + "lab/") {
+        const updates = [];
+        const tasks = [];
+        message({ data: { type }, source: { url: source }, ports: [{ postMessage(update) { updates.push(update); } }], waitUntil(task) { tasks.push(task); } });
+        await Promise.all(tasks);
+        return updates;
+      },
+    };
+  }
+  const worker = startWorker();
+  const failed = await worker.send("datax-offline-download");
+  assert.match(failed.at(-1).error, /503/);
+  assert.equal(failed.at(-1).ready, false);
+  assert.equal(stored.size, 2);
+  fail = null;
+  downloads.length = 0;
+  const resumed = await worker.send("datax-offline-download");
+  assert.equal(resumed.at(-1).ready, true);
+  assert.deepEqual(downloads, ["extensions/%40jupyterlite/widget.js", "xeus/runtime.wasm", "xeus/xeus-python-wasm-host/meriyah.umd.min.js"]);
+  online = false;
+  const restarted = startWorker();
+  assert.equal((await restarted.send("datax-offline-status")).at(-1).ready, true);
+  for (const [relative, body] of Object.entries(bodies)) {
+    const request = new Request(scope + relative.replace("%40", "@") + "?cachebust=1");
+    assert.equal(restarted.context.shouldDrop(request, new URL(request.url)), false);
+    const response = await restarted.context.maybeFromCache({ request, waitUntil() {} });
+    assert.equal(await response.text(), body);
+  }
+  const dynamic = new Request(scope + "api/drive/unsaved.ipynb");
+  const parser = await restarted.context.maybeFromCache({ request: new Request(scope + "extensions/@jupyterlite/xeus-extension/static/meriyah.umd.min.js"), waitUntil() {} });
+  assert.equal(await parser.text(), "parser");
+  assert.equal(restarted.context.shouldDrop(dynamic, new URL(dynamic.url)), true);
+  assert.deepEqual(await restarted.send("datax-offline-download", "https://unrelated.example/lab/"), []);
+  stored.clear();
+  online = true;
+  rejectWrites = true;
+  const quota = await restarted.send("datax-offline-download");
+  assert.match(quota.at(-1).error, /browser storage/);
+  assert.equal(quota.at(-1).ready, false);
+  assert.equal(stored.size, 0);
+});
+
+test("local verification server serves generated manifest bytes unchanged", () => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-offline-server-"));
+  try {
+    const manifest = JSON.stringify({ name: "DataX.now", icons: [{ src: "icon.png" }], shortcuts: [{ url: "./lab/" }] });
+    writeFileSync(join(directory, "manifest.webmanifest"), manifest);
+    const script = `
+import http.client
+import http.server
+import sys
+import threading
+from functools import partial
+sys.path.insert(0, sys.argv[1])
+from cors_server import CORSRequestHandler
+server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), partial(CORSRequestHandler, directory=sys.argv[2]))
+thread = threading.Thread(target=server.serve_forever, daemon=True)
+thread.start()
+client = http.client.HTTPConnection('127.0.0.1', server.server_port)
+client.request('GET', '/manifest.webmanifest?version=test')
+response = client.getresponse()
+assert response.status == 200
+sys.stdout.write(response.read().decode())
+client.close()
+server.shutdown()
+server.server_close()
+`;
+    const result = spawnSync("python3", ["-c", script, new URL(".", root).pathname, directory], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, manifest);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("kernel package mapping is bundled locally for pages and workers on every deployment path", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-offline-mapping-"));
+  const extension = "extensions/@jupyterlite/xeus-extension/static/";
+  try {
+    mkdirSync(join(directory, extension), { recursive: true });
+    writeFileSync(join(directory, extension, "mapping.js"), 'fetch("https://raw.githubusercontent.com/prefix-dev/parselmouth/main/files/compressed_mapping.json")');
+    const assets = offline.prepareOffline(directory);
+    assert.ok(assets["conda-pypi-mapping.json"]);
+    const patched = readFileSync(join(directory, extension, "mapping.js"), "utf8");
+    assert.equal(patched.includes("raw.githubusercontent.com"), false);
+    for (const prefix of ["/", "/go/", "/en/latest/_static/"]) {
+      for (const worker of [true, false]) {
+        let fetched;
+        const context = vm.createContext({
+          URL,
+          location: { href: "https://example.com" + prefix + extension + "worker.js" },
+          ...(worker ? {} : { document: { baseURI: "https://example.com" + prefix + "lab/", getElementById() { return { textContent: '{"baseUrl":"../"}' }; } } }),
+          fetch(url) { fetched = url; return Promise.resolve(); },
+        });
+        await vm.runInContext(patched, context);
+        assert.equal(fetched, "https://example.com" + prefix + "conda-pypi-mapping.json");
+      }
+    }
+    assert.deepEqual(offline.prepareOffline(directory), assets);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("offline inventory includes lazy assets but excludes archives and mutable deployment metadata", () => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-offline-inventory-"));
+  try {
+    mkdirSync(join(directory, "lab"));
+    writeFileSync(join(directory, "lab/index.html"), "<html><head></head><body></body></html>");
+    for (const name of ["service-worker.js", "deployment.json", "datax-now.zip", "cors_server.py", "lazy.js"]) writeFileSync(join(directory, name), "asset");
+    const first = offline.prepareOffline(directory);
+    assert.deepEqual(offline.prepareOffline(directory), first, "generation is idempotent");
+    assert.deepEqual(Object.keys(first).sort(), ["datax-offline.js", "lab/index.html", "lazy.js"]);
+    assert.match(readFileSync(join(directory, "lab/index.html"), "utf8"), /src="..\/datax-offline.js"/);
+    for (const [relative, asset] of Object.entries(first)) {
+      const bytes = readFileSync(join(directory, relative));
+      assert.equal(asset.sha256, createHash("sha256").update(bytes).digest("hex"));
+      assert.equal(asset.size, bytes.length);
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("offline app navigation survives a new notebook query after the worker restarts", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-offline-navigation-"));
+  const stored = new Map();
+  let online = true;
+  try {
+    mkdirSync(join(directory, "dist/xeus/xeus-python-wasm-host"), { recursive: true });
+    writeFileSync(join(directory, "dist/xeus/xeus-python-wasm-host/xpython.js"), "runtime");
+    writeFileSync(join(directory, "dist/service-worker.js"), upstream);
+    const result = spawnSync("python3", ["-c", patch], { cwd: directory, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    const assets = { "lab/index.html": { sha256: createHash("sha256").update("app shell").digest("hex"), size: 9 } };
+    function startWorker() {
+      const context = vm.createContext({
+        URL, Request, Response, Headers, btoa,
+        location: { href: "https://example.com/go/service-worker.js?enableCache=true", origin: "https://example.com" },
+        self: { location: { href: "https://example.com/go/service-worker.js?enableCache=true" }, addEventListener() {}, clients: { async claim() {} } },
+        caches: { async open() { return {
+          async match(request) { return stored.get(request.url ?? request)?.clone(); },
+          async put(request, response) { stored.set(request.url ?? request, response.clone()); },
+        }; } },
+        async fetch() {
+          if (!online) throw new TypeError("Network is offline");
+          return new Response("app shell");
+        },
+      });
+      vm.runInContext(readFileSync(join(directory, "dist/service-worker.js"), "utf8"), context);
+      context.assets = assets;
+      vm.runInContext(`(${offline.installOfflineCache.toString()})(assets)`, context);
+      return context;
+    }
+    async function navigate(context, path) {
+      const tasks = [];
+      const response = await context.maybeFromCache({
+        request: new Request("https://example.com/go/" + path),
+        waitUntil(task) { tasks.push(task); },
+      });
+      await Promise.all(tasks);
+      return response.text();
+    }
+    assert.equal(await navigate(startWorker(), "lab/index.html"), "app shell");
+    online = false;
+    assert.equal(await navigate(startWorker(), "lab/?path=Offline.ipynb"), "app shell");
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

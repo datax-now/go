@@ -1526,7 +1526,7 @@ preserved_top_level = {
     key: value
     for key, value in source_config.items()
   if key.startswith('xeus')
-  or key in {'appName', 'defaultKernelName', 'exposeAppInBrowser'}
+  or key in {'appName', 'defaultKernelName', 'exposeAppInBrowser', 'enableServiceWorkerCache'}
 }
 
 root_target = Path('dist/jupyter-lite.json')
@@ -1545,7 +1545,7 @@ def patch_json(path, app_name=None):
 
     config = data.setdefault('jupyter-config-data', {})
 
-    for key in ('appName', 'defaultKernelName'):
+    for key in ('appName', 'defaultKernelName', 'enableServiceWorkerCache'):
       value = source_config.get(key)
       if value is not None and config.get(key) != value:
         config[key] = value

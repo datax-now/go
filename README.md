@@ -141,6 +141,35 @@ service worker or revalidate with `304`, without another full body download.
 Cache eviction, cleared site data, and private browsing can require downloads
 again. PWA installation alone does not guarantee offline availability.
 
+### Offline use
+
+While online, open the app and select **Download for offline use** in the status
+bar. Confirm the download size and wait for **Offline ready** before disconnecting.
+This downloads the complete local application, lazy-loaded extensions, bundled
+notebooks and data, and the WebAssembly kernel packages. It excludes the
+deployment ZIP. The installed PWA can then reopen, start a fresh kernel, run
+Python, and access locally saved notebooks without an internet connection.
+App navigation remains available when notebook query parameters change.
+
+The kernel's conda-to-PyPI name mapping is also bundled locally. Its build input,
+`scripts/conda-pypi-mapping.json`, is a snapshot of prefix-dev/parselmouth's
+`files/compressed_mapping.json` at commit
+`345e9bfbd11d932d63df2bc1146511337f7ba5dd`; kernel startup does not fetch it from
+GitHub.
+
+Downloads are SHA-256 verified and reuse already cached files. An interrupted
+download can be retried without starting over. Failed downloads or insufficient
+browser storage never report readiness. The app requests persistent storage,
+but browsers may decline it or evict data; the readiness check runs again when
+the app opens. After a release update, download any missing assets again while
+online. Offline files and notebooks belong to the selected origin and browser
+profile, not to all deployment mirrors.
+
+Network-dependent notebook code, remote datasets, AI services, and packages not
+included in the build still require internet access. External fonts may fall
+back to local fonts. Keep important notebooks exported separately: installing
+a PWA or granting persistent storage is not a backup.
+
 ### Read the Docs 429 responses
 
 `429 Too Many Requests (from service worker)` can be an upstream response
