@@ -89,6 +89,14 @@ sections below follow the same order.
 
 ### Browser caching
 
+Before fingerprinting and packaging, the build removes byte-identical shared
+library copies from the runtime `bin/` and extension static directories.
+Kernel workers resolve those URLs to the single copy under
+`xeus/xeus-python-wasm-host/`, so downloads and cache entries are shared too.
+Libraries with different bytes are retained. This works without server
+redirects on all four static hosts; package archives are left intact because
+they populate the kernel filesystem.
+
 Service-worker caching is enabled in `jupyter-lite.json`. After all runtime
 patches, the build fingerprints every file under `dist/xeus/` with SHA-256 and
 embeds the manifest in the service worker. Runtime files use content-addressed
@@ -132,6 +140,35 @@ not the decoded resource size: unchanged runtime assets should come from the
 service worker or revalidate with `304`, without another full body download.
 Cache eviction, cleared site data, and private browsing can require downloads
 again. PWA installation alone does not guarantee offline availability.
+
+### Offline use
+
+While online, open the app and select **Download for offline use** in the status
+bar. Confirm the download size and wait for **Offline ready** before disconnecting.
+This downloads the complete local application, lazy-loaded extensions, bundled
+notebooks and data, and the WebAssembly kernel packages. It excludes the
+deployment ZIP. The installed PWA can then reopen, start a fresh kernel, run
+Python, and access locally saved notebooks without an internet connection.
+App navigation remains available when notebook query parameters change.
+
+The kernel's conda-to-PyPI name mapping is also bundled locally. Its build input,
+`scripts/conda-pypi-mapping.json`, is a snapshot of prefix-dev/parselmouth's
+`files/compressed_mapping.json` at commit
+`345e9bfbd11d932d63df2bc1146511337f7ba5dd`; kernel startup does not fetch it from
+GitHub.
+
+Downloads are SHA-256 verified and reuse already cached files. An interrupted
+download can be retried without starting over. Failed downloads or insufficient
+browser storage never report readiness. The app requests persistent storage,
+but browsers may decline it or evict data; the readiness check runs again when
+the app opens. After a release update, download any missing assets again while
+online. Offline files and notebooks belong to the selected origin and browser
+profile, not to all deployment mirrors.
+
+Network-dependent notebook code, remote datasets, AI services, and packages not
+included in the build still require internet access. External fonts may fall
+back to local fonts. Keep important notebooks exported separately: installing
+a PWA or granting persistent storage is not a backup.
 
 ### Read the Docs 429 responses
 
@@ -268,7 +305,8 @@ The `deploy-cloudflare.yml` workflow uploads `dist/` directly with Wrangler;
 it does not use R2 or deploy a Worker. It prepares a Pages-only copy, gzip-
 compresses assets that exceed the per-file limit, and adds matching
 `Content-Encoding` rules plus the COOP/COEP isolation headers required by the
-WebAssembly runtime. The 340 MB deployment ZIP is omitted because Pages cannot
+WebAssembly runtime. The deployment ZIP is not built (`DATAX_BUILD_ARCHIVE=0`)
+because Pages cannot
 host an asset that large; the RTD, Vercel, and GitHub Pages deployments continue
 to publish it. The workflow verifies the deployed commit and isolation headers.
 

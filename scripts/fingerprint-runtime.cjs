@@ -1,6 +1,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const offline = require('./offline-cache.cjs');
 
 // Ordered by priority: a host later in the list is only tried after every earlier one failed.
 const DEFAULT_MIRROR_ORIGINS = [
@@ -157,8 +158,10 @@ function fingerprintRuntime(directory, mirrorOrigins = DEFAULT_MIRROR_ORIGINS, b
     }
   }
   visit(runtime);
+  const assets = offline.prepareOffline(directory);
   const source = fs.readFileSync(worker, 'utf8').split(marker)[0];
-  fs.writeFileSync(worker, source + marker + `(${installRuntimeCache.toString()})(${JSON.stringify(hashes)}, ${JSON.stringify(mirrorOrigins)}, ${JSON.stringify(buildCommit)});\n`);
+  fs.writeFileSync(worker, source + marker + `(${installRuntimeCache.toString()})(${JSON.stringify(hashes)}, ${JSON.stringify(mirrorOrigins)}, ${JSON.stringify(buildCommit)});\n` +
+    `(${offline.installOfflineCache.toString()})(${JSON.stringify(assets)});\n`);
   console.log(`Fingerprinted ${Object.keys(hashes).length} runtime files for cache-first reuse`);
   return hashes;
 }
