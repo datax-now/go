@@ -7,9 +7,85 @@ import { spawnSync } from "node:child_process";
 import vm from "node:vm";
 import test from "node:test";
 import fingerprints from "./fingerprint-runtime.cjs";
+import startup from "./patch-wasm-startup.cjs";
 
 const root = new URL("../", import.meta.url);
+test("duplicate libraries are removed only after worker fetch aliases are installed", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-library-dedup-"));
+  const runtime = "xeus/xeus-python-wasm-host/";
+  const extension = "extensions/@jupyterlite/xeus-extension/static/";
+  try {
+    for (const folder of [runtime, runtime + "bin/", extension]) mkdirSync(join(directory, folder), { recursive: true });
+    writeFileSync(join(directory, runtime, "libR.so.asm"), "shared library");
+    writeFileSync(join(directory, runtime + "bin/", "libR.so.asm"), "shared library");
+    writeFileSync(join(directory, extension, "libR.so.asm"), "shared library");
+    writeFileSync(join(directory, runtime, "different.so.asm"), "canonical");
+    writeFileSync(join(directory, extension, "different.so.asm"), "different");
+    assert.throws(() => startup.compactLibraries(directory), /without a kernel worker/);
+    assert.equal(readFileSync(join(directory, runtime + "bin/", "libR.so.asm"), "utf8"), "shared library");
+    writeFileSync(join(directory, extension, "kernel.worker.test.js"), "globalThis.started = true;");
+    assert.deepEqual(startup.compactLibraries(directory), { removedFiles: 2, savedBytes: 28 });
+    assert.throws(() => readFileSync(join(directory, runtime + "bin/", "libR.so.asm")), /ENOENT/);
+    assert.equal(readFileSync(join(directory, extension, "different.so.asm"), "utf8"), "different");
+    assert.deepEqual(startup.compactLibraries(directory), { removedFiles: 0, savedBytes: 0 });
+    for (const prefix of ["/", "/go/", "/en/latest/_static/"]) {
+      const calls = [];
+      const context = vm.createContext({
+        URL, Request,
+        location: { href: `https://example.com${prefix}${extension}kernel.worker.test.js` },
+        fetch(input, options) { calls.push([input, options]); return Promise.resolve(new Response("ok")); },
+      });
+      vm.runInContext(readFileSync(join(directory, extension, "kernel.worker.test.js"), "utf8"), context);
+      assert.equal(context.started, true);
+      await context.fetch(new Request(`https://example.com${prefix}${runtime}bin/libR.so.asm?x=1`, {
+        headers: { Range: "bytes=0-3" }, credentials: "omit",
+      }));
+      assert.equal(calls[0][0].url, `https://example.com${prefix}${runtime}libR.so.asm?x=1`);
+      assert.equal(calls[0][0].headers.get("Range"), "bytes=0-3");
+      assert.equal(calls[0][0].credentials, "omit");
+      await context.fetch("./libR.so", { cache: "no-cache" });
+      assert.equal(calls[1][0], `https://example.com${prefix}${runtime}libR.so.asm`);
+      assert.equal(calls[1][1].cache, "no-cache");
+      const external = `https://other.example${prefix}${extension}libR.so.asm`;
+      await context.fetch(external);
+      assert.equal(calls[2][0], external);
+    }
+    writeFileSync(join(directory, extension, "kernel.worker.test.js"), "");
+    writeFileSync(join(directory, runtime, "custom.so.bin"), "custom");
+    writeFileSync(join(directory, extension, "custom.so.bin"), "custom");
+    startup.compactLibraries(directory, ".bin");
+    assert.match(readFileSync(join(directory, extension, "kernel.worker.test.js"), "utf8"),
+      /static\/custom\.so":"xeus\/xeus-python-wasm-host\/custom\.so\.bin/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 const build = readFileSync(new URL("build.sh", root), "utf8");
+test("deployment archive remains enabled by default and can be skipped", () => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-archive-setting-"));
+  const archivePatch = 'if [ "${DATAX_BUILD_ARCHIVE:-1}" = "1" ]; then' +
+    build.split('if [ "${DATAX_BUILD_ARCHIVE:-1}" = "1" ]; then')[1].split('\necho ""')[0];
+  mkdirSync(join(directory, "dist"));
+  writeFileSync(join(directory, "dist/deployment.json"), "{}");
+  try {
+    const defaultEnv = { ...process.env };
+    delete defaultEnv.DATAX_BUILD_ARCHIVE;
+    const enabled = spawnSync("bash", ["-c", archivePatch], { cwd: directory, env: defaultEnv, encoding: "utf8" });
+    assert.equal(enabled.status, 0, enabled.stderr);
+    assert.equal(readFileSync(join(directory, "dist/datax-now.zip")).subarray(0, 2).toString(), "PK");
+    rmSync(join(directory, "dist/datax-now.zip"));
+    const disabled = spawnSync("bash", ["-c", archivePatch], {
+      cwd: directory, env: { ...process.env, DATAX_BUILD_ARCHIVE: "0" }, encoding: "utf8",
+    });
+    assert.equal(disabled.status, 0, disabled.stderr);
+    assert.throws(() => readFileSync(join(directory, "dist/datax-now.zip")), /ENOENT/);
+    assert.equal(readFileSync(join(directory, "dist/deployment.json"), "utf8"), "{}");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 const patch = build.split('echo "Patching service worker cache version..."')[1]
   .split("python3 << 'EOFPATCH'\n")[1].split("\nEOFPATCH")[0];
 const isolationHeadersPatch = build.split('echo "Patching service worker navigation responses for isolation headers..."')[1]

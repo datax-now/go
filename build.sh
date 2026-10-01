@@ -3681,12 +3681,14 @@ fi
 
 DATAX_BUILD_COMMIT="$(node "$REPO_ROOT/scripts/deployment-manifest.mjs" commit "$REPO_ROOT")"
 export DATAX_BUILD_COMMIT
+SAFE_ASM_EXT="$SAFE_ASM_EXT" node "$REPO_ROOT/scripts/patch-wasm-startup.cjs" dist --compact
 node "$REPO_ROOT/scripts/fingerprint-runtime.cjs" dist
 
   # Include the local CORS server and package the complete deployment for static
   # hosts that publish the dist/ directory directly.
   cp "$REPO_ROOT/cors_server.py" "dist/cors_server.py"
 node "$REPO_ROOT/scripts/deployment-manifest.mjs" write "$REPO_ROOT/dist"
+if [ "${DATAX_BUILD_ARCHIVE:-1}" = "1" ]; then
 python3 <<'EOFPACKAGE'
 from pathlib import Path
 import tempfile
@@ -3710,6 +3712,9 @@ finally:
   temporary_path.unlink(missing_ok=True)
 EOFPACKAGE
   echo "  ✓ Wrote dist/datax-now.zip"
+else
+  echo "  Skipped deployment ZIP (DATAX_BUILD_ARCHIVE=${DATAX_BUILD_ARCHIVE})"
+fi
 
 echo ""
 echo "=========================================="

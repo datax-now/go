@@ -89,6 +89,14 @@ sections below follow the same order.
 
 ### Browser caching
 
+Before fingerprinting and packaging, the build removes byte-identical shared
+library copies from the runtime `bin/` and extension static directories.
+Kernel workers resolve those URLs to the single copy under
+`xeus/xeus-python-wasm-host/`, so downloads and cache entries are shared too.
+Libraries with different bytes are retained. This works without server
+redirects on all four static hosts; package archives are left intact because
+they populate the kernel filesystem.
+
 Service-worker caching is enabled in `jupyter-lite.json`. After all runtime
 patches, the build fingerprints every file under `dist/xeus/` with SHA-256 and
 embeds the manifest in the service worker. Runtime files use content-addressed
@@ -268,7 +276,8 @@ The `deploy-cloudflare.yml` workflow uploads `dist/` directly with Wrangler;
 it does not use R2 or deploy a Worker. It prepares a Pages-only copy, gzip-
 compresses assets that exceed the per-file limit, and adds matching
 `Content-Encoding` rules plus the COOP/COEP isolation headers required by the
-WebAssembly runtime. The 340 MB deployment ZIP is omitted because Pages cannot
+WebAssembly runtime. The deployment ZIP is not built (`DATAX_BUILD_ARCHIVE=0`)
+because Pages cannot
 host an asset that large; the RTD, Vercel, and GitHub Pages deployments continue
 to publish it. The workflow verifies the deployed commit and isolation headers.
 

@@ -77,5 +77,60 @@ function patchDirectory(directory) {
   console.log(`Patched WASM startup failure propagation in ${updates.length} files`);
 }
 
-module.exports = { patchWorker, patchRuntime, patchLibraries, patchDirectory };
-if (require.main === module) patchDirectory(process.argv[2] || 'dist');
+function installLibraryAliases(aliases) {
+  const original = globalThis.fetch;
+  const base = new URL('../../../../', globalThis.location.href);
+  globalThis.fetch = function(input, options) {
+    const url = new URL(input instanceof Request ? input.url : input, globalThis.location.href);
+    if (url.origin === base.origin && url.pathname.startsWith(base.pathname)) {
+      const target = aliases[decodeURIComponent(url.pathname.slice(base.pathname.length))];
+      if (target) {
+        url.pathname = base.pathname + target;
+        input = input instanceof Request ? new Request(url.href, input) : url.href;
+      }
+    }
+    return original.call(this, input, options);
+  };
+}
+
+function compactLibraries(directory, suffix = '.asm') {
+  const runtime = 'xeus/xeus-python-wasm-host/';
+  const extension = 'extensions/@jupyterlite/xeus-extension/static/';
+  const aliases = {};
+  const duplicates = [];
+  let savedBytes = 0;
+  for (const folder of [runtime + 'bin/', extension]) {
+    for (const name of fs.readdirSync(path.join(directory, folder)).sort()) {
+      if (!/^[^/]+\.so(?:\.[^/]+)?$/.test(name)) continue;
+      const duplicate = path.join(directory, folder, name);
+      const canonical = path.join(directory, runtime, name);
+      if (!fs.existsSync(canonical) || !fs.statSync(duplicate).isFile()) continue;
+      const bytes = fs.readFileSync(duplicate);
+      if (!bytes.equals(fs.readFileSync(canonical))) continue;
+      const relative = folder + name;
+      aliases[relative] = runtime + name;
+      if (suffix && name.endsWith('.so' + suffix)) aliases[relative.slice(0, -suffix.length)] = runtime + name;
+      duplicates.push(duplicate);
+      savedBytes += bytes.length;
+    }
+  }
+  if (!duplicates.length) return { removedFiles: 0, savedBytes: 0 };
+  const workers = fs.readdirSync(path.join(directory, extension))
+    .filter(name => name.includes('.worker.') && name.endsWith('.js'));
+  if (!workers.length) throw new Error('Cannot remove shared libraries without a kernel worker');
+  for (const name of workers) {
+    const worker = path.join(directory, extension, name);
+    const source = fs.readFileSync(worker, 'utf8');
+    if (source.includes('/* datax-library-aliases */')) throw new Error('Library aliases already installed');
+    fs.writeFileSync(worker, `;/* datax-library-aliases */\n(${installLibraryAliases.toString()})(${JSON.stringify(aliases)});\n` + source);
+  }
+  for (const filename of duplicates) fs.unlinkSync(filename);
+  console.log(`Removed ${duplicates.length} duplicate shared libraries (${(savedBytes / 1048576).toFixed(1)} MiB)`);
+  return { removedFiles: duplicates.length, savedBytes };
+}
+
+module.exports = { patchWorker, patchRuntime, patchLibraries, patchDirectory, installLibraryAliases, compactLibraries };
+if (require.main === module) {
+  if (process.argv[3] === '--compact') compactLibraries(process.argv[2] || 'dist', process.env.SAFE_ASM_EXT || '.asm');
+  else patchDirectory(process.argv[2] || 'dist');
+}

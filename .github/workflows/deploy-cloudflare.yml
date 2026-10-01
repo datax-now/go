@@ -28,6 +28,8 @@ jobs:
           ref: ${{ inputs.release_ref }}
 
       - name: Build JupyterLite deployment
+        env:
+          DATAX_BUILD_ARCHIVE: '0'
         run: bash ./build.sh -c
 
       - name: Prepare Cloudflare Pages assets
@@ -37,7 +39,6 @@ jobs:
           pages_dir="$(mktemp -d "${RUNNER_TEMP}/datax-now-pages.XXXXXX")"
           cp -a dist/. "$pages_dir/"
           cp cloudflare/_headers "$pages_dir/_headers"
-          rm "$pages_dir/datax-now.zip"
           compressed_files=0
           while IFS= read -r -d '' asset; do
             compressed="${asset}.gzip"
@@ -59,7 +60,7 @@ jobs:
         run: |
           set -euo pipefail
           test -s dist/deployment.json
-          test -s dist/datax-now.zip
+          test ! -e dist/datax-now.zip
           test -s "$PAGES_DIR/deployment.json"
           test ! -e "$PAGES_DIR/datax-now.zip"
           release_commit="$(jq -er '.commit' dist/deployment.json)"
