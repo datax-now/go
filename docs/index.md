@@ -14,13 +14,15 @@ Hosts are listed in priority order; use the first one that works for your networ
   host to download from. Some company networks may block it.
 - <a href="https://datax-now.pages.dev/lab/">Open the Cloudflare Pages mirror</a> —
   an independent application host.
-- <a href="_static/datax-now.zip">Download the local DataX.now deployment</a> — for faster access, use one of the hosts above instead.
 
 Choose one host for a session. Notebook files and browser storage are separate
 on each origin; export important work before switching hosts.
 
-After extracting the download, run `python cors_server.py` from the unzipped
-folder to start a local instance of DataX.now.
+For offline use, open a deployment while online and select **Download for
+offline use** in the status bar. Wait for **Offline ready** before disconnecting.
+
+To serve a local build, run `python cors_server.py` from the repository root or
+the generated `dist/` directory.
 
 ## About this site
 

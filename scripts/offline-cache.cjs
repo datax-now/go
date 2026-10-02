@@ -241,7 +241,10 @@ function prepareOffline(directory) {
       if (entry.isDirectory()) { visit(filename); continue; }
       if (!entry.isFile()) continue;
       const relative = path.relative(directory, filename).split(path.sep).map(encodeURIComponent).join('/');
-      if (['service-worker.js', 'deployment.json', 'datax-now.zip', 'cors_server.py'].includes(relative)) continue;
+      if ([
+        'service-worker.js', 'deployment.json', 'datax-now.zip', 'cors_server.py',
+        'xeus/xeus-python-wasm-host/built-in-local/conda/generate_repodata.py',
+      ].includes(relative)) continue;
       if (entry.name === 'index.html') {
         const html = fs.readFileSync(filename, 'utf8');
         const script = `<script id="datax-offline-client" src="${path.relative(path.dirname(filename), path.join(directory, client)).split(path.sep).join('/')}" defer></script>`;

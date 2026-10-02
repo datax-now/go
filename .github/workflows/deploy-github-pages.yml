@@ -33,12 +33,12 @@ jobs:
       - name: Build JupyterLite deployment
         run: bash ./build.sh -c
 
-      - name: Verify complete deployment and record release
+      - name: Verify deployment and record release
         id: release
         shell: bash
         run: |
           set -euo pipefail
-          test -s dist/datax-now.zip
+          test -s dist/deployment.json
           test -f dist/cors_server.py
           commit="$(jq -er '.commit' dist/deployment.json)"
           echo "commit=${commit}" >> "$GITHUB_OUTPUT"
@@ -90,11 +90,9 @@ jobs:
           deployed_commit="$(curl --fail --silent --show-error "${page_url}deployment.json" | jq -er '.commit')"
           test "$deployed_commit" = "$EXPECTED_COMMIT"
           echo "JupyterLite: ${page_url}"
-          echo "ZIP: ${page_url}datax-now.zip"
           {
             echo "## JupyterLite deployment"
             echo
             echo "- Release: ${deployed_commit}"
             echo "- Site: ${page_url}"
-            echo "- ZIP: ${page_url}datax-now.zip"
           } >> "$GITHUB_STEP_SUMMARY"

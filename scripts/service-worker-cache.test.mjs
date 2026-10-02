@@ -63,25 +63,43 @@ test("duplicate libraries are removed only after worker fetch aliases are instal
 });
 
 const build = readFileSync(new URL("build.sh", root), "utf8");
-test("deployment archive remains enabled by default and can be skipped", () => {
-  const directory = mkdtempSync(join(tmpdir(), "datax-archive-setting-"));
-  const archivePatch = 'if [ "${DATAX_BUILD_ARCHIVE:-1}" = "1" ]; then' +
-    build.split('if [ "${DATAX_BUILD_ARCHIVE:-1}" = "1" ]; then')[1].split('\necho ""')[0];
-  mkdirSync(join(directory, "dist"));
-  writeFileSync(join(directory, "dist/deployment.json"), "{}");
+test("build does not generate a deployment archive", () => {
+  assert.doesNotMatch(build, /DATAX_BUILD_ARCHIVE|datax-now\.zip|zipfile/);
+});
+
+test("build publishes local package assets without generator scripts", () => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-built-in-publish-"));
+  const conda = join(directory, "source/conda");
+  const wheels = join(directory, "source/wheels");
+  const destination = join(directory, "dist/built-in-local");
+  const publish = build.split('echo "Publishing built-in local package store..."')[1]
+    ?.split('echo "Normalizing empack metadata and writing built-in local manifest..."')[0];
   try {
-    const defaultEnv = { ...process.env };
-    delete defaultEnv.DATAX_BUILD_ARCHIVE;
-    const enabled = spawnSync("bash", ["-c", archivePatch], { cwd: directory, env: defaultEnv, encoding: "utf8" });
-    assert.equal(enabled.status, 0, enabled.stderr);
-    assert.equal(readFileSync(join(directory, "dist/datax-now.zip")).subarray(0, 2).toString(), "PK");
-    rmSync(join(directory, "dist/datax-now.zip"));
-    const disabled = spawnSync("bash", ["-c", archivePatch], {
-      cwd: directory, env: { ...process.env, DATAX_BUILD_ARCHIVE: "0" }, encoding: "utf8",
+    assert.ok(publish, "build publication block should exist");
+    mkdirSync(join(conda, "noarch"), { recursive: true });
+    mkdirSync(join(conda, "emscripten-wasm32"), { recursive: true });
+    mkdirSync(wheels, { recursive: true });
+    writeFileSync(join(conda, "generate_repodata.py"), "build helper");
+    writeFileSync(join(conda, "noarch/repodata.json"), "{}");
+    writeFileSync(join(conda, "noarch/demo.conda"), "package");
+    writeFileSync(join(wheels, "generate_index.py"), "build helper");
+    writeFileSync(join(wheels, "index.json"), '{"packages":{}}');
+    writeFileSync(join(wheels, "demo.whl"), "wheel");
+    const result = spawnSync("bash", ["-c", `mamba_run_deploy() { :; }\n${publish}`], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        BUILTIN_CONDA_DIR: conda,
+        BUILTIN_RUNTIME_WHEELS_DIR: wheels,
+        BUILTIN_LOCAL_DIST_DIR: destination,
+      },
     });
-    assert.equal(disabled.status, 0, disabled.stderr);
-    assert.throws(() => readFileSync(join(directory, "dist/datax-now.zip")), /ENOENT/);
-    assert.equal(readFileSync(join(directory, "dist/deployment.json"), "utf8"), "{}");
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(readFileSync(join(destination, "conda/noarch/demo.conda"), "utf8"), "package");
+    assert.equal(readFileSync(join(destination, "pip/demo.whl"), "utf8"), "wheel");
+    assert.equal(readFileSync(join(destination, "pip/index.json"), "utf8"), '{"packages":{}}');
+    assert.throws(() => readFileSync(join(destination, "conda/generate_repodata.py")), /ENOENT/);
+    assert.throws(() => readFileSync(join(destination, "pip/generate_index.py")), /ENOENT/);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -161,17 +179,28 @@ test("controlled app navigations add COOP and COEP without changing other respon
     assert.equal(readFileSync(workerPath, "utf8"), patched, "patch should be idempotent");
 
     const sourceResponse = new Response("app shell", { status: 200, statusText: "OK" });
+    const fetchCalls = [];
+    let queuedResponses = [];
     const context = vm.createContext({
       Headers,
       Response,
-      async fetch() { return sourceResponse; },
+      async fetch(input, options) {
+        fetchCalls.push([input, options]);
+        return queuedResponses.shift() ?? sourceResponse;
+      },
     });
     vm.runInContext(patched, context);
 
-    async function fetchThroughWorker(mode, destination = "") {
+    async function fetchThroughWorker(mode, destination = "", headers = new Headers()) {
       let intercepted;
       context.onFetch({
-        request: { mode, destination, url: "https://example.com/lab/index.html" },
+        request: {
+          mode,
+          destination,
+          url: "https://example.com/lab/index.html",
+          headers,
+          credentials: "include",
+        },
         respondWith(response) { intercepted = response; },
       });
       return intercepted;
@@ -187,6 +216,25 @@ test("controlled app navigations add COOP and COEP without changing other respon
     assert.equal(navigation.status, 200);
     assert.equal(navigation.statusText, "OK");
     assert.equal(await navigation.text(), "app shell");
+
+    queuedResponses = [
+      new Response(null, { status: 304 }),
+      new Response("fresh app", { status: 200, statusText: "OK" }),
+    ];
+    const conditionalNavigation = await fetchThroughWorker(
+      "navigate",
+      "",
+      new Headers({ "If-None-Match": 'W/"cached-app"' }),
+    );
+    assert.equal(conditionalNavigation.status, 200);
+    assert.equal(conditionalNavigation.headers.get("Cross-Origin-Embedder-Policy"), "require-corp");
+    assert.equal(await conditionalNavigation.text(), "fresh app");
+    assert.equal(fetchCalls[2][0].headers.get("If-None-Match"), 'W/"cached-app"');
+    assert.equal(fetchCalls[3][0], "https://example.com/lab/index.html");
+    assert.equal(fetchCalls[3][1].cache, "no-store");
+    assert.equal(fetchCalls[3][1].credentials, "include");
+    assert.equal(fetchCalls[3][1].mode, "same-origin");
+    assert.equal(fetchCalls[3][1].headers.get("If-None-Match"), null);
 
     const subresource = await fetchThroughWorker("cors");
     assert.equal(subresource, sourceResponse, "subresource responses should pass through untouched");
@@ -883,11 +931,14 @@ test("offline inventory includes lazy assets but excludes archives and mutable d
   const directory = mkdtempSync(join(tmpdir(), "datax-offline-inventory-"));
   try {
     mkdirSync(join(directory, "lab"));
+    mkdirSync(join(directory, "xeus/xeus-python-wasm-host/built-in-local/conda"), { recursive: true });
     writeFileSync(join(directory, "lab/index.html"), "<html><head></head><body></body></html>");
     for (const name of ["service-worker.js", "deployment.json", "datax-now.zip", "cors_server.py", "lazy.js"]) writeFileSync(join(directory, name), "asset");
+    writeFileSync(join(directory, "xeus/xeus-python-wasm-host/built-in-local/conda/generate_repodata.py"), "build helper");
+    writeFileSync(join(directory, "sample.py"), "runtime asset");
     const first = offline.prepareOffline(directory);
     assert.deepEqual(offline.prepareOffline(directory), first, "generation is idempotent");
-    assert.deepEqual(Object.keys(first).sort(), ["datax-offline.js", "lab/index.html", "lazy.js"]);
+    assert.deepEqual(Object.keys(first).sort(), ["datax-offline.js", "lab/index.html", "lazy.js", "sample.py"]);
     assert.match(readFileSync(join(directory, "lab/index.html"), "utf8"), /src="..\/datax-offline.js"/);
     for (const [relative, asset] of Object.entries(first)) {
       const bytes = readFileSync(join(directory, relative));

@@ -25,7 +25,7 @@ export async function createDeploymentManifest(directory, commit) {
   const root = resolve(directory);
   const files = {};
   const paths = (await listFiles(root))
-    .filter(path => !["deployment.json", "datax-now.zip"].includes(relative(root, path)))
+    .filter(path => relative(root, path) !== "deployment.json")
     .sort();
 
   for (const path of paths) {

@@ -41,6 +41,7 @@ dependencies:
     # Use the PyPI wheel: the current conda package metadata is 0.8.3 but
     # still contains the JupyterLite 0.7.6 application archive.
     - jupyterlite-core==0.8.3
+    - jupyterlite-pyodide-kernel==0.8.3
     - jupyterlab-open-url-parameter
     - jupyterlab-plugin-playground==1.0.0
     # Pre-bundle transitive pip-only deps to avoid slow PyPI downloads on clean builds
@@ -54,7 +55,7 @@ dependencies:
     - jupyterlab-ai-commands>=0.3.1,<0.4
     - built-in-wheels/jupyter_secrets_manager-0.5.0-py3-none-any.whl
     - built-in-wheels/jupyterlite_ai-0.19.0-py3-none-any.whl
-    - built-in-wheels/xeus_x_ai_agents-0.7.4-py3-none-any.whl
+    - built-in-wheels/xeus_x_ai_agents-0.7.5-py3-none-any.whl
     # xeus-x kernel wheel — produced by xeus-x/build-kernel.sh or build-wheel.sh
     # and published into built-in-wheels/
     # The version is updated automatically by update_wheel_references.py

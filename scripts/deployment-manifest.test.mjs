@@ -35,13 +35,12 @@ test("the checked-out commit wins over the dispatching ref's GITHUB_SHA", async 
   assert.equal(resolveCommit({ GITHUB_SHA: commit }, directory), git("rev-parse", "HEAD"));
 });
 
-test("manifest hashes deployment files and excludes generated metadata/archive", async t => {
+test("manifest hashes deployment files and excludes its generated metadata", async t => {
   const directory = await mkdtemp(join(tmpdir(), "deployment-manifest-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   await mkdir(join(directory, "assets"));
   await writeFile(join(directory, "assets", "runtime.wasm"), "runtime");
   await writeFile(join(directory, "deployment.json"), "old manifest");
-  await writeFile(join(directory, "datax-now.zip"), "old archive");
 
   const manifest = await createDeploymentManifest(directory, commit);
   assert.equal(manifest.commit, commit);

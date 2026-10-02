@@ -2884,14 +2884,18 @@ if not match:
 response_name = re.match(r'(\w+)&&', match.group(3)).group(1)
 event_name = match.group(2)
 wrapped_response = (
-  f'{response_name}&&{event_name}.respondWith({response_name}.then(response=>'
-  f'!{isolated_request.format(event_name)}||!response?response:'
-  '(()=>{const headers=new Headers(response.headers);'
+  f'{response_name}&&{event_name}.respondWith({response_name}.then(async response=>{{'
+  f'if(!{isolated_request.format(event_name)}||!response)return response;'
+  f'if(response.status===304){{const retryHeaders=new Headers({event_name}.request.headers);'
+  'retryHeaders.delete("If-None-Match");retryHeaders.delete("If-Modified-Since");'
+  f'response=await fetch({event_name}.request.url,{{cache:"no-store",'
+  f'credentials:{event_name}.request.credentials,headers:retryHeaders,mode:"same-origin"}});}}'
+  'const headers=new Headers(response.headers);'
   'headers.set("Cross-Origin-Embedder-Policy","require-corp");'
   'headers.set("Cross-Origin-Opener-Policy","same-origin");'
   'headers.set("Cross-Origin-Resource-Policy","same-origin");'
   'return new Response(response.body,{status:response.status,'
-  'statusText:response.statusText,headers})})()))'
+  'statusText:response.statusText,headers});}))'
 )
 updated = content[:match.start(3)] + wrapped_response + content[match.end(3):]
 sw_file.write_text(updated)
@@ -3312,7 +3316,10 @@ rm -rf "$BUILTIN_LOCAL_DIST_DIR"
 mkdir -p "$BUILTIN_LOCAL_DIST_DIR/conda" "$BUILTIN_LOCAL_DIST_DIR/pip"
 
 if [ -d "$BUILTIN_CONDA_DIR" ]; then
-  cp -r "$BUILTIN_CONDA_DIR/." "$BUILTIN_LOCAL_DIST_DIR/conda/"
+  for conda_subdir in "$BUILTIN_CONDA_DIR"/*/; do
+    [[ -d "$conda_subdir" ]] || continue
+    cp -r "${conda_subdir%/}" "$BUILTIN_LOCAL_DIST_DIR/conda/"
+  done
   for quak_package in "$BUILTIN_LOCAL_DIST_DIR"/conda/*/quak-*.conda; do
     [[ -f "$quak_package" ]] || continue
     mamba_run_deploy python "$QUAK_PATCHER" "$quak_package"
@@ -3335,7 +3342,13 @@ for _subdir in emscripten-wasm32 noarch; do
 done
 
 if [ -d "$BUILTIN_RUNTIME_WHEELS_DIR" ]; then
-  cp -r "$BUILTIN_RUNTIME_WHEELS_DIR/." "$BUILTIN_LOCAL_DIST_DIR/pip/"
+  for runtime_wheel in "$BUILTIN_RUNTIME_WHEELS_DIR"/*.whl; do
+    [[ -f "$runtime_wheel" ]] || continue
+    cp "$runtime_wheel" "$BUILTIN_LOCAL_DIST_DIR/pip/"
+  done
+  if [ -f "$BUILTIN_RUNTIME_WHEELS_DIR/index.json" ]; then
+    cp "$BUILTIN_RUNTIME_WHEELS_DIR/index.json" "$BUILTIN_LOCAL_DIST_DIR/pip/"
+  fi
   echo "  ✓ Copied runtime wheels to $BUILTIN_LOCAL_DIST_DIR/pip"
 else
   echo "  ✓ No built-in-runtime-wheels directory found - skipping"
@@ -3684,37 +3697,9 @@ export DATAX_BUILD_COMMIT
 SAFE_ASM_EXT="$SAFE_ASM_EXT" node "$REPO_ROOT/scripts/patch-wasm-startup.cjs" dist --compact
 node "$REPO_ROOT/scripts/fingerprint-runtime.cjs" dist
 
-  # Include the local CORS server and package the complete deployment for static
-  # hosts that publish the dist/ directory directly.
+  # Include the local CORS server for users serving the generated directory.
   cp "$REPO_ROOT/cors_server.py" "dist/cors_server.py"
 node "$REPO_ROOT/scripts/deployment-manifest.mjs" write "$REPO_ROOT/dist"
-if [ "${DATAX_BUILD_ARCHIVE:-1}" = "1" ]; then
-python3 <<'EOFPACKAGE'
-from pathlib import Path
-import tempfile
-import zipfile
-
-dist = Path("dist")
-archive = dist / "datax-now.zip"
-
-with tempfile.NamedTemporaryFile(
-  dir=dist, prefix=".datax-now-", suffix=".zip", delete=False
-) as temporary:
-  temporary_path = Path(temporary.name)
-
-try:
-  with zipfile.ZipFile(temporary_path, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
-    for path in sorted(dist.rglob("*")):
-      if path.is_file() and path not in {archive, temporary_path}:
-        bundle.write(path, path.relative_to(dist))
-  temporary_path.replace(archive)
-finally:
-  temporary_path.unlink(missing_ok=True)
-EOFPACKAGE
-  echo "  ✓ Wrote dist/datax-now.zip"
-else
-  echo "  Skipped deployment ZIP (DATAX_BUILD_ARCHIVE=${DATAX_BUILD_ARCHIVE})"
-fi
 
 echo ""
 echo "=========================================="

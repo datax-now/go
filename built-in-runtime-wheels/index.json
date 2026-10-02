@@ -1,4 +1,12 @@
 {
   "version": 1,
-  "packages": {}
+  "packages": {
+    "pyodide-py": {
+      "name": "pyodide-py",
+      "version": "0.29.3",
+      "filename": "pyodide_py-0.29.3-py3-none-any.whl",
+      "sha256": "10043720145cb772b64fa087b2d3f3b99d598c3dc7c1e661a282eec9b8b30664",
+      "size": 66015
+    }
+  }
 }

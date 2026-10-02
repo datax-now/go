@@ -64,10 +64,9 @@ node scripts/deployment-manifest.mjs verify - \
 
 To include Read the Docs, put its static-assets base URL ending in
 `/_static/` first. The verifier reports a mismatch if mirrors differ by commit or
-asset bytes. `deployment.json` itself and the generated ZIP are excluded from
-the inventory to avoid a self-referential archive hash. The recorded commit is
-the checked-out Git `HEAD`; `VERCEL_GIT_COMMIT_SHA` or `GITHUB_SHA` is used only
-when there is no checkout.
+asset bytes. `deployment.json` itself is excluded from the inventory because it
+contains that inventory. The recorded commit is the checked-out Git `HEAD`;
+`VERCEL_GIT_COMMIT_SHA` or `GITHUB_SHA` is used only when there is no checkout.
 
 ## Deployment priority
 
@@ -89,7 +88,7 @@ sections below follow the same order.
 
 ### Browser caching
 
-Before fingerprinting and packaging, the build removes byte-identical shared
+Before fingerprinting, the build removes byte-identical shared
 library copies from the runtime `bin/` and extension static directories.
 Kernel workers resolve those URLs to the single copy under
 `xeus/xeus-python-wasm-host/`, so downloads and cache entries are shared too.
@@ -146,9 +145,9 @@ again. PWA installation alone does not guarantee offline availability.
 While online, open the app and select **Download for offline use** in the status
 bar. Confirm the download size and wait for **Offline ready** before disconnecting.
 This downloads the complete local application, lazy-loaded extensions, bundled
-notebooks and data, and the WebAssembly kernel packages. It excludes the
-deployment ZIP. The installed PWA can then reopen, start a fresh kernel, run
-Python, and access locally saved notebooks without an internet connection.
+notebooks and data, and the WebAssembly kernel packages. The installed PWA can
+then reopen, start a fresh kernel, run Python, and access locally saved
+notebooks without an internet connection.
 App navigation remains available when notebook query parameters change.
 
 The kernel's conda-to-PyPI name mapping is also bundled locally. Its build input,
@@ -243,20 +242,11 @@ also be started manually with **Run workflow** and a `release_ref`. In the repos
 set **Pages > Build and deployment > Source** to **GitHub Actions**.
 
 GitHub Pages sites may not exceed 1 GB. The workflow fails before upload above
-1 GiB and warns above 95%; the ZIP is roughly a third of the site, so growth in
-the runtime is the first thing to trim.
-
-The workflow also places a ZIP of the complete deployment at the site root:
-
-```text
-https://<owner>.github.io/<repository>/datax-now.zip
-```
-
-The exact Pages URL and ZIP URL are printed in the deployment job summary after
-each successful run. Vercel publishes the same archive at `/datax-now.zip`, and
-Read the Docs publishes it at `/_static/datax-now.zip`. GitHub Pages does not
-let the workflow configure custom COOP/COEP response headers. The app's service
-worker adds both policies to controlled navigations and reloads the first visit
+1 GiB and warns above 95%; growth in the runtime is the first thing to trim.
+The deployment job summary prints the Pages URL after each successful run.
+GitHub Pages does not let the workflow configure custom COOP/COEP response
+headers. The app's service worker adds both policies to controlled navigations
+and reloads the first visit
 after taking control; use a browser with service worker support. Read the Docs,
 Vercel, and Cloudflare provide server headers or a service-worker fallback as
 well.
@@ -305,10 +295,8 @@ The `deploy-cloudflare.yml` workflow uploads `dist/` directly with Wrangler;
 it does not use R2 or deploy a Worker. It prepares a Pages-only copy, gzip-
 compresses assets that exceed the per-file limit, and adds matching
 `Content-Encoding` rules plus the COOP/COEP isolation headers required by the
-WebAssembly runtime. The deployment ZIP is not built (`DATAX_BUILD_ARCHIVE=0`)
-because Pages cannot
-host an asset that large; the RTD, Vercel, and GitHub Pages deployments continue
-to publish it. The workflow verifies the deployed commit and isolation headers.
+WebAssembly runtime. The workflow verifies the deployed commit and isolation
+headers.
 
 1. Create a Cloudflare Pages **Direct Upload** project named `datax-now` and
   set its production branch to `master`.
