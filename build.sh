@@ -3039,6 +3039,12 @@ if manifest.is_file():
     data = json.loads(manifest.read_text(encoding="utf-8"))
     data["short_name"] = data["name"] = title
     data["description"] = description
+    data["id"] = "./"
+    data["theme_color"] = "#f7dc1e"
+    data["icons"] = [icon for icon in data.get("icons", []) if icon.get("sizes") != "120x120"]
+    for icon in data["icons"]:
+        if icon.get("sizes") == "512x512":
+            icon["purpose"] = "any maskable"
     for shortcut in data.get("shortcuts", []):
         if shortcut["url"].startswith("/"):
             shortcut["url"] = "." + shortcut["url"]

@@ -147,11 +147,20 @@ test("manifest shortcuts stay within the deployment subpath", () => {
   try {
     writeFileSync(join(directory, "dist/manifest.webmanifest"), JSON.stringify({
       name: "JupyterLite", short_name: "JupyterLite", scope: "./", start_url: "./",
+      icons: [
+        { src: "./icon-120x120.png", type: "image/png", sizes: "120x120" },
+        { src: "./icon-512x512.png", type: "image/png", sizes: "512x512" },
+      ],
       shortcuts: [{ name: "JupyterLite", url: "/lab" }, { name: "Replite", url: "/repl?toolbar=1" }],
     }));
     const result = spawnSync("python3", ["-c", brandingPatch], { cwd: directory, encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
     const manifest = JSON.parse(readFileSync(join(directory, "dist/manifest.webmanifest"), "utf8"));
+    assert.equal(manifest.id, "./");
+    assert.equal(manifest.theme_color, "#f7dc1e");
+    assert.deepEqual(manifest.icons, [
+      { src: "./icon-512x512.png", type: "image/png", sizes: "512x512", purpose: "any maskable" },
+    ]);
     for (const shortcut of manifest.shortcuts) {
       assert.ok(new URL(shortcut.url, "https://example.com/datax-now/").pathname.startsWith("/datax-now/"));
     }
@@ -810,7 +819,7 @@ test("offline downloads resume, verify every asset, and survive worker restarts"
     let message;
     const context = vm.createContext({
       URL, Request, Response, btoa, assets,
-      self: { location: { href: scope + "service-worker.js?enableCache=true" }, addEventListener(type, listener) { message = listener; } },
+      self: { location: { href: scope + "service-worker.js?enableCache=true" }, addEventListener(type, listener) { if (type === "message") message = listener; } },
       caches: { async open() { return cache; } },
       async maybeFromCache(event) { return context.fetch(event.request); },
       async fetch(request) {
@@ -867,6 +876,286 @@ test("offline downloads resume, verify every asset, and survive worker restarts"
   assert.match(quota.at(-1).error, /browser storage/);
   assert.equal(quota.at(-1).ready, false);
   assert.equal(stored.size, 0);
+});
+
+test("offline-ready installs cache the next release before activating and prune stale entries", async () => {
+  const scope = "https://example.com/go/";
+  const stored = new Map();
+  const cache = {
+    async match(key) { return stored.get(key.url ?? key)?.clone(); },
+    async put(key, response) { stored.set(key.url ?? key, response.clone()); },
+    async keys() { return [...stored.keys()].map(key => new Request(key)); },
+    async delete(request) { return stored.delete(request.url); },
+  };
+  let online = true;
+  const downloads = [];
+  function startWorker(bodies) {
+    const listeners = {};
+    const assets = Object.fromEntries(Object.entries(bodies).map(([relative, body]) => [relative, {
+      sha256: createHash("sha256").update(body).digest("hex"), size: body.length,
+    }]));
+    const context = vm.createContext({
+      URL, Request, Response, btoa, assets,
+      self: { location: { href: scope + "service-worker.js?enableCache=true" }, addEventListener(type, listener) { listeners[type] = listener; } },
+      caches: { async open() { return cache; } },
+      async maybeFromCache(event) { return context.fetch(event.request); },
+      async fetch(request) {
+        if (!online) throw new TypeError("Network is offline");
+        const relative = new URL(request.url).pathname.slice(new URL(scope).pathname.length);
+        downloads.push(relative);
+        return new Response(bodies[relative]);
+      },
+    });
+    context.hashes = Object.fromEntries(Object.entries(assets).filter(([relative]) => relative.startsWith("xeus/")).map(([relative, asset]) => [relative, asset.sha256]));
+    vm.runInContext(`(${fingerprints.installRuntimeCache.toString()})(hashes);(${offline.installOfflineCache.toString()})(assets);`, context);
+    const dispatch = async (type, extra = {}) => {
+      const tasks = [];
+      listeners[type]({ ...extra, waitUntil(task) { tasks.push(task); } });
+      return Promise.all(tasks);
+    };
+    return { assets, dispatch };
+  }
+  const keyFor = (relative, asset) => scope + relative + "?sha256=" + asset.sha256;
+  const first = startWorker({ "lab/index.html": "shell v1", "xeus/runtime.wasm": "runtime" });
+  await first.dispatch("install");
+  assert.deepEqual(downloads, [], "installs do not download before the user opts in");
+  const updates = [];
+  await first.dispatch("message", {
+    data: { type: "datax-offline-download" }, source: { url: scope + "lab/" },
+    ports: [{ postMessage(update) { updates.push(update); } }],
+  });
+  assert.equal(updates.at(-1).ready, true);
+  assert.ok(stored.has(scope + "datax-offline-ready"));
+
+  const second = startWorker({ "lab/index.html": "shell v2", "xeus/runtime.wasm": "runtime" });
+  downloads.length = 0;
+  online = false;
+  await assert.rejects(second.dispatch("install"), /offline/);
+  assert.ok(stored.has(keyFor("lab/index.html", first.assets["lab/index.html"])), "the previous release stays complete");
+  online = true;
+  await second.dispatch("install");
+  assert.deepEqual(downloads, ["lab/index.html"], "only changed assets are downloaded");
+  await second.dispatch("activate");
+  assert.deepEqual([...stored.keys()].sort(), [
+    scope + "datax-offline-ready",
+    keyFor("lab/index.html", second.assets["lab/index.html"]),
+    keyFor("xeus/runtime.wasm", second.assets["xeus/runtime.wasm"]),
+  ].sort());
+});
+
+test("offline download subscribers receive current progress immediately", async () => {
+  const scope = "https://example.com/go/";
+  const listeners = {};
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const stored = new Map();
+  const assets = { "big.wasm": { sha256: createHash("sha256").update("big").digest("hex"), size: 3 } };
+  const context = vm.createContext({
+    URL, Request, Response, btoa, assets,
+    self: { location: { href: scope + "service-worker.js?enableCache=true" }, addEventListener(type, listener) { listeners[type] = listener; } },
+    caches: { async open() { return {
+      async match(key) { return stored.get(key.url ?? key)?.clone(); },
+      async put(key, response) { stored.set(key.url ?? key, response.clone()); },
+      async keys() { return [...stored.keys()].map(key => new Request(key)); },
+    }; } },
+    async maybeFromCache(event) { return context.fetch(event.request); },
+    async fetch() { await gate; return new Response("big"); },
+  });
+  vm.runInContext(`(${offline.installOfflineCache.toString()})(assets);`, context);
+  const send = updates => {
+    const tasks = [];
+    listeners.message({
+      data: { type: "datax-offline-download" }, source: { url: scope + "lab/" },
+      ports: [{ postMessage(update) { updates.push(update); } }], waitUntil(task) { tasks.push(task); },
+    });
+    return Promise.all(tasks);
+  };
+  const first = [];
+  const firstDone = send(first);
+  while (!first.length) await new Promise(resolve => setImmediate(resolve));
+  const second = [];
+  const secondDone = send(second);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(second[0]?.downloading, true, "a resubscribed client must not wait for the next file");
+  release();
+  await Promise.all([firstDone, secondDone]);
+  assert.equal(first.at(-1).ready, true);
+});
+
+test("offline auto-download waits for five continuous idle minutes", () => {
+  let now = 0;
+  let nextId = 0;
+  const timers = new Map();
+  const timerApi = {
+    setTimeout(callback, delay) {
+      const id = ++nextId;
+      timers.set(id, { callback, due: now + delay });
+      return id;
+    },
+    clearTimeout(id) { timers.delete(id); },
+  };
+  const advance = milliseconds => {
+    now += milliseconds;
+    for (const [id, timer] of [...timers]) {
+      if (timer.due > now) continue;
+      timers.delete(id);
+      timer.callback();
+    }
+  };
+  let downloads = 0;
+  const scheduler = offline.createKernelIdleScheduler(
+    () => downloads++, 300000, () => now, timerApi,
+  );
+  scheduler.update(["idle"], true);
+  advance(299000);
+  scheduler.update(["busy"], true);
+  advance(10000);
+  scheduler.update(["idle"], true);
+  advance(299999);
+  assert.equal(downloads, 0);
+  advance(1);
+  assert.equal(downloads, 1);
+  scheduler.update(["idle"], true);
+  assert.equal(downloads, 1, "one idle period should trigger at most one automatic attempt");
+  scheduler.update(["busy"], true);
+  scheduler.update(["idle"], false);
+  advance(300000);
+  assert.equal(downloads, 1, "automatic downloads wait until they can start");
+  scheduler.update(["idle"], true);
+  assert.equal(downloads, 2, "a delayed start can proceed once downloading is available");
+  scheduler.dispose();
+});
+
+test("offline status distinguishes controller wait and automatic download lifecycle", () => {
+  assert.equal(offline.offlineStatusText({}, null, true, false), "Offline: waiting for app control");
+  assert.equal(offline.offlineStatusText({ downloading: true, completed: 2, total: 10 }, "automatic", true),
+    "Downloading offline automatically: 2/10");
+  assert.equal(offline.offlineStatusText({ ready: true }, "automatic", true), "Offline ready (automatic)");
+  assert.equal(offline.offlineStatusText({ error: "quota exceeded" }, "automatic", true),
+    "Automatic offline download failed");
+  assert.equal(offline.offlineStatusText({}, null, false), "Offline: incomplete");
+});
+
+test("kernel activity monitor tracks every running kernel and disposes removed connections", () => {
+  const models = [{ id: "first", status: "idle" }];
+  const connections = new Map();
+  let refresh;
+  const manager = {
+    running: () => models,
+    connectTo({ model }) {
+      const listeners = new Set();
+      const connection = {
+        get status() { return model.status; },
+        statusChanged: {
+          connect(listener) { listeners.add(listener); },
+          disconnect(listener) { listeners.delete(listener); },
+        },
+        dispose() { this.disposed = true; },
+        emit() { for (const listener of listeners) listener(); },
+      };
+      connections.set(model.id, connection);
+      return connection;
+    },
+  };
+  const updates = [];
+  const stop = offline.monitorKernelActivity(
+    statuses => updates.push(statuses),
+    () => ({ serviceManager: { kernels: manager } }),
+    { setInterval(callback) { refresh = callback; return 1; }, clearInterval() {} },
+  );
+  assert.deepEqual(updates.at(-1), ["idle"]);
+  models.push({ id: "second", status: "busy" });
+  refresh();
+  assert.deepEqual(updates.at(-1), ["idle", "busy"]);
+  models[1].status = "idle";
+  connections.get("second").emit();
+  assert.deepEqual(updates.at(-1), ["idle", "idle"]);
+  models.shift();
+  refresh();
+  assert.deepEqual(updates.at(-1), ["idle"]);
+  assert.equal(connections.get("first").disposed, true);
+  stop();
+  assert.equal(connections.get("second").disposed, true);
+});
+
+test("generated offline client includes the kernel idle monitor", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-offline-client-"));
+  try {
+    mkdirSync(join(directory, "lab"), { recursive: true });
+    writeFileSync(join(directory, "lab/index.html"), "<body></body>");
+    offline.prepareOffline(directory);
+    const client = join(directory, "datax-offline.js");
+    const source = readFileSync(client, "utf8");
+    assert.match(source, /function createKernelIdleScheduler/);
+    assert.match(source, /function monitorKernelActivity/);
+    assert.match(source, /function offlineStatusText/);
+    const result = spawnSync(process.execPath, ["--check", client], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    const elements = [];
+    const makeElement = tagName => {
+      const element = {
+        tagName,
+        children: [],
+        dataset: {},
+        listeners: {},
+        setAttribute() {},
+        append(...children) { this.children.push(...children); },
+        addEventListener(type, listener) { this.listeners[type] = listener; },
+      };
+      elements.push(element);
+      return element;
+    };
+    const serviceWorkerListeners = {};
+    const timeouts = new Map();
+    let nextTimeout = 0;
+    const document = {
+      head: makeElement("head"),
+      body: makeElement("body"),
+      createElement: makeElement,
+      querySelector() { return null; },
+    };
+    const serviceWorker = {
+      controller: null,
+      ready: Promise.resolve(),
+      addEventListener(type, listener) { serviceWorkerListeners[type] = listener; },
+    };
+    const context = vm.createContext({
+      document,
+      navigator: { onLine: true, serviceWorker },
+      window: {
+        jupyterapp: { serviceManager: { kernels: { running: () => [] } } },
+        addEventListener() {},
+      },
+      MutationObserver: class { observe() {} disconnect() {} },
+      MessageChannel: class {
+        constructor() {
+          this.port1 = { onmessage: null, close() {} };
+          this.port2 = { postMessage: data => this.port1.onmessage?.({ data }) };
+        }
+      },
+      setInterval() { return 1; },
+      clearInterval() {},
+      setTimeout(callback, delay) { const id = ++nextTimeout; timeouts.set(id, { callback, delay }); return id; },
+      clearTimeout(id) { timeouts.delete(id); },
+      console: { info() {}, error() {} },
+    });
+    vm.runInContext(source, context);
+    const panel = document.body.children[0];
+    const label = panel.children[0];
+    assert.equal(label.textContent, "Offline: waiting for app control");
+    await new Promise(resolve => setImmediate(resolve));
+    serviceWorker.controller = {
+      postMessage(_message, [port]) {
+        port.postMessage({ completed: 0, total: 4, bytes: 0, totalBytes: 4096, ready: false, downloading: false });
+      },
+    };
+    serviceWorkerListeners.controllerchange();
+    assert.equal(label.textContent, "Offline: not downloaded");
+    assert.ok(!panel.children[1].disabled);
+    for (const timer of timeouts.values()) assert.notEqual(timer.delay, 0);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("local verification server serves generated manifest bytes unchanged", () => {

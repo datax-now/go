@@ -143,7 +143,12 @@ again. PWA installation alone does not guarantee offline availability.
 ### Offline use
 
 While online, open the app and select **Download for offline use** in the status
-bar. Confirm the download size and wait for **Offline ready** before disconnecting.
+bar, or leave all running kernels idle for five minutes to start the download
+automatically. Manual downloads ask you to confirm the download size. Wait for
+**Offline ready** before disconnecting. The status bar identifies automatic
+downloads and reports their progress or failure; the browser console logs when
+they start, reach progress milestones, complete, or fail. If the service worker
+does not control the page yet, the status bar reports that while waiting.
 This downloads the complete local application, lazy-loaded extensions, bundled
 notebooks and data, and the WebAssembly kernel packages. The installed PWA can
 then reopen, start a fresh kernel, run Python, and access locally saved
@@ -160,8 +165,13 @@ Downloads are SHA-256 verified and reuse already cached files. An interrupted
 download can be retried without starting over. Failed downloads or insufficient
 browser storage never report readiness. The app requests persistent storage,
 but browsers may decline it or evict data; the readiness check runs again when
-the app opens. After a release update, download any missing assets again while
-online. Offline files and notebooks belong to the selected origin and browser
+the app opens. Once a download has completed, each later release downloads its
+changed files before its service worker activates. Until that finishes, the
+previous offline-ready release stays active and the update is retried on a
+later visit. Activation then removes cached files that no current release
+uses. If progress stalls, for example because the browser stopped the service
+worker, the app resumes the download from the files already cached.
+Offline files and notebooks belong to the selected origin and browser
 profile, not to all deployment mirrors.
 
 Network-dependent notebook code, remote datasets, AI services, and packages not

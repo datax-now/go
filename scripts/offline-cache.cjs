@@ -78,18 +78,75 @@ function installOfflineCache(assets) {
     }
     return (await pending.get(key)).clone();
   };
+  const totalBytes = entries.reduce((total, [, asset]) => total + asset.size, 0);
+  // Marks that the user opted into offline use, so later releases are cached before they activate.
+  const readyKey = new URL('datax-offline-ready', scope).href;
+  let progress = null;
+  async function cachedKeys(cache) {
+    return new Set((await cache.keys()).map(request => request.url));
+  }
   async function status() {
-    const cache = await caches.open(cacheName);
-    const keys = new Set((await cache.keys()).map(request => request.url));
+    const keys = await cachedKeys(await caches.open(cacheName));
     let completed = 0;
     let bytes = 0;
     for (const [relative, asset] of entries) {
       if (keys.has(keyFor(relative, asset))) { completed++; bytes += asset.size; }
     }
-    return { type: 'datax-offline', completed, total: entries.length, bytes,
-      totalBytes: entries.reduce((total, [, asset]) => total + asset.size, 0),
+    return { type: 'datax-offline', completed, total: entries.length, bytes, totalBytes,
       ready: completed === entries.length, downloading: preparation !== null };
   }
+  function download() {
+    if (preparation) return preparation;
+    preparation = (async () => {
+      const cache = await caches.open(cacheName);
+      const keys = await cachedKeys(cache);
+      const queue = entries.filter(([relative, asset]) => !keys.has(keyFor(relative, asset)));
+      const missingBytes = queue.reduce((total, [, asset]) => total + asset.size, 0);
+      progress = { type: 'datax-offline', completed: entries.length - queue.length, total: entries.length,
+        bytes: totalBytes - missingBytes, totalBytes, ready: false, downloading: true };
+      const report = () => { for (const subscriber of ports) subscriber.postMessage(progress); };
+      report();
+      let failure = null;
+      await Promise.all(Array.from({ length: 3 }, async () => {
+        while (queue.length && !failure) {
+          const [relative, asset] = queue.shift();
+          try {
+            const response = await maybeFromCache({
+              request: new Request(new URL(relative, scope).href),
+              waitUntil() {},
+            });
+            if (!response.ok) throw new Error('HTTP ' + response.status + ': ' + relative);
+            if (!await cache.match(keyFor(relative, asset))) {
+              throw new Error('Unable to store ' + relative + '. Check available browser storage.');
+            }
+            progress = { ...progress, completed: progress.completed + 1, bytes: progress.bytes + asset.size };
+            report();
+          } catch (error) { failure = new Error(relative + ': ' + error.message); }
+        }
+      }));
+      if (failure) throw failure;
+      try { await cache.put(readyKey, new Response('')); } catch {}
+    })().finally(() => {
+      preparation = null;
+      progress = null;
+    });
+    return preparation;
+  }
+  self.addEventListener('install', event => {
+    if (!enabled) return;
+    // A failed download rejects the update, so the previous offline-ready release stays active.
+    event.waitUntil(caches.open(cacheName)
+      .then(cache => cache.match(readyKey), () => null)
+      .then(optedIn => optedIn ? download() : undefined));
+  });
+  self.addEventListener('activate', event => {
+    if (!enabled) return;
+    const current = new Set(entries.map(([relative, asset]) => keyFor(relative, asset)).concat(readyKey));
+    event.waitUntil(caches.open(cacheName).then(async cache => {
+      const stale = (await cache.keys()).filter(request => !current.has(request.url));
+      await Promise.all(stale.map(request => cache.delete(request)));
+    }).catch(() => {}));
+  });
   self.addEventListener('message', event => {
     if (!['datax-offline-status', 'datax-offline-download'].includes(event.data?.type)) return;
     const source = event.source?.url && new URL(event.source.url);
@@ -106,56 +163,133 @@ function installOfflineCache(assets) {
         return;
       }
       ports.add(port);
-      if (!preparation) {
-        preparation = (async () => {
-          const cache = await caches.open(cacheName);
-          const initial = await status();
-          let completed = initial.completed;
-          let bytes = initial.bytes;
-          const queue = [];
-          for (const [relative, asset] of entries) {
-            if (!await cache.match(keyFor(relative, asset))) queue.push([relative, asset]);
-          }
-          const report = () => {
-            const update = { ...initial, completed, bytes, ready: false, downloading: true };
-            for (const subscriber of ports) subscriber.postMessage(update);
-          };
-          report();
-          let failure = null;
-          await Promise.all(Array.from({ length: 3 }, async () => {
-            while (queue.length && !failure) {
-              const [relative, asset] = queue.shift();
-              try {
-                const response = await maybeFromCache({
-                  request: new Request(new URL(relative, scope).href),
-                  waitUntil() {},
-                });
-                if (!response.ok) throw new Error('HTTP ' + response.status + ': ' + relative);
-                if (!await cache.match(keyFor(relative, asset))) {
-                  throw new Error('Unable to store ' + relative + '. Check available browser storage.');
-                }
-                completed++;
-                bytes += asset.size;
-                report();
-              } catch (error) { failure = new Error(relative + ': ' + error.message); }
-            }
-          }));
-          if (failure) throw failure;
-        })();
-      }
+      if (progress) port.postMessage(progress);
       try {
-        await preparation;
+        await download();
         const update = { ...await status(), downloading: false };
         for (const subscriber of ports) subscriber.postMessage(update);
       } catch (error) {
         for (const subscriber of ports) subscriber.postMessage({ type: 'datax-offline', error: error.message, ready: false, downloading: false });
       } finally {
-        preparation = null;
         ports.clear();
       }
     })().catch(error => port.postMessage({ type: 'datax-offline', error: error.message, ready: false, downloading: false }));
     event.waitUntil(task);
   });
+}
+
+function createKernelIdleScheduler(onIdle, delayMs = 300000, now = () => Date.now(), timerApi = { setTimeout, clearTimeout }) {
+  let idleSince = null;
+  let timer = null;
+  let attempted = false;
+  let statuses = null;
+  let canStart = false;
+  function clearTimer() {
+    if (timer !== null) timerApi.clearTimeout(timer);
+    timer = null;
+  }
+  function evaluate() {
+    clearTimer();
+    if (statuses === null || statuses.some(status => status !== 'idle')) {
+      idleSince = null;
+      attempted = false;
+      return;
+    }
+    if (idleSince === null) idleSince = now();
+    if (!canStart || attempted) return;
+    const remaining = delayMs - (now() - idleSince);
+    if (remaining <= 0) {
+      attempted = true;
+      onIdle();
+      return;
+    }
+    timer = timerApi.setTimeout(() => {
+      timer = null;
+      evaluate();
+    }, remaining);
+  }
+  return {
+    update(nextStatuses, allowed) {
+      statuses = nextStatuses;
+      canStart = allowed;
+      evaluate();
+    },
+    dispose: clearTimer,
+  };
+}
+
+function monitorKernelActivity(onChange, getApp = () => window.jupyterapp, timerApi = { setInterval, clearInterval }) {
+  let manager = null;
+  let models = [];
+  const connections = new Map();
+  function publish() {
+    onChange(models.map(model => connections.get(model.id)?.connection.status ?? 'unknown'));
+  }
+  function clearConnections() {
+    for (const { connection, onStatusChanged } of connections.values()) {
+      connection.statusChanged.disconnect(onStatusChanged);
+      connection.dispose();
+    }
+    connections.clear();
+  }
+  function refresh() {
+    const nextManager = getApp()?.serviceManager?.kernels;
+    if (!nextManager) {
+      manager = null;
+      models = [];
+      clearConnections();
+      onChange(null);
+      return;
+    }
+    if (manager !== nextManager) {
+      clearConnections();
+      manager = nextManager;
+    }
+    try {
+      models = Array.from(manager.running());
+    } catch {
+      models = [];
+      onChange(null);
+      return;
+    }
+    const ids = new Set(models.map(model => model.id));
+    for (const [id, { connection, onStatusChanged }] of connections) {
+      if (!ids.has(id)) {
+        connection.statusChanged.disconnect(onStatusChanged);
+        connection.dispose();
+        connections.delete(id);
+      }
+    }
+    for (const model of models) {
+      if (connections.has(model.id)) continue;
+      try {
+        const connection = manager.connectTo({ model });
+        const onStatusChanged = publish;
+        connection.statusChanged.connect(onStatusChanged);
+        connections.set(model.id, { connection, onStatusChanged });
+      } catch {}
+    }
+    publish();
+  }
+  refresh();
+  const interval = timerApi.setInterval(refresh, 1000);
+  return () => {
+    timerApi.clearInterval(interval);
+    clearConnections();
+  };
+}
+
+function offlineStatusText(state, mode, online, controlled = true) {
+  if (!controlled) return 'Offline: waiting for app control';
+  if (state.error) {
+    return mode === 'automatic' ? 'Automatic offline download failed' : 'Offline download incomplete';
+  }
+  if (state.downloading) {
+    const qualifier = mode === 'automatic' ? ' automatically' : '';
+    return 'Downloading offline' + qualifier + ': ' + state.completed + '/' + state.total;
+  }
+  if (state.ready) return 'Offline ready' + (mode === 'automatic' ? ' (automatic)' : '');
+  return online ? 'Offline: not downloaded' : 'Offline: incomplete';
 }
 
 function installOfflineUI() {
@@ -165,10 +299,11 @@ function installOfflineUI() {
   const label = document.createElement('span');
   label.setAttribute('role', 'status');
   label.setAttribute('aria-live', 'polite');
-  label.textContent = 'Offline: checking';
+  label.textContent = navigator.serviceWorker.controller ? 'Offline: checking' : 'Offline: waiting for app control';
   const button = document.createElement('button');
   button.type = 'button';
   button.textContent = 'Download for offline use';
+  button.title = 'Automatically downloads after all kernels stay idle for five minutes.';
   button.disabled = true;
   panel.append(label, button);
   const style = document.createElement('style');
@@ -183,40 +318,136 @@ function installOfflineUI() {
   observer.observe(document.body, { childList: true, subtree: true });
   let current = null;
   let channel = null;
+  let kernelStatuses = null;
+  let downloadMode = null;
+  let lastLoggedProgress = 0;
+  let lastLoggedError = null;
+  let completionLogged = false;
+  let stallTimer = null;
+  function canAutoDownload() {
+    return navigator.onLine && !!navigator.serviceWorker.controller && !!current
+      && !current.ready && !current.downloading && !current.unavailable;
+  }
+  const idleScheduler = createKernelIdleScheduler(() => startDownload(true));
+  const updateIdleScheduler = () => idleScheduler.update(kernelStatuses, canAutoDownload());
   function request(type) {
-    if (!navigator.serviceWorker.controller) return;
+    if (!navigator.serviceWorker.controller) {
+      if (type === 'datax-offline-status') {
+        label.textContent = 'Offline: waiting for app control';
+        panel.title = 'Waiting for the service worker to control this page.';
+        button.disabled = true;
+      }
+      return;
+    }
     channel?.port1.close();
-    channel = new MessageChannel();
-    channel.port1.onmessage = event => {
+    const requestChannel = new MessageChannel();
+    channel = requestChannel;
+    let responseTimeout = setTimeout(() => {
+      if (channel !== requestChannel) return;
+      requestChannel.port1.close();
+      channel = null;
+      current = { ...(current || {}), unavailable: true };
+      label.textContent = 'Offline cache unavailable';
+      panel.title = type === 'datax-offline-status'
+        ? 'The offline service worker did not respond. Reload the app to retry.'
+        : 'The offline download did not respond. Reload the app to retry.';
+      button.disabled = true;
+      updateIdleScheduler();
+      console.error('[DataX.now] Offline service worker did not respond to ' + type + '.');
+    }, 10000);
+    let receivedResponse = false;
+    requestChannel.port1.onmessage = event => {
+      if (!receivedResponse) {
+        clearTimeout(responseTimeout);
+        responseTimeout = null;
+        receivedResponse = true;
+      }
       const state = event.data;
       current = state;
+      clearTimeout(stallTimer);
+      // A terminated worker drops its ports silently; resubscribing resumes from cached files.
+      stallTimer = state.downloading ? setTimeout(() => request('datax-offline-download'), 60000) : null;
       button.disabled = state.downloading || state.ready || state.unavailable;
       button.hidden = state.ready;
+      updateIdleScheduler();
       if (state.error) {
-        label.textContent = state.unavailable ? 'Offline cache unavailable' : 'Offline download incomplete';
+        label.textContent = state.unavailable
+          ? 'Offline cache unavailable'
+          : offlineStatusText(state, downloadMode, navigator.onLine);
         panel.title = state.error;
         button.textContent = 'Retry offline download';
+        if (lastLoggedError !== state.error) {
+          console.error('[DataX.now] Offline download failed:', state.error);
+          lastLoggedError = state.error;
+        }
+      } else if (state.downloading) {
+        label.textContent = offlineStatusText(state, downloadMode, navigator.onLine);
+        if (downloadMode === 'automatic' && state.total > 0) {
+          const progress = Math.floor(state.completed * 100 / state.total / 10) * 10;
+          if (progress >= 10 && progress > lastLoggedProgress) {
+            console.info('[DataX.now] Automatic offline download ' + progress + '% complete.');
+            lastLoggedProgress = progress;
+          }
+        }
       } else {
-        panel.title = state.total + ' files; ' + Math.ceil(state.totalBytes / 1048576) + ' MiB';
-        label.textContent = state.ready ? 'Offline ready' : state.downloading
-          ? 'Downloading offline: ' + state.completed + '/' + state.total
-          : navigator.onLine ? 'Offline: not downloaded' : 'Offline: incomplete';
+        panel.title = state.total + ' files; ' + Math.ceil(state.totalBytes / 1048576)
+          + ' MiB; automatic download after 5 minutes with every kernel idle';
+        label.textContent = offlineStatusText(state, downloadMode, navigator.onLine);
+        if (state.ready && downloadMode === 'automatic' && !completionLogged) {
+          console.info('[DataX.now] Automatic offline download complete. Offline use is ready.');
+          completionLogged = true;
+        }
       }
     };
-    navigator.serviceWorker.controller.postMessage({ type }, [channel.port2]);
+    requestChannel.port1.onmessageerror = () => {
+      clearTimeout(responseTimeout);
+      responseTimeout = null;
+      channel = null;
+      label.textContent = 'Offline cache unavailable';
+      panel.title = 'Could not read the offline service worker response.';
+      button.disabled = true;
+      console.error('[DataX.now] Could not read the offline service worker response.');
+    };
+    navigator.serviceWorker.controller.postMessage({ type }, [requestChannel.port2]);
   }
-  button.addEventListener('click', async () => {
+  async function startDownload(automatic = false) {
+    if (automatic && !canAutoDownload()) return;
     const remaining = Math.ceil(((current?.totalBytes ?? 0) - (current?.bytes ?? 0)) / 1048576);
-    if (!confirm('Download ' + remaining + ' MiB for offline use on this device?')) return;
+    if (!automatic && !confirm('Download ' + remaining + ' MiB for offline use on this device?')) return;
+    downloadMode = automatic ? 'automatic' : 'manual';
+    lastLoggedProgress = 0;
+    lastLoggedError = null;
+    completionLogged = false;
+    if (automatic) {
+      label.textContent = 'Starting automatic offline download';
+      console.info('[DataX.now] Starting automatic offline download after five minutes with all kernels idle.');
+    }
     try { await navigator.storage?.persist?.(); } catch {}
     button.disabled = true;
     request('datax-offline-download');
+  }
+  button.addEventListener('click', () => startDownload());
+  const stopKernelMonitor = monitorKernelActivity(statuses => {
+    kernelStatuses = statuses;
+    updateIdleScheduler();
+  });
+  window.addEventListener('pagehide', event => {
+    if (event.persisted) return;
+    stopKernelMonitor();
+    idleScheduler.dispose();
+    clearTimeout(stallTimer);
   });
   navigator.serviceWorker.ready.then(() => request('datax-offline-status')).catch(() => {
     label.textContent = 'Offline cache unavailable';
   });
-  navigator.serviceWorker.addEventListener('controllerchange', () => request('datax-offline-status'));
-  window.addEventListener('online', () => request('datax-offline-status'));
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    request(current?.downloading ? 'datax-offline-download' : 'datax-offline-status');
+    updateIdleScheduler();
+  });
+  window.addEventListener('online', () => {
+    if (!current?.downloading) request('datax-offline-status');
+    updateIdleScheduler();
+  });
   window.addEventListener('offline', () => { if (!current?.downloading) request('datax-offline-status'); });
 }
 
@@ -233,7 +464,7 @@ function prepareOffline(directory) {
     }
   }
   const client = 'datax-offline.js';
-  fs.writeFileSync(path.join(directory, client), `(${installOfflineUI.toString()})();\n`);
+  fs.writeFileSync(path.join(directory, client), `${createKernelIdleScheduler.toString()}\n${monitorKernelActivity.toString()}\n${offlineStatusText.toString()}\n(${installOfflineUI.toString()})();\n`);
   const assets = {};
   function visit(folder) {
     for (const entry of fs.readdirSync(folder, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
@@ -259,4 +490,4 @@ function prepareOffline(directory) {
   return assets;
 }
 
-module.exports = { installOfflineCache, installOfflineUI, prepareOffline };
+module.exports = { createKernelIdleScheduler, installOfflineCache, installOfflineUI, monitorKernelActivity, offlineStatusText, prepareOffline };
