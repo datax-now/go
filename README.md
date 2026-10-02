@@ -179,6 +179,20 @@ included in the build still require internet access. External fonts may fall
 back to local fonts. Keep important notebooks exported separately: installing
 a PWA or granting persistent storage is not a backup.
 
+### Read the Docs navigation failure
+
+Read the Docs injects its add-ons script and metadata into served HTML after
+the build. Those bytes differ from the build's SHA-256 inventory. Fetching that
+HTML with integrity enabled fails, which can surface as `ERR_FAILED` when the
+service worker controls an app navigation, even after a successful RTD build.
+
+The build creates byte-identical `.html.offline` copies for HTML assets. The
+offline cache fetches these non-HTML URLs with the original SHA-256 check and
+restores the HTML content type before serving the original application URL.
+This keeps navigation and offline downloads verified without depending on
+host-injected HTML. Keep these copies in every deployment. Rebuild and redeploy
+to apply this fix; existing deployments are not changed by a local code update.
+
 ### Read the Docs 429 responses
 
 `429 Too Many Requests (from service worker)` can be an upstream response

@@ -48,7 +48,7 @@ function installOfflineCache(assets) {
     if (!enabled || !relative || request.method !== 'GET' || request.headers.has('Range')) return original(event);
     const asset = assets[relative];
     const key = keyFor(relative, asset);
-    const canonical = new Request(new URL(relative, scope).href, {
+    const canonical = new Request(new URL(asset.source || relative, scope).href, {
       method: request.method, headers: request.headers, credentials: request.credentials,
       mode: request.mode === 'navigate' ? 'same-origin' : request.mode,
       redirect: request.redirect, signal: request.signal,
@@ -67,7 +67,14 @@ function installOfflineCache(assets) {
     if (!pending.has(key)) {
       const download = (async () => {
         const integrity = 'sha256-' + btoa(String.fromCharCode(...asset.sha256.match(/../g).map(byte => parseInt(byte, 16))));
-        const response = await fetch(new Request(canonical, { integrity, cache: 'no-cache' }));
+        let response = await fetch(new Request(canonical, { integrity, cache: 'no-cache' }));
+        if (asset.source && relative.endsWith('.html') && response.ok) {
+          const headers = new Headers(response.headers);
+          headers.set('Content-Type', 'text/html; charset=utf-8');
+          headers.delete('Content-Encoding');
+          headers.delete('Content-Length');
+          response = new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+        }
         if (response.ok && response.status !== 206) {
           try { await cache.put(key, response.clone()); } catch {}
         }
@@ -477,6 +484,7 @@ function prepareOffline(directory) {
       const filename = path.join(folder, entry.name);
       if (entry.isDirectory()) { visit(filename); continue; }
       if (!entry.isFile()) continue;
+      if (entry.name.endsWith('.html.offline')) continue;
       const relative = path.relative(directory, filename).split(path.sep).map(encodeURIComponent).join('/');
       if ([
         'service-worker.js', 'deployment.json', 'datax-now.zip', 'cors_server.py',
@@ -494,6 +502,10 @@ function prepareOffline(directory) {
       }
       const bytes = fs.readFileSync(filename);
       assets[relative] = { sha256: crypto.createHash('sha256').update(bytes).digest('hex'), size: bytes.length };
+      if (entry.name.endsWith('.html')) {
+        fs.writeFileSync(filename + '.offline', bytes);
+        assets[relative].source = relative + '.offline';
+      }
     }
   }
   visit(directory);

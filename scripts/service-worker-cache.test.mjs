@@ -1307,6 +1307,55 @@ test("offline inventory includes lazy assets but excludes archives and mutable d
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("offline HTML remains integrity-checked when the host injects addons", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-offline-html-"));
+  const stored = new Map();
+  const requests = [];
+  let online = true;
+  try {
+    mkdirSync(join(directory, "lab"));
+    writeFileSync(join(directory, "lab/index.html"), "<html><head></head><body>app</body></html>");
+    const assets = offline.prepareOffline(directory);
+    const expected = readFileSync(join(directory, "lab/index.html"), "utf8");
+    const scope = "https://datax-now.readthedocs.io/en/latest/_static/";
+    const context = vm.createContext({
+      URL, Request, Response, Headers, btoa, assets,
+      self: { location: { href: scope + "service-worker.js?enableCache=true" }, addEventListener() {} },
+      maybeFromCache() { throw new Error("Unexpected cache bypass"); },
+      caches: { async open() { return {
+        async match(key) { return stored.get(key)?.clone(); },
+        async put(key, response) { stored.set(key, response.clone()); },
+      }; } },
+      async fetch(request) {
+        if (!online) throw new TypeError("Network is offline");
+        requests.push(request);
+        const relative = new URL(request.url).pathname.slice(new URL(scope).pathname.length);
+        let bytes = readFileSync(join(directory, relative), "utf8");
+        if (relative.endsWith(".html")) bytes = bytes.replace("</head>", '<script src="/addons.js"></script></head>');
+        return fetch("data:application/octet-stream," + encodeURIComponent(bytes), { integrity: request.integrity });
+      },
+    });
+    vm.runInContext(`(${offline.installOfflineCache.toString()})(assets)`, context);
+    async function navigate(relative) {
+      const tasks = [];
+      const response = await context.maybeFromCache({ request: new Request(scope + relative), waitUntil(task) { tasks.push(task); } });
+      await Promise.all(tasks);
+      assert.equal(response.headers.get("Content-Type"), "text/html; charset=utf-8");
+      assert.equal(await response.text(), expected);
+    }
+    await navigate("lab/index.html");
+    assert.equal(requests.length, 1);
+    assert.ok(requests[0].integrity.startsWith("sha256-"));
+    online = false;
+    await navigate("lab/?path=Offline.ipynb");
+    assert.equal(requests.length, 1);
+    online = true;
+    stored.clear();
+    writeFileSync(join(directory, "lab/index.html.offline"), "corrupted shell");
+    await assert.rejects(navigate("lab/index.html"), /fetch failed/);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("offline app navigation survives a new notebook query after the worker restarts", async () => {
   const directory = mkdtempSync(join(tmpdir(), "datax-offline-navigation-"));
   const stored = new Map();
