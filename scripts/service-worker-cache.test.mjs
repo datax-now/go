@@ -499,7 +499,7 @@ test("failed hosts fail over in priority order, skipping stale mirrors and cooli
   const requests = [];
   let clock = 0;
   const manifests = {
-    "https://datax.now/deployment.json": { commit: "b".repeat(40), files: { [runtimePath]: { sha256 } } },
+    "https://datax.now/deployment.json": { commit: "b".repeat(40), files: { [runtimePath]: { sha256: "c".repeat(64) } } },
     "https://datax-now.pages.dev/deployment.json": { commit: release, files: { [runtimePath]: { sha256 } } },
   };
   const context = vm.createContext({
@@ -546,6 +546,39 @@ test("failed hosts fail over in priority order, skipping stale mirrors and cooli
   assert.equal(await (await load()).text(), bytes);
   assert.deepEqual(requests, [`https://datax-now.github.io/go/${runtimePath}`],
     "the preferred host is used again once its cooldown expires");
+});
+
+test("mirrors on another release serve byte-identical runtime files", async () => {
+  const runtimePath = "xeus/xeus-python-wasm-host/stats.so.asm";
+  const bytes = "shared library";
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  const requests = [];
+  const context = vm.createContext({
+    URL, Request, Response, Headers, btoa, Date,
+    location: { href: "https://datax-now.readthedocs.io/en/latest/_static/service-worker.js" },
+    caches: { async open() { throw new Error("cache disabled"); } },
+    async fetch(request) {
+      requests.push(request.url);
+      const url = new URL(request.url);
+      // A Cloudflare challenge page fails the SRI check as a network error.
+      if (url.hostname.endsWith("readthedocs.io")) throw new TypeError("Failed to fetch. SRI's integrity checks failed.");
+      if (url.pathname.endsWith("/deployment.json")) {
+        return new Response(JSON.stringify({ commit: "d".repeat(40), files: { [runtimePath]: { sha256 } } }));
+      }
+      return fetch(`data:application/octet-stream,${encodeURIComponent(bytes)}`, { integrity: request.integrity });
+    },
+  });
+  vm.runInContext("maybeFromCache = async event => fetch(event.request)", context);
+  context.self = context;
+  context.hashes = { [runtimePath]: sha256 };
+  context.mirrors = fingerprints.DEFAULT_MIRROR_ORIGINS;
+  vm.runInContext(`(${fingerprints.installRuntimeCache.toString()})(hashes, mirrors, "${"a".repeat(40)}")`, context);
+  const response = await context.maybeFromCache({
+    request: new Request(`https://datax-now.readthedocs.io/en/latest/_static/${runtimePath}`),
+    waitUntil() {},
+  });
+  assert.equal(await response.text(), bytes);
+  assert.equal(requests.at(-1), `https://datax-now.github.io/go/${runtimePath}`);
 });
 
 test("hosts outside the deployment set never fail over", async () => {
@@ -1133,10 +1166,14 @@ test("generated offline client includes the kernel idle monitor", async () => {
           this.port2 = { postMessage: data => this.port1.onmessage?.({ data }) };
         }
       },
-      setInterval() { return 1; },
-      clearInterval() {},
-      setTimeout(callback, delay) { const id = ++nextTimeout; timeouts.set(id, { callback, delay }); return id; },
-      clearTimeout(id) { timeouts.delete(id); },
+      // Browsers reject timer calls whose receiver is not the global object.
+      setInterval() { if (this !== undefined) throw new TypeError("Illegal invocation"); return 1; },
+      clearInterval() { if (this !== undefined) throw new TypeError("Illegal invocation"); },
+      setTimeout(callback, delay) {
+        if (this !== undefined) throw new TypeError("Illegal invocation");
+        const id = ++nextTimeout; timeouts.set(id, { callback, delay }); return id;
+      },
+      clearTimeout(id) { if (this !== undefined) throw new TypeError("Illegal invocation"); timeouts.delete(id); },
       console: { info() {}, error() {} },
     });
     vm.runInContext(source, context);
@@ -1214,6 +1251,39 @@ test("kernel package mapping is bundled locally for pages and workers on every d
     }
     assert.deepEqual(offline.prepareOffline(directory), assets);
   } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("service-worker heartbeat stays within subpath deployments", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-heartbeat-"));
+  try {
+    mkdirSync(join(directory, "build"));
+    writeFileSync(join(directory, "build/manager.js"), 'fetch("/api/service-worker-heartbeat")');
+    offline.prepareOffline(directory);
+    const patched = readFileSync(join(directory, "build/manager.js"), "utf8");
+    for (const prefix of ["/", "/go/", "/en/latest/_static/"]) {
+      let fetched;
+      const context = vm.createContext({
+        URL,
+        document: { baseURI: "https://example.com" + prefix + "lab/", getElementById() { return { textContent: '{"baseUrl":"../"}' }; } },
+        fetch(url) { fetched = url; },
+      });
+      vm.runInContext(patched, context);
+      assert.equal(fetched, "https://example.com" + prefix + "api/service-worker-heartbeat");
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+  const directoryWorker = mkdtempSync(join(tmpdir(), "datax-heartbeat-sw-"));
+  try {
+    mkdirSync(join(directoryWorker, "dist/xeus/xeus-python-wasm-host"), { recursive: true });
+    writeFileSync(join(directoryWorker, "dist/xeus/xeus-python-wasm-host/xpython.js"), "runtime");
+    writeFileSync(join(directoryWorker, "dist/service-worker.js"), upstream.replace(
+      "async function onFetch(event){",
+      'async function onFetch(event){let t=new URL(event.request.url);if("/api/service-worker-heartbeat"===t.pathname)return void event.respondWith(new Response("ok"));',
+    ));
+    const result = spawnSync("python3", ["-c", patch], { cwd: directoryWorker, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(readFileSync(join(directoryWorker, "dist/service-worker.js"), "utf8"),
+      /t\.pathname\.endsWith\("\/api\/service-worker-heartbeat"\)/);
+  } finally { rmSync(directoryWorker, { recursive: true, force: true }); }
 });
 
 test("offline inventory includes lazy assets but excludes archives and mutable deployment metadata", () => {

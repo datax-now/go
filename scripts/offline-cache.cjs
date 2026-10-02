@@ -178,7 +178,9 @@ function installOfflineCache(assets) {
   });
 }
 
-function createKernelIdleScheduler(onIdle, delayMs = 300000, now = () => Date.now(), timerApi = { setTimeout, clearTimeout }) {
+// Browser timers throw "Illegal invocation" when called as methods of another object.
+function createKernelIdleScheduler(onIdle, delayMs = 300000, now = () => Date.now(),
+  timerApi = { setTimeout: (callback, delay) => setTimeout(callback, delay), clearTimeout: id => clearTimeout(id) }) {
   let idleSince = null;
   let timer = null;
   let attempted = false;
@@ -218,7 +220,8 @@ function createKernelIdleScheduler(onIdle, delayMs = 300000, now = () => Date.no
   };
 }
 
-function monitorKernelActivity(onChange, getApp = () => window.jupyterapp, timerApi = { setInterval, clearInterval }) {
+function monitorKernelActivity(onChange, getApp = () => window.jupyterapp,
+  timerApi = { setInterval: (callback, delay) => setInterval(callback, delay), clearInterval: id => clearInterval(id) }) {
   let manager = null;
   let models = [];
   const connections = new Map();
@@ -427,16 +430,6 @@ function installOfflineUI() {
     request('datax-offline-download');
   }
   button.addEventListener('click', () => startDownload());
-  const stopKernelMonitor = monitorKernelActivity(statuses => {
-    kernelStatuses = statuses;
-    updateIdleScheduler();
-  });
-  window.addEventListener('pagehide', event => {
-    if (event.persisted) return;
-    stopKernelMonitor();
-    idleScheduler.dispose();
-    clearTimeout(stallTimer);
-  });
   navigator.serviceWorker.ready.then(() => request('datax-offline-status')).catch(() => {
     label.textContent = 'Offline cache unavailable';
   });
@@ -449,6 +442,16 @@ function installOfflineUI() {
     updateIdleScheduler();
   });
   window.addEventListener('offline', () => { if (!current?.downloading) request('datax-offline-status'); });
+  const stopKernelMonitor = monitorKernelActivity(statuses => {
+    kernelStatuses = statuses;
+    updateIdleScheduler();
+  });
+  window.addEventListener('pagehide', event => {
+    if (event.persisted) return;
+    stopKernelMonitor();
+    idleScheduler.dispose();
+    clearTimeout(stallTimer);
+  });
 }
 
 function prepareOffline(directory) {
@@ -463,6 +466,9 @@ function prepareOffline(directory) {
       if (source.includes(remote)) fs.writeFileSync(filename, source.split(remote).join(local));
     }
   }
+  // Upstream pings the origin root, which is outside the worker scope on subpath deployments.
+  const heartbeat = 'fetch("/api/service-worker-heartbeat")';
+  const localHeartbeat = 'fetch(typeof document==="undefined"?"/api/service-worker-heartbeat":new URL("api/service-worker-heartbeat",new URL(JSON.parse(document.getElementById("jupyter-config-data").textContent).baseUrl||"../",document.baseURI)).href)';
   const client = 'datax-offline.js';
   fs.writeFileSync(path.join(directory, client), `${createKernelIdleScheduler.toString()}\n${monitorKernelActivity.toString()}\n${offlineStatusText.toString()}\n(${installOfflineUI.toString()})();\n`);
   const assets = {};
@@ -476,6 +482,10 @@ function prepareOffline(directory) {
         'service-worker.js', 'deployment.json', 'datax-now.zip', 'cors_server.py',
         'xeus/xeus-python-wasm-host/built-in-local/conda/generate_repodata.py',
       ].includes(relative)) continue;
+      if (entry.name.endsWith('.js')) {
+        const source = fs.readFileSync(filename, 'utf8');
+        if (source.includes(heartbeat)) fs.writeFileSync(filename, source.split(heartbeat).join(localHeartbeat));
+      }
       if (entry.name === 'index.html') {
         const html = fs.readFileSync(filename, 'utf8');
         const script = `<script id="datax-offline-client" src="${path.relative(path.dirname(filename), path.join(directory, client)).split(path.sep).join('/')}" defer></script>`;

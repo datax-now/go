@@ -72,9 +72,9 @@ function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null) {
       const mirrorRequest = { method: 'GET', mode: 'cors', credentials: 'omit', cache: 'no-cache' };
       if (runtimeHash) {
         const manifest = await loadMirrorManifest(base);
-        // A mirror still serving another release would mix runtime files from two builds.
-        if (manifest && buildCommit && manifest.commit !== buildCommit) continue;
         const mirrorHash = manifest?.files[decodeURIComponent(runtimePath[1].slice(1))]?.sha256;
+        // Another release is safe only for byte-identical files; otherwise two builds would be mixed.
+        if (manifest && buildCommit && manifest.commit !== buildCommit && mirrorHash !== runtimeHash) continue;
         mirrorRequest.integrity = integrityOf(mirrorHash ?? runtimeHash);
       }
       try {
@@ -157,8 +157,8 @@ function fingerprintRuntime(directory, mirrorOrigins = DEFAULT_MIRROR_ORIGINS, b
       }
     }
   }
-  visit(runtime);
   const assets = offline.prepareOffline(directory);
+  visit(runtime);
   const source = fs.readFileSync(worker, 'utf8').split(marker)[0];
   fs.writeFileSync(worker, source + marker + `(${installRuntimeCache.toString()})(${JSON.stringify(hashes)}, ${JSON.stringify(mirrorOrigins)}, ${JSON.stringify(buildCommit)});\n` +
     `(${offline.installOfflineCache.toString()})(${JSON.stringify(assets)});\n`);

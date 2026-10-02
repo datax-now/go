@@ -2791,6 +2791,12 @@ updated = re.sub(
 )
 updated = updated.replace('let enableCache=!1', 'let enableCache="true"===new URL(location.href).searchParams.get("enableCache")')
 updated = updated.replace('caches.open("precache")', 'caches.open(CACHE)')
+# Subpath deployments ping <base>/api/service-worker-heartbeat.
+updated = re.sub(
+  r'"/api/service-worker-heartbeat"===(\w+)\.pathname',
+  r'\1.pathname.endsWith("/api/service-worker-heartbeat")',
+  updated,
+)
 updated = updated.replace('t&&404!==t.status?t:null', 't&&t.ok?t:null', 1)
 updated = updated.replace(
   'e.waitUntil(updateCache(a,t.clone()))',
