@@ -276,7 +276,7 @@ function monitorKernelActivity(onChange, getApp = () => window.jupyterapp,
     for (const model of models) {
       if (connections.has(model.id)) continue;
       try {
-        const connection = manager.connectTo({ model });
+        const connection = manager.connectTo({ model, handleComms: false });
         const onStatusChanged = publish;
         connection.statusChanged.connect(onStatusChanged);
         connections.set(model.id, { connection, onStatusChanged });
@@ -492,7 +492,67 @@ function patchServiceWorkerManager(source) {
   return patched;
 }
 
-function prepareOffline(directory) {
+function patchContentsManager(source) {
+  const marker = '/* datax-retry-bundled-directory */';
+  if (source.includes(marker)) return source;
+  let count = 0;
+  const patched = source.replace(
+    /async _getServerDirectory\([\w$]+\)\{[\s\S]*?(?=async _ensureDirectoryExists\()/g,
+    method => {
+      count++;
+      const utilities = method.match(/([\w$]+)\.PageConfig\.getOption\("contentsAllJsonFile"\)/)?.[1];
+      if (!utilities) throw new Error('Could not locate bundled-directory configuration utilities');
+      return `async _getServerDirectory(directory){${marker}
+        if(this._serverContents.has(directory))return this._serverContents.get(directory);
+        const listing=new Map(),file=${utilities}.PageConfig.getOption("contentsAllJsonFile");
+        if(!file){this._serverContents.set(directory,listing);return listing}
+        const url=${utilities}.URLExt.join(${utilities}.PageConfig.getBaseUrl(),"api/contents",directory,file);
+        try{
+          const response=await fetch(url);
+          if(!response.ok)throw new Error("HTTP "+response.status);
+          const model=JSON.parse(await response.text());
+          if(!Array.isArray(model.content))throw new Error("Invalid bundled directory listing");
+          for(const entry of model.content)listing.set(entry.name,entry);
+        }catch(error){
+          console.error("[DataX.now] Could not load bundled directory "+url+"; refresh the file browser to retry.",error);
+          throw error;
+        }
+        this._serverContents.set(directory,listing);
+        return listing;
+      }`;
+    },
+  );
+  if (count !== 1) throw new Error(`Expected one bundled-directory loader, found ${count}`);
+  return patched;
+}
+
+function normalizeContentsMetadata(directory, timestamp) {
+  if (!fs.existsSync(directory)) return;
+  function normalize(model) {
+    for (const key of ['created', 'last_modified']) {
+      if (typeof model[key] === 'string') model[key] = timestamp;
+    }
+    if (Array.isArray(model.content)) model.content.forEach(normalize);
+  }
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const filename = path.join(directory, entry.name);
+    if (entry.isDirectory()) normalizeContentsMetadata(filename, timestamp);
+    else if (entry.isFile() && entry.name.endsWith('.json')) {
+      const model = JSON.parse(fs.readFileSync(filename, 'utf8'));
+      normalize(model);
+      fs.writeFileSync(filename, JSON.stringify(model, null, 2) + '\n');
+    }
+  }
+}
+
+function prepareOffline(directory, sourceDateEpoch = process.env.SOURCE_DATE_EPOCH) {
+  if (sourceDateEpoch !== undefined) {
+    if (!/^\d+$/.test(String(sourceDateEpoch)) || !Number.isSafeInteger(Number(sourceDateEpoch))) {
+      throw new Error('SOURCE_DATE_EPOCH must be a nonnegative Unix timestamp');
+    }
+    const timestamp = new Date(Number(sourceDateEpoch) * 1000).toISOString();
+    normalizeContentsMetadata(path.join(directory, 'api/contents'), timestamp);
+  }
   const extension = path.join(directory, 'extensions/@jupyterlite/xeus-extension/static');
   if (fs.existsSync(extension)) {
     const remote = '"https://raw.githubusercontent.com/prefix-dev/parselmouth/main/files/compressed_mapping.json"';
@@ -525,7 +585,20 @@ function prepareOffline(directory) {
         const source = fs.readFileSync(filename, 'utf8');
         let updated = source.split(heartbeat).join(localHeartbeat);
         if (updated.includes('_unregisterOldServiceWorkers(')) updated = patchServiceWorkerManager(updated);
+        if (updated.includes('async _getServerDirectory(')) updated = patchContentsManager(updated);
         if (updated !== source) fs.writeFileSync(filename, updated);
+      }
+      if (entry.name.endsWith('.html') && sourceDateEpoch !== undefined) {
+        const html = fs.readFileSync(filename, 'utf8');
+        const updated = html.replace(/([^"'<> \t\r\n?]+\.js)\?_=[a-f0-9]+/g, (match, script) => {
+          const base = new URL(relative, 'https://datax.invalid/');
+          const url = new URL(script, base);
+          if (url.origin !== base.origin) return match;
+          const target = path.join(directory, decodeURIComponent(url.pathname));
+          const digest = crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex');
+          return script + '?_=' + digest.slice(0, 12);
+        });
+        if (updated !== html) fs.writeFileSync(filename, updated);
       }
       if (entry.name === 'index.html') {
         const html = fs.readFileSync(filename, 'utf8');
@@ -545,4 +618,4 @@ function prepareOffline(directory) {
   return assets;
 }
 
-module.exports = { createKernelIdleScheduler, installOfflineCache, installOfflineUI, monitorKernelActivity, offlineStatusText, patchServiceWorkerManager, prepareOffline };
+module.exports = { createKernelIdleScheduler, installOfflineCache, installOfflineUI, monitorKernelActivity, offlineStatusText, patchContentsManager, patchServiceWorkerManager, prepareOffline };

@@ -188,6 +188,8 @@ notebooks and data, and the WebAssembly kernel packages. The installed PWA can
 then reopen, start a fresh kernel, run Python, and access locally saved
 notebooks without an internet connection.
 App navigation remains available when notebook query parameters change.
+The idle monitor's kernel connections do not handle widget comms, leaving
+comm ownership with notebook connections even when monitoring starts first.
 
 The kernel's conda-to-PyPI name mapping is also bundled locally. Its build input,
 `scripts/conda-pypi-mapping.json`, is a snapshot of prefix-dev/parselmouth's
@@ -211,6 +213,16 @@ Timestamped build diagnostics (`xpython-deploy-manifest.json`) are not offline
 dependencies and are excluded from the offline inventory, like `deployment.json`.
 Their bytes differ between builds on different hosts and cannot be recovered
 as integrity-verified runtime assets from a mirror.
+
+Bundled directory indexes use the source commit time (`SOURCE_DATE_EPOCH`, which
+can be overridden for a reproducible build), not build time or checkout file
+timestamps. Generated HTML cache tokens use the referenced script's content
+hash. These are normalized before offline copies and inventories are written,
+so independently built mirrors can recover the same notebook/data listings
+and application pages without weakening SHA-256 verification.
+If a bundled directory download fails, the file browser reports the error
+instead of caching an empty folder for the session. Refresh the file browser
+to retry once connectivity recovers. Locally saved notebook metadata is unchanged.
 
 Network-dependent notebook code, remote datasets, AI services, and packages not
 included in the build still require internet access. External fonts may fall

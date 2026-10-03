@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -229,6 +229,8 @@ const runtimeConfigPatch = build.split('echo "Restoring custom runtime config in
   .split("python3 << 'EOFPATCH'\n")[1].split("\nEOFPATCH")[0];
 const configStaging = "for lite_file in " + build.split("for lite_file in ")[1]
   .split("# Validate notebook fallback")[0];
+const dataIndexPatch = build.split("mamba_run_deploy python3 - <<'PYEOF'\nimport json\nfrom datetime")[1]
+  .split("\nPYEOF")[0];
 const upstream = `const CACHE="precache";let enableCache=!1;
 function onActivate(e){enableCache="true"===new URL(location.href).searchParams.get("enableCache"),e.waitUntil(self.clients.claim())}
 async function onFetch(event){event.respondWith(maybeFromCache(event))}
@@ -939,6 +941,156 @@ test("failed hosts fail over in priority order, skipping stale mirrors and cooli
     "the preferred host is used again once its cooldown expires");
 });
 
+test("data directory listings are byte-identical across clean deployments and remain mirror-downloadable", async t => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-data-index-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const listings = [];
+  for (const [host, mtime] of [["github", 1000000000], ["rtd", 1700000000]]) {
+    const folder = join(directory, host);
+    mkdirSync(join(folder, "dist/files/data"), { recursive: true });
+    mkdirSync(join(folder, "dist/api/contents"), { recursive: true });
+    const file = join(folder, "dist/files/data/titanic.csv");
+    writeFileSync(file, "PassengerId,Survived\n1,0\n");
+    utimesSync(file, mtime, mtime);
+    writeFileSync(join(folder, "dist/api/contents/all.json"), '{"content":[]}');
+    const result = spawnSync("python3", ["-c", "import json\nfrom datetime" + dataIndexPatch], {
+      cwd: folder, encoding: "utf8", env: { ...process.env, SOURCE_DATE_EPOCH: "1780000000" },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const listing = readFileSync(join(folder, "dist/api/contents/data/all.json"), "utf8");
+    assert.equal(JSON.parse(listing).content[0].name, "titanic.csv");
+    listings.push(listing);
+  }
+  assert.equal(listings[0], listings[1], "build time and checkout mtimes must not invalidate the data listing's mirror hash");
+  const integrity = "sha256-" + createHash("sha256").update(listings[0]).digest("base64");
+  const response = await fetch("data:application/json," + encodeURIComponent(listings[1]), { integrity });
+  assert.equal((await response.json()).content[0].name, "titanic.csv");
+});
+
+test("offline inventories normalize generated listing timestamps and HTML cache tokens before hashing", async t => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-reproducible-offline-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const inventories = [];
+  for (const token of ["aaaaaaa", "bbbbbbb"]) {
+    const folder = join(directory, token);
+    mkdirSync(join(folder, "api/contents/how-to"), { recursive: true });
+    mkdirSync(join(folder, "lab"));
+    const timestamp = token === "aaaaaaa" ? "2026-01-01T00:00:00Z" : "2026-10-01T00:00:00Z";
+    writeFileSync(join(folder, "api/contents/how-to/all.json"), JSON.stringify({
+      created: timestamp, last_modified: timestamp,
+      content: [{ name: "example.ipynb", created: timestamp, last_modified: timestamp }],
+    }));
+    writeFileSync(join(folder, "config-utils.js"), "globalThis.started=true;");
+    writeFileSync(join(folder, "lab/index.html"),
+      `<html><script>import('../config-utils.js?_=${token}')</script></html>`);
+    const assets = offline.prepareOffline(folder, 1780000000);
+    const listing = JSON.parse(readFileSync(join(folder, "api/contents/how-to/all.json"), "utf8"));
+    assert.equal(listing.content[0].name, "example.ipynb");
+    assert.deepEqual(offline.prepareOffline(folder, 1780000000), assets, "normalization must be idempotent");
+    assert.equal(readFileSync(join(folder, "lab/index.html.offline"), "utf8"),
+      readFileSync(join(folder, "lab/index.html"), "utf8"));
+    inventories.push(assets);
+  }
+  assert.deepEqual(inventories[0], inventories[1], "mirrors must agree on the exact bytes used for offline SRI");
+  const scope = "https://datax-now.readthedocs.io/en/latest/_static/";
+  const mirror = "https://datax-now.github.io/go/";
+  const assets = inventories[0];
+  const stored = new Map();
+  let message;
+  const context = vm.createContext({
+    URL, Request, Response, Headers, btoa, assets,
+    self: {
+      location: { href: scope + "service-worker.js?enableCache=true" },
+      addEventListener(type, listener) { if (type === "message") message = listener; },
+    },
+    caches: { async open() { return {
+      async match(key) { return stored.get(key.url ?? key)?.clone(); },
+      async put(key, response) { stored.set(key.url ?? key, response.clone()); },
+      async keys() { return [...stored.keys()].map(url => new Request(url)); },
+    }; } },
+    async maybeFromCache(event) { return context.fetch(event.request); },
+    async fetch(request) {
+      const url = new URL(request.url);
+      if (url.origin === new URL(scope).origin) throw new TypeError("RTD challenge failed integrity");
+      if (url.pathname.endsWith("/deployment.json")) {
+        return new Response(JSON.stringify({ files: Object.fromEntries(Object.entries(inventories[1])
+          .flatMap(([relative, asset]) => [[relative, asset], ...(asset.source ? [[asset.source, asset]] : [])])) }));
+      }
+      const relative = decodeURIComponent(url.pathname.slice(new URL(mirror).pathname.length));
+      const bytes = readFileSync(join(directory, "bbbbbbb", relative));
+      return fetch("data:application/octet-stream;base64," + bytes.toString("base64"), { integrity: request.integrity });
+    },
+  });
+  vm.runInContext(
+    `(${fingerprints.installRuntimeCache.toString()})({}, ["${mirror}"], null,
+      Object.fromEntries(Object.entries(assets).flatMap(([path, asset]) =>
+        [[path, asset.sha256], ...(asset.source ? [[asset.source, asset.sha256]] : [])])));` +
+    `(${offline.installOfflineCache.toString()})(assets);`,
+    context,
+  );
+  const updates = [];
+  const tasks = [];
+  message({
+    data: { type: "datax-offline-download" }, source: { url: scope + "lab/" },
+    ports: [{ postMessage(update) { updates.push(update); } }],
+    waitUntil(task) { tasks.push(task); },
+  });
+  await Promise.all(tasks);
+  assert.equal(updates.at(-1).ready, true, updates.at(-1).error);
+  assert.equal(updates.at(-1).completed, Object.keys(assets).length);
+});
+
+test("failed bundled directory requests surface an error and remain retryable instead of caching an empty data folder", async t => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-contents-retry-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  mkdirSync(join(directory, "build"));
+  const source = `globalThis.Contents=class {
+    constructor(){this._serverContents=new Map}
+    async _getServerDirectory(e){let t=this._serverContents.get(e)||new Map;if(!this._serverContents.has(e)){
+      let s=u.PageConfig.getOption("contentsAllJsonFile");if(!s)return this._serverContents.set(e,t),t;
+      let n=u.URLExt.join(u.PageConfig.getBaseUrl(),"api/contents",e,s);
+      try{let e=await fetch(n);for(let s of JSON.parse(await e.text()).content)t.set(s.name,s)}
+      catch(e){console.warn(\`don't worry, about \${e}... nothing's broken. If there had been a
+          file at \${n}, you might see some more files.\`)}this._serverContents.set(e,t)}return t}
+    async _ensureDirectoryExists(e){}
+  };`;
+  writeFileSync(join(directory, "build/contents.js"), source);
+  offline.prepareOffline(directory);
+  const patched = readFileSync(join(directory, "build/contents.js"), "utf8");
+  let fetches = 0;
+  let failure;
+  const errors = [];
+  const context = vm.createContext({
+    u: {
+      PageConfig: { getOption() { return "all.json"; }, getBaseUrl() { return "https://example.com/go/"; } },
+      URLExt: { join: (...parts) => parts.join("/") },
+    },
+    console: { warn() {}, error(...args) { errors.push(args); } },
+    async fetch() {
+      fetches++;
+      if (failure instanceof Error) throw failure;
+      if (failure) return failure.clone();
+      return new Response('{"content":[{"name":"titanic.csv","path":"data/titanic.csv"}]}');
+    },
+  });
+  vm.runInContext(patched, context);
+  for (failure of [new TypeError("Failed to fetch"), new Response("challenge", { status: 429 }),
+    new Response("{}"), new Response("not JSON")]) {
+    const contents = new context.Contents();
+    await assert.rejects(contents._getServerDirectory("data"));
+    assert.equal(contents._serverContents.has("data"), false);
+    failure = null;
+    const listing = await contents._getServerDirectory("data");
+    assert.equal(listing.get("titanic.csv").path, "data/titanic.csv");
+    const before = fetches;
+    assert.equal(await contents._getServerDirectory("data"), listing);
+    assert.equal(fetches, before, "successful listings retain the upstream cache behavior");
+  }
+  assert.equal(errors.length, 4, "each failure must be reported explicitly");
+  offline.prepareOffline(directory);
+  assert.equal(readFileSync(join(directory, "build/contents.js"), "utf8"), patched);
+});
+
 test("mirrors on another release serve byte-identical runtime files", async () => {
   const runtimePath = "xeus/xeus-python-wasm-host/stats.so.asm";
   const bytes = "shared library";
@@ -1556,7 +1708,8 @@ test("kernel activity monitor tracks every running kernel and disposes removed c
   let refresh;
   const manager = {
     running: () => models,
-    connectTo({ model }) {
+    connectTo({ model, handleComms }) {
+      assert.equal(handleComms, false, "the offline observer must not claim notebook widget comms during cold startup");
       const listeners = new Set();
       const connection = {
         get status() { return model.status; },

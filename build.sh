@@ -24,6 +24,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${SCRIPT_DIR}"
 BUILTIN_WHEELS_DIR="${BUILTIN_WHEELS_DIR:-${REPO_ROOT}/built-in-wheels}"
+SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$REPO_ROOT" show -s --format=%ct HEAD)}"
+if [[ ! "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: SOURCE_DATE_EPOCH must be a nonnegative Unix timestamp." >&2
+  exit 1
+fi
+export SOURCE_DATE_EPOCH
 
 # ==============================================================================
 # Pinned dependency versions
@@ -1616,12 +1622,13 @@ if [ -d "$PWD/notebooks/data" ]; then
   mamba_run_deploy python3 - <<'PYEOF'
 import json
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 
 data_dir = Path("dist/files/data")
 root_all_json = Path("dist/api/contents/all.json")
 data_all_json = Path("dist/api/contents/data/all.json")
-now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+now = datetime.fromtimestamp(int(os.environ["SOURCE_DATE_EPOCH"]), timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 # Fix root all.json: keep only direct children (no '/' in path)
 with open(root_all_json) as f:
@@ -1662,7 +1669,7 @@ for fp in sorted(data_dir.iterdir()):
             "format": None,
             "hash": None,
             "hash_algorithm": None,
-            "last_modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "last_modified": now,
             "mimetype": mimetype,
             "name": fp.name,
             "path": f"data/{fp.name}",
