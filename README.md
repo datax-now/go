@@ -164,7 +164,7 @@ kernel initialization failure.
 Run the focused regression checks with:
 
 ```bash
-node --test scripts/service-worker-cache.test.mjs scripts/deployment-manifest.test.mjs scripts/kernel-config.test.mjs
+node --test scripts/build-environment.test.mjs scripts/service-worker-cache.test.mjs scripts/deployment-manifest.test.mjs scripts/kernel-config.test.mjs
 ```
 
 After rebuilding and deploying, allow one initial load to populate the cache.
@@ -214,9 +214,15 @@ dependencies and are excluded from the offline inventory, like `deployment.json`
 Their bytes differ between builds on different hosts and cannot be recovered
 as integrity-verified runtime assets from a mirror.
 
-Bundled directory indexes use the source commit time (`SOURCE_DATE_EPOCH`, which
-can be overridden for a reproducible build), not build time or checkout file
-timestamps. Generated HTML cache tokens use the referenced script's content
+Bundled directory indexes use a fixed metadata timestamp (`SOURCE_DATE_EPOCH`,
+defaulting to `0`, the Unix epoch), not build time or checkout file timestamps.
+This default is identical on all hosts and does not require `.git`, which Vercel
+excludes from its build context. To override it, use the same value on every
+mirror. The timestamp is excluded from the JupyterLite build subprocess:
+JupyterLite 0.8.3 otherwise recursively timestamps the output directory's parent,
+including Micromamba caches and broken sysroot symlinks. It remains available to
+the post-build directory-index and offline-inventory normalization.
+Generated HTML cache tokens use the referenced script's content
 hash. These are normalized before offline copies and inventories are written,
 so independently built mirrors can recover the same notebook/data listings
 and application pages without weakening SHA-256 verification.

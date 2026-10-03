@@ -24,7 +24,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${SCRIPT_DIR}"
 BUILTIN_WHEELS_DIR="${BUILTIN_WHEELS_DIR:-${REPO_ROOT}/built-in-wheels}"
-SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$REPO_ROOT" show -s --format=%ct HEAD)}"
+SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-0}"
 if [[ ! "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]]; then
   echo "ERROR: SOURCE_DATE_EPOCH must be a nonnegative Unix timestamp." >&2
   exit 1
@@ -1498,7 +1498,11 @@ if [ -f "$PWD/jupyter_lite_config.json" ]; then
 fi
 
 echo "Building JupyterLite..."
-mamba_run_deploy jupyter lite build "${JUPYTER_LITE_BUILD_ARGS[@]}"
+(
+  # JupyterLite's timestamp traversal includes the repository's package caches.
+  unset SOURCE_DATE_EPOCH
+  mamba_run_deploy jupyter lite build "${JUPYTER_LITE_BUILD_ARGS[@]}"
+)
 rm -rf "$PWD/dist/extensions/@jupyterlite/pyodide-kernel-extension"
 
 # JupyterLite 0.8.3 embeds the upstream JupyterLab security fixes.
