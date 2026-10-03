@@ -117,6 +117,83 @@ test("cold kernel messages wait for initialization and mounted filesystem in arr
   assert.equal(failed.messages.length, 0);
 });
 
+test("kernel IOPub output reaches live clients after the originating socket closes", () => {
+  const source = `class Router {
+    constructor(){this._clients=new Map();this._kernelClients=new Map()}
+    send(e){let t="stdin"===e.channel?e.parent_header.session:e.header.session,s=this._clients.get(t);
+      if(!s)return void console.warn(\`Trying to send message on removed socket for kernel \${kernelId}\`);
+      let n=serialize(e);if("iopub"===e.channel){let e=this._kernelClients.get(kernelId);
+        e?.forEach(e=>{this._clients.get(e)?.send(n)});return}
+      s.send(n)}
+  } globalThis.Router=Router;`;
+  const warnings = [];
+  const received = [];
+  const context = vm.createContext({
+    kernelId: "kernel", serialize: message => message,
+    console: { warn(message) { warnings.push(message); } },
+  });
+  const patched = startup.patchSocketMessages(source);
+  assert.equal(startup.patchSocketMessages(patched), patched);
+  assert.throws(() => startup.patchSocketMessages("changed upstream code"), /Expected one kernel IOPub/);
+  vm.runInContext(patched, context);
+  const router = new context.Router();
+  router._clients.set("notebook", { send(message) { received.push(message); } });
+  router._kernelClients.set("kernel", new Set(["notebook"]));
+  const output = { channel: "iopub", header: { session: "closed-probe" } };
+  router.send(output);
+  assert.deepEqual(received, [output], "IOPub must broadcast even without a live originating socket");
+  assert.deepEqual(warnings, [], "a valid broadcast must not produce a removed-socket warning");
+  router.send({ channel: "shell", header: { session: "closed-probe" } });
+  assert.equal(warnings.length, 1, "orphaned direct replies must still be reported");
+  const input = { channel: "stdin", header: { session: "kernel" }, parent_header: { session: "notebook" } };
+  router.send(input);
+  assert.equal(received.at(-1), input, "stdin must still reach the parent session");
+});
+
+test("Python comm exposure waits for pyjs readiness rather than timing out during cold downloads", () => {
+  const source = `function __xeus_x_tryExposePythonCommOnModule(){
+    if(typeof Module.exec_eval!=="function")return false;
+    const comm=Module.exec_eval("import comm; comm");
+    if(!comm)return false;
+    Module.__xeus_x_pythonComm=comm.Comm;Module.__xeus_x_pythonCreateComm=comm.create_comm;return true;
+  }
+  function __xeus_x_ensurePythonCommOnModule(log){
+    if(typeof Module==="undefined"){return}
+    if(__xeus_x_tryExposePythonCommOnModule())return;
+    let attempts=0;const poll=()=>{
+      if(__xeus_x_tryExposePythonCommOnModule())return;
+      if(++attempts>=100){log.warn("Module.__xeus_x_pythonComm was not exposed after waiting for pyjs init");return}
+      setTimeout(poll,200);
+    };setTimeout(poll,200);
+  }
+  __xeus_x_ensurePythonCommOnModule(console);
+  function initialize(){Module.exec_eval=()=>pythonComm;Module._is_initialized=true;}`;
+  const timers = [];
+  const warnings = [];
+  const pythonComm = { Comm() {}, create_comm() {} };
+  const context = vm.createContext({
+    Module: {}, pythonComm,
+    setTimeout(callback) { timers.push(callback); },
+    console: { warn(message) { warnings.push(message); } },
+  });
+  const patched = startup.patchCommInitialization(source);
+  assert.equal(startup.patchCommInitialization(patched), patched);
+  assert.throws(() => startup.patchCommInitialization("changed upstream code"), /Expected one Python comm initialization/);
+  vm.runInContext(patched, context);
+  for (let elapsed = 0; elapsed < 30000 && timers.length; elapsed += 200) timers.shift()();
+  assert.deepEqual(warnings, [], "slow downloads before Python starts must not exhaust the comm exposure wait");
+  assert.equal(timers.length, 0, "comm exposure must not poll an uninitialized interpreter");
+  context.initialize();
+  assert.equal(context.Module.__xeus_x_pythonComm, pythonComm.Comm, "Python initialization must trigger comm exposure");
+  assert.equal(context.Module.__xeus_x_pythonCreateComm, pythonComm.create_comm);
+  context.pythonComm = null;
+  delete context.Module.__xeus_x_pythonComm;
+  delete context.Module.__xeus_x_pythonCreateComm;
+  context.initialize();
+  for (let elapsed = 0; elapsed < 30000 && timers.length; elapsed += 200) timers.shift()();
+  assert.equal(warnings.length, 1, "a genuine comm exposure failure after initialization must still be reported");
+});
+
 test("duplicate libraries are removed only after worker fetch aliases are installed", async () => {
   const directory = mkdtempSync(join(tmpdir(), "datax-library-dedup-"));
   const runtime = "xeus/xeus-python-wasm-host/";
@@ -783,8 +860,6 @@ test("RTD challenges retry fingerprinted runtime assets and the web manifest", a
   const requests = [];
   const packageHash = createHash("sha256").update("verified package").digest("hex");
   const packageIntegrity = `sha256-${Buffer.from(packageHash, "hex").toString("base64")}`;
-  const mirrorPackageHash = createHash("sha256").update("mirror build package").digest("hex");
-  const mirrorPackageIntegrity = `sha256-${Buffer.from(mirrorPackageHash, "hex").toString("base64")}`;
   const packagePath = "xeus/xeus-python-wasm-host/kernel_packages/openssl-4.0.2-hb2bca66_0.tar.gz";
   const runtimePath = "xeus/xeus-python-wasm-host/xpython.wasm";
   let failRtdRequest = false;
@@ -809,9 +884,11 @@ test("RTD challenges retry fingerprinted runtime assets and the web manifest", a
         return new Response('{"name":"DataX.now"}', { status: 200 });
       }
       if (new URL(request.url).pathname === "/go/deployment.json") {
-        return new Response(JSON.stringify({ files: { [packagePath]: { sha256: mirrorPackageHash } } }));
+        return new Response(JSON.stringify({ files: {
+          [packagePath]: { sha256: packageHash }, [runtimePath]: { sha256: packageHash },
+        } }));
       }
-      const body = request.url.endsWith(packagePath) ? "mirror build package" : "verified package";
+      const body = "verified package";
       return fetch(`data:application/octet-stream,${encodeURIComponent(body)}`, {
         integrity: request.integrity,
       });
@@ -830,7 +907,7 @@ test("RTD challenges retry fingerprinted runtime assets and the web manifest", a
   ), waitUntil() {} });
 
   assert.equal(response.status, 200);
-  assert.equal(await response.text(), "mirror build package");
+  assert.equal(await response.text(), "verified package");
   assert.equal(requests.length, 3);
   assert.equal(new URL(requests[1].url).href, "https://datax-now.github.io/go/deployment.json");
   assert.equal(new URL(requests[2].url).href,
@@ -838,7 +915,7 @@ test("RTD challenges retry fingerprinted runtime assets and the web manifest", a
   assert.equal(requests[2].mode, "cors");
   assert.equal(requests[2].credentials, "omit");
   assert.equal(requests[2].headers.has("Authorization"), false);
-  assert.equal(requests[2].integrity, mirrorPackageIntegrity, "mirror bytes are checked against the mirror's own manifest");
+  assert.equal(requests[2].integrity, packageIntegrity, "mirror bytes must match this build's hash");
 
   clock += 61000;
   const manifest = await context.maybeFromCache({
@@ -884,7 +961,7 @@ test("RTD challenges retry fingerprinted runtime assets and the web manifest", a
     "/go/xeus/xeus-python-wasm-host/kernel_packages/openssl-4.0.2-hb2bca66_0.tar.gz");
 });
 
-test("failed hosts fail over in priority order, skipping stale mirrors and cooling hosts", async () => {
+test("failed hosts fail over in priority order, skipping mismatched mirrors and cooling hosts", async () => {
   const release = "a".repeat(40);
   const runtimePath = "xeus/xeus-python-wasm-host/xpython.wasm";
   const bytes = "runtime bytes";
@@ -892,7 +969,7 @@ test("failed hosts fail over in priority order, skipping stale mirrors and cooli
   const requests = [];
   let clock = 0;
   const manifests = {
-    "https://datax.now/deployment.json": { commit: "b".repeat(40), files: { [runtimePath]: { sha256: "c".repeat(64) } } },
+    "https://datax.now/deployment.json": { commit: release, files: { [runtimePath]: { sha256: "c".repeat(64) } } },
     "https://datax-now.pages.dev/deployment.json": { commit: release, files: { [runtimePath]: { sha256 } } },
   };
   const context = vm.createContext({
@@ -927,7 +1004,7 @@ test("failed hosts fail over in priority order, skipping stale mirrors and cooli
     "https://datax.now/deployment.json",
     "https://datax-now.pages.dev/deployment.json",
     `https://datax-now.pages.dev/${runtimePath}`,
-  ], "priority order is RTD, Vercel, Cloudflare after GitHub Pages fails; the stale Vercel release is never used");
+  ], "priority order is RTD, Vercel, Cloudflare after GitHub Pages fails; different bytes are rejected even at the same commit");
 
   requests.length = 0;
   assert.equal(await (await load()).text(), bytes);
@@ -1464,6 +1541,118 @@ test("offline downloads recover indexed assets from mirrors only when their hash
   });
 });
 
+test("RTD runtime fallback cannot mark different mirror bytes as offline ready", async () => {
+  const scope = "https://datax-now.readthedocs.io/en/latest/_static/";
+  const mirror = "https://datax-now.github.io/go/";
+  const relative = "xeus/xeus-python-wasm-host/kernel_packages/lz4-c-1.10.0-h906537b_2.tar.gz";
+  const body = "local build package";
+  const mirrorBody = "different mirror package";
+  const sha256 = createHash("sha256").update(body).digest("hex");
+  const mirrorHash = createHash("sha256").update(mirrorBody).digest("hex");
+  const stored = new Map();
+  let message;
+  const context = vm.createContext({
+    URL, Request, Response, Headers, btoa,
+    hashes: { [relative]: sha256 },
+    assets: { [relative]: { sha256, size: Buffer.byteLength(body) } },
+    assetHashes: { [relative]: sha256 },
+    self: {
+      location: { href: scope + "service-worker.js?enableCache=true" },
+      addEventListener(type, listener) { if (type === "message") message = listener; },
+    },
+    caches: { async open() { return {
+      async match(key) { return stored.get(key.url ?? key)?.clone(); },
+      async put(key, response) { stored.set(key.url ?? key, response.clone()); },
+      async keys() { return [...stored.keys()].map(key => new Request(key)); },
+      async delete(key) { return stored.delete(key.url ?? key); },
+    }; } },
+    async maybeFromCache(event) { return context.fetch(event.request); },
+    async fetch(request) {
+      if (request.url.startsWith(scope)) {
+        throw new TypeError("Fetch API cannot load RTD asset. SRI's integrity checks failed.");
+      }
+      if (request.url.endsWith("deployment.json")) {
+        return new Response(JSON.stringify({ commit: "same-commit", files: { [relative]: { sha256: mirrorHash } } }));
+      }
+      return fetch("data:application/octet-stream," + encodeURIComponent(mirrorBody), { integrity: request.integrity });
+    },
+  });
+  vm.runInContext(
+    `(${fingerprints.installRuntimeCache.toString()})(hashes, [${JSON.stringify(mirror)}], "same-commit", assetHashes);` +
+      `(${offline.installOfflineCache.toString()})(assets);`,
+    context,
+  );
+  const updates = [];
+  const tasks = [];
+  message({
+    data: { type: "datax-offline-download" }, source: { url: scope + "lab/" },
+    ports: [{ postMessage(update) { updates.push(update); } }],
+    waitUntil(task) { tasks.push(task); },
+  });
+  await Promise.all(tasks);
+  assert.equal(updates.at(-1).ready, false, "a mismatched kernel package must not report Offline ready");
+  assert.match(updates.at(-1).error, /lz4-c/);
+  assert.equal(stored.size, 0, "mirror bytes must not poison this build's runtime hash or readiness marker");
+});
+
+test("offline upgrades ignore old runtime entries without losing verified application assets", async () => {
+  const scope = "https://example.com/go/";
+  const bodies = { "lab/index.html": "verified shell", "xeus/runtime.wasm": "current runtime" };
+  const assets = Object.fromEntries(Object.entries(bodies).map(([relative, body]) => [relative, {
+    sha256: createHash("sha256").update(body).digest("hex"), size: Buffer.byteLength(body),
+  }]));
+  const runtimeKey = scope + "xeus/runtime.wasm?sha256=" + assets["xeus/runtime.wasm"].sha256;
+  const shellKey = scope + "lab/index.html?sha256=" + assets["lab/index.html"].sha256;
+  const stored = new Map([
+    [runtimeKey, new Response("wrong mirror runtime")],
+    [shellKey, new Response(bodies["lab/index.html"])],
+    [scope + "datax-offline-ready", new Response("")],
+  ]);
+  const listeners = {};
+  const downloads = [];
+  const context = vm.createContext({
+    URL, Request, Response, Headers, btoa, assets,
+    hashes: { "xeus/runtime.wasm": assets["xeus/runtime.wasm"].sha256 },
+    self: {
+      location: { href: scope + "service-worker.js?enableCache=true" },
+      addEventListener(type, listener) { listeners[type] = listener; },
+    },
+    caches: { async open() { return {
+      async match(key) { return stored.get(key.url ?? key)?.clone(); },
+      async put(key, response) { stored.set(key.url ?? key, response.clone()); },
+      async keys() { return [...stored.keys()].map(key => new Request(key)); },
+      async delete(key) { return stored.delete(key.url ?? key); },
+    }; } },
+    async maybeFromCache(event) { return context.fetch(event.request); },
+    async fetch(request) {
+      const relative = new URL(request.url).pathname.slice(new URL(scope).pathname.length);
+      downloads.push(relative);
+      return fetch("data:application/octet-stream," + encodeURIComponent(bodies[relative]), { integrity: request.integrity });
+    },
+  });
+  vm.runInContext(
+    `(${fingerprints.installRuntimeCache.toString()})(hashes);(${offline.installOfflineCache.toString()})(assets);`,
+    context,
+  );
+  const dispatch = async (type, extra = {}) => {
+    const tasks = [];
+    listeners[type]({ ...extra, waitUntil(task) { tasks.push(task); } });
+    await Promise.all(tasks);
+  };
+  const updates = [];
+  await dispatch("message", {
+    data: { type: "datax-offline-status" }, source: { url: scope + "lab/" },
+    ports: [{ postMessage(update) { updates.push(update); } }],
+  });
+  assert.equal(updates.at(-1).ready, false, "an old poisoned runtime key must not count toward readiness");
+  await dispatch("install");
+  assert.deepEqual(downloads, ["xeus/runtime.wasm"], "offline opt-in is preserved and verified app assets are reused");
+  assert.equal(await stored.get(runtimeKey + "&verified=local").text(), bodies["xeus/runtime.wasm"]);
+  await dispatch("activate");
+  assert.equal(stored.has(runtimeKey), false, "activation prunes the unsafe legacy key");
+  assert.equal(stored.has(shellKey), true);
+});
+
 test("offline downloads resume, verify every asset, and survive worker restarts", async () => {
   const stored = new Map();
   const bodies = { "lab/index.html": "app shell", "extensions/%40jupyterlite/widget.js": "widget", "api/contents/all.json": "notebook", "xeus/runtime.wasm": "runtime", "xeus/xeus-python-wasm-host/meriyah.umd.min.js": "parser" };
@@ -1581,7 +1770,8 @@ test("offline-ready installs cache the next release before activating and prune 
     };
     return { assets, dispatch };
   }
-  const keyFor = (relative, asset) => scope + relative + "?sha256=" + asset.sha256;
+  const keyFor = (relative, asset) => scope + relative + "?sha256=" + asset.sha256 +
+    (relative.startsWith("xeus/") ? "&verified=local" : "");
   const first = startWorker({ "lab/index.html": "shell v1", "xeus/runtime.wasm": "runtime" });
   await first.dispatch("install");
   assert.deepEqual(downloads, [], "installs do not download before the user opts in");

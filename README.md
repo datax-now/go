@@ -27,9 +27,13 @@ acquiring a prewarmed worker.
 The build also patches the kernel message queue to wait for initialization and
 filesystem mounting before delivering messages, preserving their arrival order.
 Initialization failures reject that readiness wait instead of leaving it pending.
+IOPub messages broadcast to all live kernel connections even after the originating
+probe socket closes; direct replies still report a missing destination socket.
 The bundled WASM kernel registers Python widget comm targets during startup,
 before JupyterLab's control-channel probe or the first cell. It also preserves
 explicit comm IDs and retains the comm module safely in its callbacks.
+The JavaScript comm bridge starts its exposure wait only after pyjs initializes,
+so a slow cold download does not exhaust that wait before Python starts.
 Keeping the runtime settings identical across hosts also lets offline downloads
 recover verified configuration files from a mirror when RTD serves a challenge.
 
@@ -135,8 +139,12 @@ accept `304` responses without retrying.
 Runtime cache misses revalidate the HTTP cache and require fetch integrity to
 match the build's SHA-256 digest before returning or storing a response. A
 deployment mismatch fails the download and can be retried; it is not cached
-under the expected hash. Previously unverified runtime cache entries are not
-reused, so this upgrade requires an initial runtime download. Byte-range requests
+under the expected hash. Mirror runtime bytes must match the local build's hash,
+even when both deployments report the same commit. Runtime cache keys now include
+`verified=local`: older entries that could contain a different mirror's bytes are
+not reused or counted toward offline readiness. Already verified application
+assets and the offline-download opt-in are preserved; activation prunes the old
+runtime keys after replacement downloads succeed. Byte-range requests
 bypass service-worker caches and retain the server's partial-response behavior.
 The Cloudflare Worker also handles conditional requests with body-free `304`
 responses. Stable runtime URLs are not marked immutable.
@@ -269,6 +277,12 @@ failed is not contacted again for 60 seconds, so a blocked host costs one round
 trip rather than one per file. For offline downloads, a mirror is accepted only
 when its manifest records the exact hash expected by this build; mismatched
 files are skipped, even if the mirror reports the same commit.
+
+The browser can log an SRI failure for the original RTD response even when a
+verified mirror subsequently supplies the correct file. That console message
+alone does not mean the offline download failed. **Offline ready** requires every
+inventory entry to be stored under its local build hash; otherwise the status
+bar reports the failing asset instead of readiness.
 
 These requests use CORS without credentials. Runtime requests are checked
 against the mirror's `deployment.json`; offline downloads additionally require

@@ -64,6 +64,28 @@ function patchKernelMessages(source) {
     'kernel initialization failure propagation');
 }
 
+function patchSocketMessages(source) {
+  const marker = '/* datax-iopub-broadcast */';
+  if (source.includes(marker)) return source;
+  return replaceOnce(source,
+    /(if\(![\w$]+\)return void console\.warn\(`Trying to send message on removed socket for kernel \$\{[\w$]+\}`\);\s*)(let [\w$]+=[^;]+;\s*)(if\("iopub"===[\w$]+\.channel\)\{[\s\S]*?return\})/g,
+    (_, socketCheck, serialize, broadcast) => marker + serialize + broadcast + socketCheck,
+    'kernel IOPub broadcast routing');
+}
+
+function patchCommInitialization(source) {
+  const marker = '/* datax-python-comm-ready */';
+  if (source.includes(marker)) return source;
+  source = replaceOnce(source,
+    /function __xeus_x_ensurePythonCommOnModule\([\w$]+\)\{\s*if\(typeof Module==="undefined"\)\{return\}/g,
+    match => match + marker + 'if(!Module._is_initialized)return;',
+    'Python comm initialization barrier');
+  return replaceOnce(source,
+    'Module._is_initialized=true;',
+    'Module._is_initialized=true;__xeus_x_ensurePythonCommOnModule(globalThis._console||console);',
+    'Python comm readiness hook');
+}
+
 function patchLibraries(source, suffix = '.asm') {
   if (source.includes('dataxLibraryURL')) return source;
   source = replaceOnce(source,
@@ -94,11 +116,17 @@ function patchDirectory(directory) {
       existing[1] = source => patchKernelMessages(patch(source));
     } else files.push([file, patchKernelMessages]);
   }
+  const core = path.join(directory, 'build');
+  const routers = fs.readdirSync(core).filter(name => name.endsWith('.js'))
+    .map(name => path.join(core, name))
+    .filter(file => fs.readFileSync(file, 'utf8').includes('Trying to send message on removed socket for kernel'));
+  if (!routers.length) throw new Error('No JupyterLite kernel socket routers found');
+  for (const file of routers) files.push([file, patchSocketMessages]);
   const runtime = path.join(directory, 'xeus/xeus-python-wasm-host');
   const suffix = (process.env.SAFE_EXT_SUFFIXES || 'whl so').split(/\s+/).includes('so')
     ? (process.env.SAFE_ASM_EXT || '.asm') : '';
   for (const name of ['xpython.js', 'bin/xpython.js']) {
-    files.push([path.join(runtime, name), source => patchLibraries(patchRuntime(source), suffix)]);
+    files.push([path.join(runtime, name), source => patchCommInitialization(patchLibraries(patchRuntime(source), suffix))]);
   }
   const updates = files.map(([file, patch]) => [file, patch(fs.readFileSync(file, 'utf8'))]);
   for (const [file, source] of updates) fs.writeFileSync(file, source);
@@ -157,7 +185,7 @@ function compactLibraries(directory, suffix = '.asm') {
   return { removedFiles: duplicates.length, savedBytes };
 }
 
-module.exports = { patchWorker, patchRuntime, patchKernelMessages, patchLibraries, patchDirectory, installLibraryAliases, compactLibraries };
+module.exports = { patchWorker, patchRuntime, patchKernelMessages, patchSocketMessages, patchCommInitialization, patchLibraries, patchDirectory, installLibraryAliases, compactLibraries };
 if (require.main === module) {
   if (process.argv[3] === '--compact') compactLibraries(process.argv[2] || 'dist', process.env.SAFE_ASM_EXT || '.asm');
   else patchDirectory(process.argv[2] || 'dist');

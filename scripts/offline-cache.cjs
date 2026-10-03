@@ -14,6 +14,7 @@ function installOfflineCache(assets) {
   const keyFor = (relative, asset) => {
     const key = new URL(relative, scope);
     key.searchParams.set('sha256', asset.sha256);
+    if (relative.startsWith('xeus/')) key.searchParams.set('verified', 'local');
     return key.href;
   };
   function relativeFor(request) {

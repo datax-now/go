@@ -27,7 +27,6 @@ function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null, ass
   const cool = origin => coolingUntil.set(origin, Date.now() + cooldownMs);
   const isBlocked = response => [429, 502, 503, 504].includes(response.status)
     || response.headers.get('cf-mitigated') === 'challenge';
-  // Builds on different hosts embed their own paths in runtime files, so bytes differ between hosts.
   function loadMirrorManifest(base) {
     if (!manifests.has(base.href)) {
       manifests.set(base.href, fetch(new Request(new URL('deployment.json', base).href, {
@@ -48,7 +47,7 @@ function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null, ass
         .map(segment => encodeURIComponent(decodeURIComponent(segment))).join('/');
     } catch { return null; }
   }
-  async function fetchWithMirrors(request, fetchOriginal, strictAssetHash = false) {
+  async function fetchWithMirrors(request, fetchOriginal) {
     if (!mirrors.length || request.method !== 'GET' || request.headers.has('Range')) {
       return fetchOriginal();
     }
@@ -87,11 +86,8 @@ function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null, ass
         const manifest = await loadMirrorManifest(base);
         const expectedHash = runtimeHash || assetHash;
         const mirrorHash = manifest?.files[decodeURIComponent(mirrorPath.slice(1))]?.sha256;
-        const exactHashRequired = !!assetHash && (!runtimeHash || strictAssetHash);
-        if (exactHashRequired && manifest && mirrorHash !== assetHash) continue;
-        // Another release is safe only for byte-identical files; otherwise two builds would be mixed.
-        if (manifest && buildCommit && manifest.commit !== buildCommit && mirrorHash !== expectedHash) continue;
-        mirrorRequest.integrity = integrityOf(exactHashRequired ? assetHash : mirrorHash ?? expectedHash);
+        if (manifest && mirrorHash !== expectedHash) continue;
+        mirrorRequest.integrity = integrityOf(expectedHash);
       }
       try {
         const response = await fetch(new Request(mirrorUrl.href, mirrorRequest));
@@ -106,7 +102,7 @@ function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null, ass
     if (failedError) throw failedError;
     return fetchOriginal();
   }
-  self.dataxFetchOfflineAsset = request => fetchWithMirrors(request, () => fetch(request), true);
+  self.dataxFetchOfflineAsset = request => fetchWithMirrors(request, () => fetch(request));
   async function fetchRuntime(request) {
     return fetchWithMirrors(request, () => fetch(request));
   }
@@ -126,6 +122,8 @@ function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null, ass
     }
     const key = new URL(relative, scope);
     key.searchParams.set('sha256', hash);
+    // Older entries may contain mirror bytes verified against a different build's hash.
+    key.searchParams.set('verified', 'local');
     const integrity = integrityOf(hash);
     const verifiedRequest = new Request(request, { integrity, cache: 'no-cache' });
     let cache;
