@@ -2857,8 +2857,19 @@ coop_header = 'headers.set("Cross-Origin-Opener-Policy","same-origin");'
 corp_header = 'headers.set("Cross-Origin-Resource-Policy","same-origin");'
 # Dedicated worker scripts must carry COEP themselves when the page uses require-corp.
 isolated_request = '({0}.request.mode==="navigate"||["worker","sharedworker"].includes({0}.request.destination))'
+# A CORS mirror response is not a local subresource under COEP, even after SRI verification.
+local_mirror_response = (
+  'if(response&&response.type==="cors"){const headers=new Headers(response.headers);'
+  'headers.delete("Content-Encoding");headers.delete("Content-Length");'
+  'response=new Response(response.body,{status:response.status,statusText:response.statusText,headers});}'
+)
 if coep_header in content:
   updated = content
+  if local_mirror_response not in updated:
+    wrapper = '.then(async response=>{'
+    if wrapper not in updated:
+      raise SystemExit("Error: Could not upgrade the service worker mirror response wrapper")
+    updated = updated.replace(wrapper, wrapper + local_mirror_response, 1)
   if coop_header not in updated:
     updated = updated.replace(coep_header, coep_header + coop_header, 1)
   if corp_header not in updated:
@@ -2890,7 +2901,8 @@ if not match:
 response_name = re.match(r'(\w+)&&', match.group(3)).group(1)
 event_name = match.group(2)
 wrapped_response = (
-  f'{response_name}&&{event_name}.respondWith({response_name}.then(async response=>{{'
+  f'{response_name}&&{event_name}.respondWith({response_name}.then(async response=>{{' +
+  local_mirror_response +
   f'if(!{isolated_request.format(event_name)}||!response)return response;'
   f'if(response.status===304){{const retryHeaders=new Headers({event_name}.request.headers);'
   'retryHeaders.delete("If-None-Match");retryHeaders.delete("If-Modified-Since");'

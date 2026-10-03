@@ -255,6 +255,26 @@ test("controlled app navigations add COOP and COEP without changing other respon
     assert.equal(subresource, sourceResponse, "subresource responses should pass through untouched");
     assert.equal(subresource.headers.has("Cross-Origin-Embedder-Policy"), false);
 
+    for (const mode of ["no-cors", "same-origin", "cors"]) {
+      const mirrorResponse = new Response("verified mirror script", {
+        headers: {
+          "Content-Type": "text/javascript",
+          "Content-Encoding": "br",
+          "Content-Length": "10",
+          ETag: '"mirror-etag"',
+        },
+      });
+      Object.defineProperty(mirrorResponse, "type", { value: "cors" });
+      queuedResponses = [mirrorResponse];
+      const script = await fetchThroughWorker(mode, "script");
+      assert.equal(script.type, "default", "mirror responses must be local before respondWith to avoid COEP/response-mode rejection");
+      assert.equal(script.headers.get("Content-Type"), "text/javascript");
+      assert.equal(script.headers.get("ETag"), '"mirror-etag"');
+      assert.equal(script.headers.get("Content-Encoding"), null, "fetch has already decoded the mirror body");
+      assert.equal(script.headers.get("Content-Length"), null);
+      assert.equal(await script.text(), "verified mirror script");
+    }
+
     writeFileSync(
       workerPath,
       patched.replace('headers.set("Cross-Origin-Opener-Policy","same-origin");', ""),
@@ -262,6 +282,13 @@ test("controlled app navigations add COOP and COEP without changing other respon
     const upgrade = spawnSync("python3", ["-c", isolationHeadersPatch], { cwd: directory, encoding: "utf8" });
     assert.equal(upgrade.status, 0, upgrade.stderr);
     assert.match(readFileSync(workerPath, "utf8"), /Cross-Origin-Opener-Policy/);
+
+    const normalization = patched.match(/if\(response&&response\.type==="cors"\)\{[\s\S]*?response=new Response[\s\S]*?;\}/)?.[0];
+    assert.ok(normalization);
+    writeFileSync(workerPath, patched.replace(normalization, ""));
+    const mirrorUpgrade = spawnSync("python3", ["-c", isolationHeadersPatch], { cwd: directory, encoding: "utf8" });
+    assert.equal(mirrorUpgrade.status, 0, mirrorUpgrade.stderr);
+    assert.equal(readFileSync(workerPath, "utf8"), patched, "existing builds must gain the mirror fix without changing isolation headers");
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

@@ -124,6 +124,11 @@ and build-inventoried assets on the other hosts in priority order. Offline
 downloads cache a mirror response only when its bytes match the build's
 SHA-256; a different release can supply a file only when its manifest records
 that same hash (see below).
+Before returning a mirror response to a local application request, the service
+worker wraps its decoded body as a local response. This also applies to cached
+mirror responses: cross-origin response metadata would otherwise make isolated
+pages reject classic scripts and other resources, even after a successful,
+integrity-verified download. Normal same-origin responses are unchanged.
 A cached asset can still be served while background revalidation fails; the host
 must recover before uncached requests can succeed.
 
