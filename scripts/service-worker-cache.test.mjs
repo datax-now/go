@@ -919,6 +919,57 @@ for host, timestamp, owner in [("rtd", 1700000000, 1000), ("github", 1800000000,
   assert.ok(requests.includes(mirror + relative));
 });
 
+test("RTD cold kernel metadata recovers from independently ordered mirror environments", async t => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-metadata-mirrors-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const relative = "xeus/xeus-python-wasm-host/empack_env_meta.json";
+  const packages = [
+    { name: "liblzma", version: "5.4.0", build: "h8b79025_1", filename: "liblzma-5.4.0-h8b79025_1.tar.gz",
+      channel: "https://repo.prefix.dev/emscripten-forge-4x", depends: ["emscripten-abi >=4,<5.0a0"], subdir: "emscripten-wasm32" },
+    { name: "pybind11", version: "2.13.6", build: "pyhc790b64_3", filename: "pybind11-2.13.6-pyhc790b64_3.tar.gz",
+      channel: "conda-forge", depends: ["pybind11-global 2.13.6 *_3", "python >=3.9"], subdir: "noarch" },
+  ];
+  const channels = ["https://repo.prefix.dev/emscripten-forge-4x", "conda-forge"];
+  for (const host of ["rtd", "github"]) {
+    mkdirSync(join(directory, host, "xeus/xeus-python-wasm-host"), { recursive: true });
+    writeFileSync(join(directory, host, "service-worker.js"), "");
+    writeFileSync(join(directory, host, relative), JSON.stringify({
+      prefix: "/", channels, packages: host === "rtd" ? packages : [...packages].reverse()
+        .map(packageRecord => Object.fromEntries(Object.entries(packageRecord).reverse())),
+    }, null, 2) + "\n");
+  }
+  const scope = "https://datax-now.readthedocs.io/en/latest/_static/";
+  const mirror = "https://datax-now.github.io/go/";
+  const hashes = fingerprints.fingerprintRuntime(join(directory, "rtd"), [mirror]);
+  const mirrorHashes = fingerprints.fingerprintRuntime(join(directory, "github"), [mirror]);
+  const localBytes = readFileSync(join(directory, "rtd", relative));
+  const metadata = JSON.parse(localBytes);
+  assert.equal(metadata.prefix, "/");
+  assert.deepEqual(metadata.channels, channels, "channel precedence must be preserved");
+  assert.deepEqual(metadata.packages.sort((left, right) => left.name.localeCompare(right.name)), packages,
+    "package records and dependency order must be preserved");
+  assert.deepEqual(fingerprints.fingerprintRuntime(join(directory, "rtd"), [mirror]), hashes);
+  assert.deepEqual(readFileSync(join(directory, "rtd", relative)), localBytes, "normalization must be idempotent");
+  const mirrorBytes = readFileSync(join(directory, "github", relative));
+  const context = vm.createContext({
+    URL, Request, Response, Headers, btoa, hashes,
+    self: { location: { href: scope + "service-worker.js?enableCache=true" } },
+    caches: { async open() { throw new Error("cache unavailable in a cold profile"); } },
+    async maybeFromCache(event) { return context.fetch(event.request); },
+    async fetch(request) {
+      if (request.url.startsWith(scope)) throw new TypeError("Failed to fetch. SRI's integrity checks failed.");
+      if (request.url.endsWith("deployment.json")) {
+        return new Response(JSON.stringify({ files: { [relative]: { sha256: mirrorHashes[relative] } } }));
+      }
+      return fetch("data:application/json;base64," + mirrorBytes.toString("base64"), { integrity: request.integrity });
+    },
+  });
+  vm.runInContext(`(${fingerprints.installRuntimeCache.toString()})(hashes, [${JSON.stringify(mirror)}])`, context);
+  const response = await context.maybeFromCache({ request: new Request(scope + relative), waitUntil() {} });
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), localBytes,
+    "blocked RTD metadata must not prevent kernel initialization when the mirror has the same packages");
+});
+
 test("RTD challenges retry fingerprinted runtime assets and the web manifest", async () => {
   const requests = [];
   const packageHash = createHash("sha256").update("verified package").digest("hex");

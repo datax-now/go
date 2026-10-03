@@ -124,8 +124,15 @@ library copies from the runtime `bin/` and extension static directories.
 Kernel workers resolve those URLs to the single copy under
 `xeus/xeus-python-wasm-host/`, so downloads and cache entries are shared too.
 Libraries with different bytes are retained. This works without server
-redirects on all four static hosts; package archives are left intact because
+redirects on all four static hosts; package payloads are left intact because
 they populate the kernel filesystem.
+The build also canonicalizes the package order and JSON keys in
+`empack_env_meta.json`, normalizes packed kernel archive metadata, and uses
+fixed ZIP timestamps when patching Quak's conda archive. Independently built
+deployments with identical package contents therefore produce identical bytes
+for integrity-verified mirror downloads. After changing these normalization
+rules, rebuild RTD and its mirrors from the same commit; older deployments
+still have incompatible hashes for the affected assets.
 
 Service-worker caching is enabled in `jupyter-lite.json`. After all runtime
 patches, the build fingerprints every file under `dist/xeus/` with SHA-256 and

@@ -559,7 +559,8 @@ function prepareOffline(directory, sourceDateEpoch = process.env.SOURCE_DATE_EPO
   if (fs.existsSync(runtime) && fs.readdirSync(runtime, { withFileTypes: true }).some(entry => {
     if (!entry.isDirectory()) return false;
     const packages = path.join(runtime, entry.name, 'kernel_packages');
-    return fs.existsSync(packages) && fs.readdirSync(packages).some(name => name.endsWith('.tar.gz'));
+    return fs.existsSync(path.join(runtime, entry.name, 'empack_env_meta.json'))
+      || (fs.existsSync(packages) && fs.readdirSync(packages).some(name => name.endsWith('.tar.gz')));
   })) {
     const normalized = spawnSync(process.env.DATAX_BUILD_PYTHON || 'python3',
       [path.join(__dirname, 'normalize-kernel-packages.py'), directory], {

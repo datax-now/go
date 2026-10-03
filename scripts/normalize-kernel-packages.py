@@ -2,6 +2,7 @@ import argparse
 import copy
 import filecmp
 import gzip
+import json
 import os
 from pathlib import Path
 import re
@@ -11,6 +12,19 @@ import tempfile
 
 
 VOLATILE_PAX_FIELDS = {"mtime", "atime", "ctime", "uid", "gid", "uname", "gname"}
+
+
+def normalize_metadata(path: Path) -> bool:
+    original = path.read_text()
+    metadata = json.loads(original)
+    if not isinstance(metadata.get("packages"), list):
+        raise ValueError(f"Kernel metadata must contain a packages array: {path}")
+    metadata["packages"].sort(key=lambda package: json.dumps(package, sort_keys=True))
+    normalized = json.dumps(metadata, indent=2, sort_keys=True) + "\n"
+    if original == normalized:
+        return False
+    path.write_text(normalized)
+    return True
 
 
 def normalize_archive(path: Path, epoch: int) -> bool:
@@ -48,7 +62,7 @@ def normalize_archive(path: Path, epoch: int) -> bool:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Normalize kernel package metadata before SHA-256 fingerprinting.")
+    parser = argparse.ArgumentParser(description="Normalize kernel metadata and package archives before SHA-256 fingerprinting.")
     parser.add_argument("directory", type=Path)
     args = parser.parse_args()
     if not args.directory.is_dir():
@@ -57,8 +71,11 @@ def main() -> None:
     if re.fullmatch(r"[0-9]+", value) is None:
         parser.error("SOURCE_DATE_EPOCH must be a nonnegative Unix timestamp")
     epoch = int(value)
+    metadata = sorted((args.directory / "xeus").glob("*/empack_env_meta.json"))
+    changed_metadata = sum(normalize_metadata(path) for path in metadata)
     packages = sorted((args.directory / "xeus").glob("*/kernel_packages/*.tar.gz"))
     changed = sum(normalize_archive(package, epoch) for package in packages)
+    print(f"Normalized {changed_metadata}/{len(metadata)} kernel metadata files for reproducible mirror downloads")
     print(f"Normalized {changed}/{len(packages)} kernel package archives for reproducible mirror downloads")
 
 

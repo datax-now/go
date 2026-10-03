@@ -138,7 +138,8 @@ def patch_conda(path: Path) -> bool:
     try:
         with zipfile.ZipFile(temporary, "w") as archive:
             for name, data in contents.items():
-                archive.writestr(name, data)
+                entry = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                archive.writestr(entry, data)
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)

@@ -137,3 +137,37 @@ assert not list(root.glob(".datax-package-*")), "temporary output must be cleane
   assert.notEqual(invalid.status, 0);
   assert.match(invalid.stderr, /SOURCE_DATE_EPOCH must be a nonnegative Unix timestamp/);
 });
+
+test("patched Quak conda ZIP entries are reproducible without changing their payloads", t => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-quak-zip-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const script = new URL("./patch_quak_widget.py", import.meta.url).pathname;
+  const result = spawnSync("python3", ["-B", "-c", `
+import ast
+from pathlib import Path
+import sys
+import textwrap
+import zipfile
+from unittest.mock import patch
+root = Path(sys.argv[2])
+source = Path(sys.argv[1]).read_text()
+tree = ast.parse(source)
+writer = next(node for node in ast.walk(tree)
+              if isinstance(node, ast.With)
+              and ast.get_source_segment(source, node.items[0].context_expr) == 'zipfile.ZipFile(temporary, "w")')
+code = compile(textwrap.dedent(ast.get_source_segment(source, writer)), sys.argv[1], "exec")
+contents = {"metadata.json": b'{"conda_pkg_format_version":2}',
+            "pkg-quak.tar.zst": b"identical compressed patched widget",
+            "info-quak.tar.zst": b"identical compressed paths metadata"}
+outputs = []
+for index, timestamp in enumerate([(2026, 10, 3, 14, 10, 0, 5, 276, 0), (2026, 10, 3, 14, 20, 0, 5, 276, 0)]):
+    temporary = root / f"quak-{index}.conda"
+    with patch("zipfile.time.localtime", return_value=timestamp):
+        exec(code, {"zipfile": zipfile, "temporary": temporary, "contents": contents})
+    with zipfile.ZipFile(temporary) as archive:
+        assert {name: archive.read(name) for name in archive.namelist()} == contents
+    outputs.append(temporary.read_bytes())
+assert outputs[0] == outputs[1], "build-time ZIP timestamps prevent integrity-verified mirror fallback"
+`, script, directory], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+});
