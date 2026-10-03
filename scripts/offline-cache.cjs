@@ -67,7 +67,10 @@ function installOfflineCache(assets) {
     if (!pending.has(key)) {
       const download = (async () => {
         const integrity = 'sha256-' + btoa(String.fromCharCode(...asset.sha256.match(/../g).map(byte => parseInt(byte, 16))));
-        let response = await fetch(new Request(canonical, { integrity, cache: 'no-cache' }));
+        const verified = new Request(canonical, { integrity, cache: 'no-cache' });
+        let response = typeof self.dataxFetchOfflineAsset === 'function'
+          ? await self.dataxFetchOfflineAsset(verified)
+          : await original({ request: verified, waitUntil: task => event.waitUntil(task) });
         if (asset.source && relative.endsWith('.html') && response.ok) {
           const headers = new Headers(response.headers);
           headers.set('Content-Type', 'text/html; charset=utf-8');

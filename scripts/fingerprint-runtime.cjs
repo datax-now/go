@@ -11,7 +11,7 @@ const DEFAULT_MIRROR_ORIGINS = [
   'https://datax-now.pages.dev/',
 ];
 
-function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null) {
+function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null, assetHashes = {}) {
   const original = maybeFromCache;
   const scope = new URL('./', self.location.href);
   const mirrors = [].concat(mirrorOrigins || []).filter(Boolean)
@@ -38,18 +38,31 @@ function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null) {
     }
     return manifests.get(base.href);
   }
-  async function fetchWithMirrors(request, fetchOriginal) {
+  function assetPathFor(url) {
+    const base = [scope, ...mirrors]
+      .filter(candidate => candidate.origin === url.origin && url.pathname.startsWith(candidate.pathname))
+      .sort((left, right) => right.pathname.length - left.pathname.length)[0];
+    if (!base) return null;
+    try {
+      return url.pathname.slice(base.pathname.length).split('/')
+        .map(segment => encodeURIComponent(decodeURIComponent(segment))).join('/');
+    } catch { return null; }
+  }
+  async function fetchWithMirrors(request, fetchOriginal, strictAssetHash = false) {
     if (!mirrors.length || request.method !== 'GET' || request.headers.has('Range')) {
       return fetchOriginal();
     }
     const url = new URL(request.url);
     const runtimePath = url.pathname.match(/(\/xeus\/.+)$/);
     const runtimeHash = runtimePath && hashes[runtimePath[1].slice(1)];
+    const assetPath = assetPathFor(url);
+    const assetHash = assetPath && assetHashes[assetPath];
     const isManifest = url.pathname.endsWith('/manifest.webmanifest');
     const isDeployment = url.hostname === 'readthedocs.io' || url.hostname.endsWith('.readthedocs.io')
       || mirrors.some(base => base.origin === url.origin);
     const mirrorPath = runtimeHash
       ? runtimePath[1]
+      : assetHash ? `/${assetPath}`
       : isManifest ? '/manifest.webmanifest' : null;
     if (!isDeployment || !mirrorPath) return fetchOriginal();
     let failedResponse = null;
@@ -70,12 +83,15 @@ function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null) {
       const mirrorUrl = new URL(mirrorPath.slice(1), base);
       mirrorUrl.search = url.search;
       const mirrorRequest = { method: 'GET', mode: 'cors', credentials: 'omit', cache: 'no-cache' };
-      if (runtimeHash) {
+      if (runtimeHash || assetHash) {
         const manifest = await loadMirrorManifest(base);
-        const mirrorHash = manifest?.files[decodeURIComponent(runtimePath[1].slice(1))]?.sha256;
+        const expectedHash = runtimeHash || assetHash;
+        const mirrorHash = manifest?.files[decodeURIComponent(mirrorPath.slice(1))]?.sha256;
+        const exactHashRequired = !!assetHash && (!runtimeHash || strictAssetHash);
+        if (exactHashRequired && manifest && mirrorHash !== assetHash) continue;
         // Another release is safe only for byte-identical files; otherwise two builds would be mixed.
-        if (manifest && buildCommit && manifest.commit !== buildCommit && mirrorHash !== runtimeHash) continue;
-        mirrorRequest.integrity = integrityOf(mirrorHash ?? runtimeHash);
+        if (manifest && buildCommit && manifest.commit !== buildCommit && mirrorHash !== expectedHash) continue;
+        mirrorRequest.integrity = integrityOf(exactHashRequired ? assetHash : mirrorHash ?? expectedHash);
       }
       try {
         const response = await fetch(new Request(mirrorUrl.href, mirrorRequest));
@@ -90,6 +106,7 @@ function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null) {
     if (failedError) throw failedError;
     return fetchOriginal();
   }
+  self.dataxFetchOfflineAsset = request => fetchWithMirrors(request, () => fetch(request), true);
   async function fetchRuntime(request) {
     return fetchWithMirrors(request, () => fetch(request));
   }
@@ -158,9 +175,14 @@ function fingerprintRuntime(directory, mirrorOrigins = DEFAULT_MIRROR_ORIGINS, b
     }
   }
   const assets = offline.prepareOffline(directory);
+  const assetHashes = {};
+  for (const [relative, asset] of Object.entries(assets)) {
+    assetHashes[relative] = asset.sha256;
+    if (asset.source) assetHashes[asset.source] = asset.sha256;
+  }
   visit(runtime);
   const source = fs.readFileSync(worker, 'utf8').split(marker)[0];
-  fs.writeFileSync(worker, source + marker + `(${installRuntimeCache.toString()})(${JSON.stringify(hashes)}, ${JSON.stringify(mirrorOrigins)}, ${JSON.stringify(buildCommit)});\n` +
+  fs.writeFileSync(worker, source + marker + `(${installRuntimeCache.toString()})(${JSON.stringify(hashes)}, ${JSON.stringify(mirrorOrigins)}, ${JSON.stringify(buildCommit)}, ${JSON.stringify(assetHashes)});\n` +
     `(${offline.installOfflineCache.toString()})(${JSON.stringify(assets)});\n`);
   console.log(`Fingerprinted ${Object.keys(hashes).length} runtime files for cache-first reuse`);
   return hashes;

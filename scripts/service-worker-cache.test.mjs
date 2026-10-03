@@ -67,6 +67,12 @@ test("build does not generate a deployment archive", () => {
   assert.doesNotMatch(build, /DATAX_BUILD_ARCHIVE|datax-now\.zip|zipfile/);
 });
 
+test("Vercel allows cross-origin reads for verified mirror assets", () => {
+  const config = JSON.parse(readFileSync(new URL("vercel.json", root), "utf8"));
+  const allAssets = config.headers.find(({ source }) => source === "/(.*)");
+  assert.ok(allAssets.headers.some(({ key, value }) => key === "Access-Control-Allow-Origin" && value === "*"));
+});
+
 test("build publishes local package assets without generator scripts", () => {
   const directory = mkdtempSync(join(tmpdir(), "datax-built-in-publish-"));
   const conda = join(directory, "source/conda");
@@ -831,6 +837,96 @@ test("runtime URL rewrites preserve validators and do not amplify rate limits or
   }
 });
 
+test("offline downloads recover indexed assets from mirrors only when their hashes match", async () => {
+  const scope = "https://datax-now.readthedocs.io/en/latest/_static/";
+  const mirror = "https://datax-now.github.io/go/";
+  const relative = "api/contents/how-to/all.json";
+  const body = '{"notebooks":[]}';
+  const sha256 = createHash("sha256").update(body).digest("hex");
+  const runtimeRelative = "xeus/xeus-python-wasm-host/xpython.wasm";
+  const runtimeBody = "verified kernel runtime";
+  const runtimeHash = createHash("sha256").update(runtimeBody).digest("hex");
+  const assets = {
+    [relative]: { sha256, size: Buffer.byteLength(body) },
+    [runtimeRelative]: { sha256: runtimeHash, size: Buffer.byteLength(runtimeBody) },
+  };
+  const hashes = { [runtimeRelative]: runtimeHash };
+  const mirrorHashes = { [relative]: sha256, [runtimeRelative]: runtimeHash };
+  const stored = new Map();
+  const requests = [];
+  let message;
+  const cache = {
+    async match(key) { return stored.get(key.url ?? key)?.clone(); },
+    async put(key, response) { stored.set(key.url ?? key, response.clone()); },
+    async keys() { return [...stored.keys()].map(key => new Request(key)); },
+    async delete(key) { return stored.delete(key.url ?? key); },
+  };
+  const context = vm.createContext({
+    URL, Request, Response, Headers, btoa, assets, hashes, mirrorHashes,
+    mirrors: [mirror], buildCommit: "a".repeat(40),
+    self: {
+      location: { href: scope + "service-worker.js?enableCache=true" },
+      addEventListener(type, listener) { if (type === "message") message = listener; },
+    },
+    caches: { async open() { return cache; } },
+    async maybeFromCache(event) { return context.fetch(event.request); },
+    async fetch(request) {
+      requests.push(request.url);
+      const url = new URL(request.url);
+      if (url.origin === new URL(scope).origin) throw new TypeError("Failed to fetch. SRI's integrity checks failed.");
+      if (url.pathname === "/go/deployment.json") {
+        return new Response(JSON.stringify({
+          commit: "b".repeat(40), files: {
+            [relative]: { sha256 }, [runtimeRelative]: { sha256: runtimeHash },
+          },
+        }));
+      }
+      const bytes = url.pathname.endsWith("/" + runtimeRelative) ? runtimeBody : body;
+      return fetch("data:application/octet-stream," + encodeURIComponent(bytes), { integrity: request.integrity });
+    },
+  });
+  vm.runInContext(
+    `(${fingerprints.installRuntimeCache.toString()})(hashes, mirrors, buildCommit, mirrorHashes);` +
+      `(${offline.installOfflineCache.toString()})(assets);`,
+    context,
+  );
+  const updates = [];
+  const tasks = [];
+  message({
+    data: { type: "datax-offline-download" }, source: { url: scope + "lab/" },
+    ports: [{ postMessage(update) { updates.push(update); } }],
+    waitUntil(task) { tasks.push(task); },
+  });
+
+  return Promise.all(tasks).then(async () => {
+    assert.equal(updates.at(-1).ready, true);
+    for (const path of [relative, runtimeRelative]) {
+      assert.ok(requests.includes(scope + path));
+      assert.ok(requests.includes(mirror + path));
+    }
+    assert.ok(requests.includes(mirror + "deployment.json"));
+    assert.equal(stored.size, 3, "both assets and the offline-ready marker are cached");
+
+    stored.clear();
+    requests.length = 0;
+    const unexpectedHash = createHash("sha256").update("different runtime").digest("hex");
+    assets[runtimeRelative].sha256 = unexpectedHash;
+    mirrorHashes[runtimeRelative] = unexpectedHash;
+    const failedUpdates = [];
+    const failedTasks = [];
+    message({
+      data: { type: "datax-offline-download" }, source: { url: scope + "lab/" },
+      ports: [{ postMessage(update) { failedUpdates.push(update); } }],
+      waitUntil(task) { failedTasks.push(task); },
+    });
+    await Promise.all(failedTasks);
+    assert.equal(failedUpdates.at(-1).ready, false);
+    assert.match(failedUpdates.at(-1).error, new RegExp(runtimeRelative));
+    assert.equal(stored.has(scope + runtimeRelative + "?sha256=" + unexpectedHash), false,
+      "different runtime bytes must not be cached under this build's hash");
+  });
+});
+
 test("offline downloads resume, verify every asset, and survive worker restarts", async () => {
   const stored = new Map();
   const bodies = { "lab/index.html": "app shell", "extensions/%40jupyterlite/widget.js": "widget", "api/contents/all.json": "notebook", "xeus/runtime.wasm": "runtime", "xeus/xeus-python-wasm-host/meriyah.umd.min.js": "parser" };
@@ -1321,7 +1417,7 @@ test("offline HTML remains integrity-checked when the host injects addons", asyn
     const context = vm.createContext({
       URL, Request, Response, Headers, btoa, assets,
       self: { location: { href: scope + "service-worker.js?enableCache=true" }, addEventListener() {} },
-      maybeFromCache() { throw new Error("Unexpected cache bypass"); },
+      async maybeFromCache(event) { return context.fetch(event.request); },
       caches: { async open() { return {
         async match(key) { return stored.get(key)?.clone(); },
         async put(key, response) { stored.set(key, response.clone()); },

@@ -114,11 +114,13 @@ bypass service-worker caches and retain the server's partial-response behavior.
 The Cloudflare Worker also handles conditional requests with body-free `304`
 responses. Stable runtime URLs are not marked immutable.
 
-The service worker leaves cross-origin requests (including Google Fonts) to the
-browser and does not cache unsuccessful same-origin responses. When a
-deployment host is blocked or unavailable, it retries the web manifest and
-fingerprinted kernel runtime assets on the other hosts in priority order with
-their SHA-256 integrity checks (see below).
+The service worker leaves unrelated cross-origin requests (including Google
+Fonts) to the browser and does not cache unsuccessful same-origin responses.
+When a deployment host is blocked or unavailable, it retries the web manifest
+and build-inventoried assets on the other hosts in priority order. Offline
+downloads cache a mirror response only when its bytes match the build's
+SHA-256; a different release can supply a file only when its manifest records
+that same hash (see below).
 A cached asset can still be served while background revalidation fails; the host
 must recover before uncached requests can succeed.
 
@@ -203,32 +205,33 @@ A background runtime fetch cannot complete an interactive HTML challenge.
 
 For a 429, Cloudflare challenge, 502-504 response, or browser-level network
 failure from any deployment host (`*.readthedocs.io`, GitHub Pages, Vercel or
-Cloudflare Pages), the service worker retries fingerprinted files under
-`/xeus/` on the other hosts in priority order: Read the Docs
+Cloudflare Pages), the service worker retries fingerprinted runtime files and
+other build-inventoried assets on the other hosts in priority order: Read the Docs
 (`https://datax-now.readthedocs.io/en/latest/_static/`), GitHub Pages
 (`https://datax-now.github.io/go/`), Vercel (`https://datax.now/`), then
 Cloudflare Pages (`https://datax-now.pages.dev/`). The current host is skipped,
 and hosts outside this set (such as `localhost`) never fail over. A host that
 failed is not contacted again for 60 seconds, so a blocked host costs one round
-trip rather than one per file. A mirror whose `deployment.json` reports a
-different commit than this build is skipped so runtime files from two releases
-are never mixed.
+trip rather than one per file. For offline downloads, a mirror is accepted only
+when its manifest records the exact hash expected by this build; mismatched
+files are skipped, even if the mirror reports the same commit.
 
-These requests use CORS
-without credentials and are integrity-checked against the SHA-256 recorded in
-the mirror's `deployment.json` (builds on different hosts embed their own
-paths and repack timestamps, so the bytes of a file differ between hosts; the
-build's own digest is used only if the mirror manifest is unavailable). It also
-retries `manifest.webmanifest` from the mirrors; that optional metadata request
-does not gate kernel startup. Other resources and other 429 responses are not
-retried. The client network must permit access to the mirror hosts; this fallback
-does not remove the hosting provider's protection.
-Every mirror must include CORS headers for `/xeus/`, `/deployment.json` and
-`/manifest.webmanifest`, and must contain the same
+These requests use CORS without credentials. Runtime requests are checked
+against the mirror's `deployment.json`; offline downloads additionally require
+the exact build SHA-256 before caching, so host-specific runtime bytes are not
+stored under another build's hash. If a mirror manifest is unavailable, the
+request is still checked against the build's expected hash. The service worker
+also retries `manifest.webmanifest`; that optional metadata request does not
+gate kernel startup. Unindexed or unrelated resources are not retried. The
+client network must permit access to the mirror hosts; this fallback does not
+remove the hosting provider's protection.
+Every mirror must include CORS headers for build-inventoried asset paths,
+`/deployment.json` and `/manifest.webmanifest`, and must contain the same
 runtime package filenames (a package version that floated between builds is
 missing on the mirror). GitHub Pages and Cloudflare Pages send
 `Access-Control-Allow-Origin: *` by default; do not repeat it in the Cloudflare
-`_headers` file, which would duplicate the value. Set
+`_headers` file, which would duplicate the value. Vercel sets it on all static
+assets. Set
 `DATAX_RUNTIME_MIRROR_ORIGIN` at build time to a comma-separated list of base
 URLs in priority order (an empty value disables failover). Use
 `scripts/deployment-manifest.mjs verify` to confirm the hosts match before
