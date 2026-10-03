@@ -10,6 +10,7 @@ import test from "node:test";
 import fingerprints from "./fingerprint-runtime.cjs";
 import startup from "./patch-wasm-startup.cjs";
 import offline from "./offline-cache.cjs";
+import { createDeploymentManifest } from "./deployment-manifest.mjs";
 
 const root = new URL("../", import.meta.url);
 test("first-visit service-worker management preserves isolation and survives blocked updates", async t => {
@@ -968,6 +969,60 @@ test("RTD cold kernel metadata recovers from independently ordered mirror enviro
   const response = await context.maybeFromCache({ request: new Request(scope + relative), waitUntil() {} });
   assert.deepEqual(Buffer.from(await response.arrayBuffer()), localBytes,
     "blocked RTD metadata must not prevent kernel initialization when the mirror has the same packages");
+});
+
+test("RTD restored artifacts recover build-specific WASM bytes from the Pages mirror", async t => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-shared-artifact-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const pages = join(directory, "pages");
+  const restored = join(directory, "rtd");
+  const relative = "xeus/host/cairo.so.asm";
+  const commit = "a".repeat(40);
+  const bytes = Buffer.from("WASM bytes from the canonical build");
+  mkdirSync(join(pages, "xeus/host"), { recursive: true });
+  writeFileSync(join(pages, relative), bytes);
+  writeFileSync(join(pages, "service-worker.js"), "");
+  const hashes = fingerprints.fingerprintRuntime(pages);
+  const manifest = await createDeploymentManifest(pages, commit);
+  writeFileSync(join(pages, "deployment.json"), JSON.stringify(manifest));
+  const transport = spawnSync("python3", ["-B", "-c", `
+import importlib.util
+from pathlib import Path
+import sys
+spec = importlib.util.spec_from_file_location("artifact", sys.argv[1])
+artifact = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(artifact)
+root = Path(sys.argv[2])
+artifact.pack(root / "pages", root / "site.tar.gz", sys.argv[3])
+artifact.unpack(root / "site.tar.gz", root / "rtd", sys.argv[3])
+`, new URL("./deployment-artifact.py", import.meta.url).pathname, directory, commit], { encoding: "utf8" });
+  assert.equal(transport.status, 0, transport.stderr);
+  assert.deepEqual(readFileSync(join(restored, "deployment.json")), readFileSync(join(pages, "deployment.json")));
+  assert.deepEqual(readFileSync(join(restored, "service-worker.js")), readFileSync(join(pages, "service-worker.js")));
+
+  const scope = "https://datax-now.readthedocs.io/en/latest/_static/";
+  const mirror = "https://datax-now.github.io/go/";
+  const context = vm.createContext({
+    URL, Request, Response, Headers, btoa, hashes,
+    self: { location: { href: scope + "service-worker.js?enableCache=true" } },
+    caches: { async open() { throw new Error("cold profile"); } },
+    async maybeFromCache(event) { return context.fetch(event.request); },
+    async fetch(request) {
+      if (request.url.startsWith(scope)) throw new TypeError("Failed to fetch. SRI's integrity checks failed.");
+      if (request.url.endsWith("deployment.json")) return new Response(JSON.stringify(manifest));
+      return fetch("data:application/octet-stream;base64," + bytes.toString("base64"), { integrity: request.integrity });
+    },
+  });
+  const install = `(${fingerprints.installRuntimeCache.toString()})(hashes, [${JSON.stringify(mirror)}])`;
+  const independentHash = createHash("sha256").update("same commit, independently built WASM").digest("hex");
+  context.hashes = { [relative]: independentHash };
+  vm.runInContext(install, context);
+  const event = { request: new Request(scope + relative), waitUntil() {} };
+  await assert.rejects(context.maybeFromCache(event), /SRI's integrity checks failed/);
+  context.hashes = hashes;
+  vm.runInContext(install, context);
+  const response = await context.maybeFromCache(event);
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), readFileSync(join(restored, relative)));
 });
 
 test("RTD challenges retry fingerprinted runtime assets and the web manifest", async () => {

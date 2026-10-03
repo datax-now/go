@@ -22,6 +22,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       release_commit: ${{ steps.release.outputs.commit }}
     steps:
@@ -30,7 +32,28 @@ jobs:
         with:
           ref: ${{ inputs.release_ref || github.sha }}
 
+      - name: Test deployment artifact transport
+        run: |
+          python3 -B -m unittest discover -s scripts -p 'test_deployment_artifact.py'
+          node --test --test-name-pattern='RTD restored artifacts' scripts/service-worker-cache.test.mjs
+
+      - name: Restore the canonical deployment if already published
+        id: artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          python3 scripts/deployment-artifact.py restore --wait-seconds 0 --allow-missing || status=$?
+          if [ "$status" -eq 0 ]; then
+            echo "restored=true" >> "$GITHUB_OUTPUT"
+          elif [ "$status" -ne 3 ]; then
+            exit "$status"
+          else
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build JupyterLite deployment
+        if: steps.artifact.outputs.restored != 'true'
         run: bash ./build.sh -c
 
       - name: Verify deployment and record release
@@ -40,7 +63,8 @@ jobs:
           set -euo pipefail
           test -s dist/deployment.json
           test -f dist/cors_server.py
-          commit="$(jq -er '.commit' dist/deployment.json)"
+          commit="$(git rev-parse HEAD)"
+          test "$(jq -er '.commit' dist/deployment.json)" = "$commit"
           echo "commit=${commit}" >> "$GITHUB_OUTPUT"
 
       - name: Check the site size against the GitHub Pages limit
@@ -57,6 +81,23 @@ jobs:
           if [ "$bytes" -gt $((limit / 100 * 95)) ]; then
             echo "::warning::dist uses over 95% of the 1 GB GitHub Pages limit (${bytes} bytes)"
           fi
+
+      - name: Publish the canonical deployment for Read the Docs
+        if: steps.artifact.outputs.restored != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ steps.release.outputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/datax-site.tar.gz"
+          python3 scripts/deployment-artifact.py pack dist "$archive" --commit "$RELEASE_COMMIT"
+          tag="site-${RELEASE_COMMIT}"
+          gh release create "$tag" "$archive" \
+            --target "$RELEASE_COMMIT" --draft \
+            --title "JupyterLite site ${RELEASE_COMMIT}" \
+            --notes "Canonical deployment shared by GitHub Pages and Read the Docs. Do not replace this artifact; publish a new commit instead."
+          gh release edit "$tag" --draft=false --latest=false
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5

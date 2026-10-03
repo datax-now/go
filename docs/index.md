@@ -29,6 +29,8 @@ the generated `dist/` directory.
 This page is the Read the Docs front page for the generated JupyterLite site.
 The application runs entirely in the browser, with no separate application
 server required.
+Read the Docs and GitHub Pages publish the same commit-specific build artifact;
+Read the Docs verifies its file inventory before publishing the application.
 
 To customize the workspace, add notebooks and data files to `notebooks/` or
 update the JSON configuration files at the repository root.

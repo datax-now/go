@@ -1,20 +1,31 @@
 # JupyterLite on Read the Docs
 
 This repository builds a browser-based JupyterLite site and publishes it as
-static documentation with Read the Docs. The build uses the checked-in wheel
-and WebAssembly runtime inputs, so the Read the Docs project does not need a
-second application host.
+static documentation with Read the Docs. GitHub Actions builds the checked-in
+wheel and WebAssembly inputs once; Read the Docs and GitHub Pages publish the
+same verified artifact. Each host serves a complete, browser-only application.
 
 ## Read the Docs setup
 
 1. Create or import this repository in Read the Docs.
 2. Use the checked-in `.readthedocs.yaml` configuration.
-3. Build the `latest` version.
-4. Open the JupyterLite application from the documentation page at
+3. Run the GitHub Pages workflow for the commit to publish its site artifact.
+4. Build the RTD `latest` version at that same commit.
+5. Open the JupyterLite application from the documentation page at
    `/_static/lab/`.
 
-The RTD build runs `./build.sh -c` before Sphinx builds the documentation. The
-generated site is copied under the documentation `_static/` directory.
+Before Sphinx runs, RTD downloads `datax-site.tar.gz` from the GitHub release
+`site-<full-commit-sha>`. The restore helper verifies the manifest's commit,
+the complete file inventory, and every file's size and SHA-256 before publishing
+`dist/`. Sphinx copies those bytes under the documentation `_static/` directory.
+RTD does not rebuild or re-fingerprint the application.
+
+An automatic RTD build may start before GitHub Actions finishes. It waits up to
+ten minutes for that commit's artifact. If the artifact is still unavailable,
+the build fails explicitly: finish the GitHub Pages workflow, then retry RTD.
+There is no fallback to another commit or to an independent build. Public
+release downloads require no GitHub secret in RTD. Historical commits without
+an artifact must first be published using the Pages workflow's `release_ref`.
 
 DataX (`xpython`) is the only published kernel. The Pyodide kernel is not a
 build dependency, and incremental builds uninstall previously installed
@@ -47,16 +58,23 @@ recover verified configuration files from a mirror when RTD serves a challenge.
   `built-in-wheels/` using `built-in-wheels/update_wheel_references.py`.
 
 The `built-in-wheels/` and `built-in-conda/` directories are deployment inputs,
-not build output. Keep them in the repository so a clean RTD build is
-self-contained.
+not build output. Keep them in the repository so the canonical GitHub Actions
+build is self-contained.
 
 ## Local verification
 
 The build script targets Linux x86-64 and downloads Micromamba on its first
-run. To reproduce the RTD build locally:
+run. To build the canonical application locally:
 
 ```bash
 ./build.sh -c
+```
+
+To restore the published artifact for the current checkout instead (the output
+directory must not already exist):
+
+```bash
+python scripts/deployment-artifact.py restore --output downloaded-site
 ```
 
 The static result is written to `dist/`. A local server must provide the
@@ -131,8 +149,12 @@ The build also canonicalizes the package order and JSON keys in
 fixed ZIP timestamps when patching Quak's conda archive. Independently built
 deployments with identical package contents therefore produce identical bytes
 for integrity-verified mirror downloads. After changing these normalization
-rules, rebuild RTD and its mirrors from the same commit; older deployments
-still have incompatible hashes for the affected assets.
+rules, publish a new canonical artifact and rebuild RTD from it. Normalization
+alone does not guarantee independent builds match: R installation embeds dates
+and paths in serialized databases, and some WASM libraries also differ between
+build environments. Sharing the artifact preserves those exact bytes without
+rewriting package payloads or weakening integrity checks. Vercel and Cloudflare
+still build independently and can supply only assets whose hashes match.
 
 Service-worker caching is enabled in `jupyter-lite.json`. After all runtime
 patches, the build fingerprints every file under `dist/xeus/` with SHA-256 and
@@ -180,6 +202,7 @@ Run the focused regression checks with:
 
 ```bash
 node --test scripts/build-environment.test.mjs scripts/service-worker-cache.test.mjs scripts/deployment-manifest.test.mjs scripts/kernel-config.test.mjs
+python3 -B -m unittest discover -s scripts -p 'test_deployment_artifact.py'
 ```
 
 After rebuilding and deploying, allow one initial load to populate the cache.
@@ -352,6 +375,15 @@ The `.github/workflows/deploy-github-pages.yml` workflow builds and publishes
 the complete `dist/` directory to GitHub Pages when `master` changes. It can
 also be started manually with **Run workflow** and a `release_ref`. In the repository settings,
 set **Pages > Build and deployment > Source** to **GitHub Actions**.
+
+The build job needs `contents: write` to publish a commit-specific GitHub
+release containing `datax-site.tar.gz`. Publication uses a draft until upload
+completes. Subsequent runs restore and verify the existing release rather than
+rebuilding or overwriting it. Do not replace published release assets: make a
+new commit when application bytes must change. If an upload fails and leaves
+an unpublished draft, remove that incomplete draft before retrying.
+The archive is a deployment transport, not part of the published site's
+offline inventory or browser downloads.
 
 GitHub Pages sites may not exceed 1 GB. The workflow fails before upload above
 1 GiB and warns above 95%; growth in the runtime is the first thing to trim.
