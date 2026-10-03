@@ -3818,7 +3818,7 @@ DATAX_BUILD_COMMIT="$(node "$REPO_ROOT/scripts/deployment-manifest.mjs" commit "
 export DATAX_BUILD_COMMIT
 node "$REPO_ROOT/scripts/verify-kernel-config.mjs" dist
 SAFE_ASM_EXT="$SAFE_ASM_EXT" node "$REPO_ROOT/scripts/patch-wasm-startup.cjs" dist --compact
-node "$REPO_ROOT/scripts/fingerprint-runtime.cjs" dist
+DATAX_BUILD_PYTHON="$DEPLOY_PREFIX/bin/python" node "$REPO_ROOT/scripts/fingerprint-runtime.cjs" dist
 
   # Include the local CORS server for users serving the generated directory.
   cp "$REPO_ROOT/cors_server.py" "dist/cors_server.py"

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import vm from "node:vm";
+import { gunzipSync } from "node:zlib";
 import test from "node:test";
 import fingerprints from "./fingerprint-runtime.cjs";
 import startup from "./patch-wasm-startup.cjs";
@@ -854,6 +855,68 @@ test("runtime cache rejects mismatched bytes and retries without poisoning the h
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("RTD cold package downloads recover from independently packed byte-identical environments", async t => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-packed-mirrors-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const relative = "xeus/xeus-python-wasm-host/kernel_packages/boost-scope_exit-1.92.0-h29704b6_0.tar.gz";
+  for (const host of ["rtd", "github"]) {
+    mkdirSync(join(directory, host, "xeus/xeus-python-wasm-host/kernel_packages"), { recursive: true });
+    writeFileSync(join(directory, host, "service-worker.js"), "");
+  }
+  const fixture = spawnSync("python3", ["-c", `
+import gzip
+import io
+import sys
+import tarfile
+from pathlib import Path
+root = Path(sys.argv[1])
+for host, timestamp, owner in [("rtd", 1700000000, 1000), ("github", 1800000000, 1001)]:
+    path = root / host / sys.argv[2]
+    with path.open("wb") as output:
+        with gzip.GzipFile(filename=str(path), fileobj=output, mode="wb", mtime=timestamp) as compressed:
+            with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
+                info = tarfile.TarInfo("include/boost/scope_exit.hpp")
+                data = b"identical installed package contents"
+                info.size = len(data)
+                info.mtime = timestamp + 0.25
+                info.uid = info.gid = owner
+                info.uname = info.gname = host
+                info.pax_headers = {"atime": str(timestamp + 0.5), "ctime": str(timestamp + 0.75)}
+                archive.addfile(info, io.BytesIO(data))
+`, directory, relative], { encoding: "utf8" });
+  assert.equal(fixture.status, 0, fixture.stderr);
+  const scope = "https://datax-now.readthedocs.io/en/latest/_static/";
+  const mirror = "https://datax-now.github.io/go/";
+  const localHashes = fingerprints.fingerprintRuntime(join(directory, "rtd"), [mirror], "same-commit");
+  const mirrorHashes = fingerprints.fingerprintRuntime(join(directory, "github"), [mirror], "same-commit");
+  const localBytes = readFileSync(join(directory, "rtd", relative));
+  const mirrorBytes = readFileSync(join(directory, "github", relative));
+  const requests = [];
+  const context = vm.createContext({
+    URL, Request, Response, Headers, btoa, hashes: localHashes,
+    self: { location: { href: scope + "service-worker.js?enableCache=true" } },
+    caches: { async open() { throw new Error("cache unavailable in a cold profile"); } },
+    async maybeFromCache(event) { return context.fetch(event.request); },
+    async fetch(request) {
+      requests.push(request.url);
+      if (request.url.startsWith(scope)) throw new TypeError("Failed to fetch. SRI's integrity checks failed.");
+      if (request.url.endsWith("deployment.json")) {
+        return new Response(JSON.stringify({ commit: "same-commit", files: {
+          [relative]: { sha256: mirrorHashes[relative] },
+        } }));
+      }
+      return fetch("data:application/octet-stream;base64," + mirrorBytes.toString("base64"), { integrity: request.integrity });
+    },
+  });
+  vm.runInContext(`(${fingerprints.installRuntimeCache.toString()})(hashes, [${JSON.stringify(mirror)}], "same-commit")`, context);
+  await assert.doesNotReject(async () => {
+    const response = await context.maybeFromCache({ request: new Request(scope + relative), waitUntil() {} });
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), localBytes);
+    assert.ok(gunzipSync(localBytes).includes(Buffer.from("identical installed package contents")));
+  }, "a blocked RTD package must remain downloadable from an independently built mirror");
+  assert.ok(requests.includes(mirror + relative));
 });
 
 test("RTD challenges retry fingerprinted runtime assets and the web manifest", async () => {

@@ -230,6 +230,16 @@ mirror. The timestamp is excluded from the JupyterLite build subprocess:
 JupyterLite 0.8.3 otherwise recursively timestamps the output directory's parent,
 including Micromamba caches and broken sysroot symlinks. It remains available to
 the post-build directory-index and offline-inventory normalization.
+Before runtime and offline inventories are hashed, the build also normalizes
+the generated `kernel_packages/*.tar.gz` archives using the pinned deployment
+Python. Gzip timestamps and embedded filenames are removed; tar modification
+times use `SOURCE_DATE_EPOCH`, ownership is fixed, and volatile PAX timestamps
+are removed. Package payloads, permissions, links and member order are preserved.
+This makes archives containing the same installed files recoverable from mirrors,
+instead of rejecting them merely because they were packed on a different host.
+Corrupt or unsupported archives fail the build without replacing the input.
+Rebuild and redeploy RTD and its mirrors with the same epoch to apply this fix;
+older, unnormalized mirror archives will still fail strict SHA-256 verification.
 Generated HTML cache tokens use the referenced script's content
 hash. These are normalized before offline copies and inventories are written,
 so independently built mirrors can recover the same notebook/data listings

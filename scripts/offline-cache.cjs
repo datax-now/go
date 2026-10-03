@@ -1,6 +1,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { spawnSync } = require('node:child_process');
 
 function installOfflineCache(assets) {
   const original = maybeFromCache;
@@ -553,6 +554,22 @@ function prepareOffline(directory, sourceDateEpoch = process.env.SOURCE_DATE_EPO
     }
     const timestamp = new Date(Number(sourceDateEpoch) * 1000).toISOString();
     normalizeContentsMetadata(path.join(directory, 'api/contents'), timestamp);
+  }
+  const runtime = path.join(directory, 'xeus');
+  if (fs.existsSync(runtime) && fs.readdirSync(runtime, { withFileTypes: true }).some(entry => {
+    if (!entry.isDirectory()) return false;
+    const packages = path.join(runtime, entry.name, 'kernel_packages');
+    return fs.existsSync(packages) && fs.readdirSync(packages).some(name => name.endsWith('.tar.gz'));
+  })) {
+    const normalized = spawnSync(process.env.DATAX_BUILD_PYTHON || 'python3',
+      [path.join(__dirname, 'normalize-kernel-packages.py'), directory], {
+        encoding: 'utf8', env: { ...process.env, SOURCE_DATE_EPOCH: String(sourceDateEpoch ?? 0) },
+      });
+    if (normalized.error || normalized.status !== 0) {
+      throw new Error('Kernel package normalization failed: ' +
+        (normalized.error?.message || normalized.stderr || `exit ${normalized.status}`));
+    }
+    console.log(normalized.stdout.trim());
   }
   const extension = path.join(directory, 'extensions/@jupyterlite/xeus-extension/static');
   if (fs.existsSync(extension)) {
