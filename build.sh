@@ -2985,9 +2985,10 @@ window.__dataxStaticHostReady = (() => {
     return Promise.resolve(false);
   }
   const serviceWorker = navigator.serviceWorker;
+  const timeoutMs = 120000;
   function withTimeout(promise, message) {
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error(message)), 15000);
+      const timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
       Promise.resolve(promise).then(
         value => { clearTimeout(timeout); resolve(value); },
         error => { clearTimeout(timeout); reject(error); },
@@ -3009,8 +3010,8 @@ window.__dataxStaticHostReady = (() => {
       };
       timeout = setTimeout(() => {
         cleanup();
-        reject(new Error("The service worker did not take control within 15 seconds."));
-      }, 15000);
+        reject(new Error("The service worker did not take control within 120 seconds."));
+      }, timeoutMs);
       serviceWorker.addEventListener("controllerchange", onControllerChange);
       onControllerChange();
     });
@@ -3021,9 +3022,9 @@ window.__dataxStaticHostReady = (() => {
       const workerUrl = new URL("service-worker.js?enableCache=true", scope);
       await withTimeout(
         serviceWorker.register(workerUrl.href, { scope: scope.pathname }),
-        "The service worker did not register within 15 seconds.",
+        "The service worker did not register within 120 seconds.",
       );
-      await withTimeout(serviceWorker.ready, "The service worker did not become ready within 15 seconds.");
+      await withTimeout(serviceWorker.ready, "The service worker did not become ready within 120 seconds.");
       await waitForController();
       sessionStorage.setItem(key, String(attempts + 1));
       console.info("[DataX.now] Reloading the controlled page before starting JupyterLite.");

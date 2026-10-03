@@ -464,6 +464,34 @@ function installOfflineUI() {
   });
 }
 
+function patchServiceWorkerManager(source) {
+  const marker = '/* datax-preserve-service-worker */';
+  if (source.includes(marker)) return source;
+  let count = 0;
+  const patched = source.replace(
+    /async _unregisterOldServiceWorkers\(([\w$]+)\)\{let ([\w$]+)=`\$\{\1\}-version`,([\w$]+)=localStorage\.getItem\(\2\);if\(\3&&\3!==([\w$]+)\|\|!\3\)\{[\s\S]*?\}localStorage\.setItem\(\2,\4\)\}/g,
+    (_, url, key, stored, version) => {
+      count++;
+      return `async _unregisterOldServiceWorkers(${url}){${marker}
+        const ${key}=${url}+"-version",${stored}=localStorage.getItem(${key});
+        if(${stored}&&${stored}!==${version}||!${stored}){
+          const registration=await navigator.serviceWorker.getRegistration(${url});
+          if(registration){
+            try{await registration.update()}catch(error){
+              if(error?.name!=="TypeError"&&error?.name!=="NetworkError")throw error;
+              console.warn("[DataX.now] Could not update the service worker; keeping the active isolated runtime.",error);
+              return;
+            }
+          }
+        }
+        localStorage.setItem(${key},${version});
+      }`;
+    },
+  );
+  if (count !== 1) throw new Error(`Expected one service-worker version handler, found ${count}`);
+  return patched;
+}
+
 function prepareOffline(directory) {
   const extension = path.join(directory, 'extensions/@jupyterlite/xeus-extension/static');
   if (fs.existsSync(extension)) {
@@ -490,12 +518,14 @@ function prepareOffline(directory) {
       if (entry.name.endsWith('.html.offline')) continue;
       const relative = path.relative(directory, filename).split(path.sep).map(encodeURIComponent).join('/');
       if ([
-        'service-worker.js', 'deployment.json', 'datax-now.zip', 'cors_server.py',
+        'service-worker.js', 'deployment.json', 'xpython-deploy-manifest.json', 'datax-now.zip', 'cors_server.py',
         'xeus/xeus-python-wasm-host/built-in-local/conda/generate_repodata.py',
       ].includes(relative)) continue;
       if (entry.name.endsWith('.js')) {
         const source = fs.readFileSync(filename, 'utf8');
-        if (source.includes(heartbeat)) fs.writeFileSync(filename, source.split(heartbeat).join(localHeartbeat));
+        let updated = source.split(heartbeat).join(localHeartbeat);
+        if (updated.includes('_unregisterOldServiceWorkers(')) updated = patchServiceWorkerManager(updated);
+        if (updated !== source) fs.writeFileSync(filename, updated);
       }
       if (entry.name === 'index.html') {
         const html = fs.readFileSync(filename, 'utf8');
@@ -515,4 +545,4 @@ function prepareOffline(directory) {
   return assets;
 }
 
-module.exports = { createKernelIdleScheduler, installOfflineCache, installOfflineUI, monitorKernelActivity, offlineStatusText, prepareOffline };
+module.exports = { createKernelIdleScheduler, installOfflineCache, installOfflineUI, monitorKernelActivity, offlineStatusText, patchServiceWorkerManager, prepareOffline };

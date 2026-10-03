@@ -61,7 +61,14 @@ Cloudflare set these headers directly. Read the Docs provides COOP, so its
 service worker adds COEP to controlled app navigations; GitHub Pages provides
 neither header, so the service worker adds both. On a first visit to either
 static host, a preflight registers the service worker and waits for it to
-control the page before JupyterLite starts. The app loader stays paused while
+control the page before JupyterLite starts. Each registration, readiness, and
+control wait allows up to two minutes for a
+cold browser profile rather than failing after 15 seconds. The preflight's
+active registration is retained when JupyterLite starts: version changes check
+for a normal service-worker update in the current scope instead of unregistering
+workers (including workers belonging to other deployment paths). A network-blocked
+update is reported and retried on a later visit without discarding the working
+registration. The app loader stays paused while
 controlled navigations retry (up to three attempts) until cross-origin
 isolation is available, so notebooks and warmed kernels are not started in a
 document that is about to reload. If isolation still cannot be enabled, the
@@ -200,6 +207,10 @@ uses. If progress stalls, for example because the browser stopped the service
 worker, the app resumes the download from the files already cached.
 Offline files and notebooks belong to the selected origin and browser
 profile, not to all deployment mirrors.
+Timestamped build diagnostics (`xpython-deploy-manifest.json`) are not offline
+dependencies and are excluded from the offline inventory, like `deployment.json`.
+Their bytes differ between builds on different hosts and cannot be recovered
+as integrity-verified runtime assets from a mirror.
 
 Network-dependent notebook code, remote datasets, AI services, and packages not
 included in the build still require internet access. External fonts may fall

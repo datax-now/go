@@ -11,6 +11,68 @@ import startup from "./patch-wasm-startup.cjs";
 import offline from "./offline-cache.cjs";
 
 const root = new URL("../", import.meta.url);
+test("first-visit service-worker management preserves isolation and survives blocked updates", async t => {
+  const source = `const version="1.0"; class Manager {
+    async _initialize(e){let{serviceWorker:t}=navigator,s=null;
+      if(t.controller){let e=t.controller.scriptURL;await this._unregisterOldServiceWorkers(e),s=await t.getRegistration(e)||null}
+      if(!s)s=await t.register(e);this.registration=s}
+    async _unregisterOldServiceWorkers(e){let t=\`\${e}-version\`,s=localStorage.getItem(t);if(s&&s!==version||!s){console.info("New version, unregistering existing service workers.");let e=await navigator.serviceWorker.getRegistrations();await Promise.all(e.map(e=>e.unregister())),console.info("All existing service workers have been unregistered.")}localStorage.setItem(t,version)}
+  } globalThis.Manager=Manager;`;
+  const patched = offline.patchServiceWorkerManager(source);
+  assert.equal(offline.patchServiceWorkerManager(patched), patched, "patch must be idempotent");
+  assert.throws(() => offline.patchServiceWorkerManager("changed upstream code"), /Expected one service-worker version handler/);
+  const directory = mkdtempSync(join(tmpdir(), "datax-worker-manager-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  mkdirSync(join(directory, "build"));
+  writeFileSync(join(directory, "build/manager.js"), source);
+  const assets = offline.prepareOffline(directory);
+  assert.equal(readFileSync(join(directory, "build/manager.js"), "utf8"), patched);
+  assert.equal(assets["build/manager.js"].sha256, createHash("sha256").update(patched).digest("hex"),
+    "the inventory must fingerprint the patched manager, not its original bytes");
+  assert.deepEqual(offline.prepareOffline(directory), assets);
+  for (const previousVersion of [null, "0.9", "1.0"]) {
+    for (const blocked of [false, true]) {
+      let registered = true;
+      let updates = 0;
+      let unregistrations = 0;
+      let registrations = 0;
+      const warnings = [];
+      const values = new Map();
+      const url = "https://datax-now.readthedocs.io/en/latest/_static/service-worker.js?enableCache=true";
+      if (previousVersion) values.set(url + "-version", previousVersion);
+      const registration = {
+        async update() { updates++; if (blocked) throw new TypeError("Cloudflare blocked the worker update"); },
+        async unregister() { unregistrations++; registered = false; },
+      };
+      const unrelated = { async unregister() { unregistrations++; } };
+      const context = vm.createContext({
+        navigator: { serviceWorker: {
+          controller: { scriptURL: url },
+          async getRegistration(scope) { assert.equal(scope, url); return registered ? registration : undefined; },
+          async getRegistrations() { return [registration, unrelated]; },
+          async register() { registrations++; throw new TypeError("Cloudflare blocked registration"); },
+        } },
+        localStorage: {
+          getItem(key) { return values.get(key) ?? null; },
+          setItem(key, value) { values.set(key, value); },
+        },
+        console: { info() {}, warn(...args) { warnings.push(args); } },
+      });
+      vm.runInContext(patched, context);
+      const manager = new context.Manager();
+      await manager._initialize(url);
+      assert.equal(manager.registration, registration, "kernel startup must retain the preflight registration");
+      assert.equal(unregistrations, 0, "neither the active worker nor other deployment scopes may be unregistered");
+      assert.equal(registrations, 0);
+      assert.equal(updates, previousVersion === "1.0" ? 0 : 1);
+      assert.equal(warnings.length, blocked && previousVersion !== "1.0" ? 1 : 0,
+        "blocked update checks must be reported without discarding the working registration");
+      assert.equal(values.get(url + "-version"), blocked ? previousVersion ?? undefined : "1.0",
+        "failed update checks must remain retryable on the next visit");
+    }
+  }
+});
+
 test("cold kernel messages wait for initialization and mounted filesystem in arrival order", async () => {
   const source = `class Kernel {
     constructor(initialize, mount) {
@@ -457,7 +519,7 @@ test("static-host app startup waits for an isolated service-worker-controlled pa
     const appLoader = loader.replace(/await import\([\s\S]*?\);/, "globalThis.dataxAppStarted = true;");
     assert.doesNotMatch(appLoader, /await import\(/);
 
-    function createPage(hostname, href, ready, sessionValues = new Map()) {
+    function createPage(hostname, href, ready, sessionValues = new Map(), timers = { setTimeout, clearTimeout }) {
       let controller = null;
       let reloads = 0;
       const listeners = new Set();
@@ -501,8 +563,8 @@ test("static-host app startup waits for an isolated service-worker-controlled pa
           info() {},
           warn() {},
         },
-        setTimeout,
-        clearTimeout,
+        setTimeout: timers.setTimeout,
+        clearTimeout: timers.clearTimeout,
       });
       context.window = context;
       return {
@@ -560,6 +622,77 @@ test("static-host app startup waits for an isolated service-worker-controlled pa
       assert.equal(page.context.dataxAppStarted, true, `${hostname} should start JupyterLite after isolation is available`);
       assert.equal(page.sessionValues.size, 0, "successful isolation should clear the retry counter");
     }
+
+    let now = 0;
+    let timerId = 0;
+    const scheduled = new Map();
+    const timers = {
+      setTimeout(callback, delay) {
+        const id = ++timerId;
+        scheduled.set(id, { callback, at: now + delay });
+        return id;
+      },
+      clearTimeout(id) { scheduled.delete(id); },
+    };
+    function advance(milliseconds) {
+      now += milliseconds;
+      for (const [id, timer] of scheduled) {
+        if (timer.at <= now) {
+          scheduled.delete(id);
+          timer.callback();
+        }
+      }
+    }
+    let finishRegistration;
+    const slow = createPage("datax-now.github.io", "https://datax-now.github.io/go/lab/index.html",
+      Promise.resolve({}), new Map(), timers);
+    slow.context.navigator.serviceWorker.register = () => new Promise(resolve => { finishRegistration = resolve; });
+    vm.runInContext(bootstrap, slow.context);
+    vm.runInContext(appLoader, slow.context);
+    advance(16000);
+    await new Promise(resolve => setImmediate(resolve));
+    finishRegistration({});
+    slow.setController({});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(slow.errors.length, 0, "a cold registration taking more than 15 seconds must still complete");
+    assert.equal(slow.reloads, 1, "slow first visits must recover without a manual refresh");
+    assert.equal(slow.context.dataxAppStarted, undefined, "the loader must remain gated until the isolated reload");
+    assert.equal(scheduled.size, 0, "successful registration must clear its timeouts");
+
+    for (const phase of ["ready", "controller"]) {
+      let finishReady;
+      const ready = new Promise(resolve => { finishReady = resolve; });
+      const page = createPage("datax-now.github.io", "https://datax-now.github.io/go/lab/index.html",
+        ready, new Map(), timers);
+      vm.runInContext(bootstrap, page.context);
+      vm.runInContext(appLoader, page.context);
+      await new Promise(resolve => setImmediate(resolve));
+      if (phase === "controller") {
+        finishReady({});
+        await new Promise(resolve => setImmediate(resolve));
+      }
+      advance(16000);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(page.errors.length, 0, `cold ${phase} waits must allow more than 15 seconds`);
+      assert.equal(page.context.dataxAppStarted, undefined);
+      finishReady({});
+      page.setController({});
+      page.controllerChanged();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(page.reloads, 1);
+      assert.equal(scheduled.size, 0);
+    }
+
+    const stalled = createPage("datax-now.github.io", "https://datax-now.github.io/go/lab/index.html",
+      new Promise(() => {}), new Map(), timers);
+    stalled.context.navigator.serviceWorker.register = () => new Promise(() => {});
+    vm.runInContext(bootstrap, stalled.context);
+    vm.runInContext(appLoader, stalled.context);
+    advance(120000);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(stalled.errors.length, 1, "a permanently stalled registration must report an error");
+    assert.equal(stalled.reloads, 0);
+    assert.equal(stalled.context.dataxAppStarted, undefined);
 
     const exhaustedState = new Map([["datax-static-host-isolation-attempts-v2", "3"]]);
     const exhausted = createPage(
@@ -1640,7 +1773,7 @@ test("offline inventory includes lazy assets but excludes archives and mutable d
     mkdirSync(join(directory, "lab"));
     mkdirSync(join(directory, "xeus/xeus-python-wasm-host/built-in-local/conda"), { recursive: true });
     writeFileSync(join(directory, "lab/index.html"), "<html><head></head><body></body></html>");
-    for (const name of ["service-worker.js", "deployment.json", "datax-now.zip", "cors_server.py", "lazy.js"]) writeFileSync(join(directory, name), "asset");
+    for (const name of ["service-worker.js", "deployment.json", "xpython-deploy-manifest.json", "datax-now.zip", "cors_server.py", "lazy.js"]) writeFileSync(join(directory, name), "asset");
     writeFileSync(join(directory, "xeus/xeus-python-wasm-host/built-in-local/conda/generate_repodata.py"), "build helper");
     writeFileSync(join(directory, "sample.py"), "runtime asset");
     const first = offline.prepareOffline(directory);
@@ -1653,6 +1786,75 @@ test("offline inventory includes lazy assets but excludes archives and mutable d
       assert.equal(asset.size, bytes.length);
     }
   } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("RTD offline download completes despite unavailable timestamped diagnostics", async t => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-offline-diagnostics-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  mkdirSync(join(directory, "build"));
+  mkdirSync(join(directory, "xeus"));
+  writeFileSync(join(directory, "build/app.js"), "app bundle");
+  writeFileSync(join(directory, "xeus/runtime.wasm"), "runtime bytes");
+  writeFileSync(join(directory, "xpython-deploy-manifest.json"), '{"deploy_timestamp":"first build"}');
+  const assets = offline.prepareOffline(directory);
+  const hashes = { "xeus/runtime.wasm": assets["xeus/runtime.wasm"].sha256 };
+  const assetHashes = Object.fromEntries(Object.entries(assets).map(([relative, asset]) => [relative, asset.sha256]));
+  const scope = "https://datax-now.readthedocs.io/en/latest/_static/";
+  const mirror = "https://datax-now.github.io/go/";
+  const stored = new Map();
+  const requests = [];
+  const cache = {
+    async match(key) { return stored.get(key.url ?? key)?.clone(); },
+    async put(key, response) { stored.set(key.url ?? key, response.clone()); },
+    async keys() { return [...stored.keys()].map(key => new Request(key)); },
+    async delete(key) { return stored.delete(key.url ?? key); },
+  };
+  let message;
+  const context = vm.createContext({
+    URL, Request, Response, Headers, btoa, assets, hashes, assetHashes, mirrors: [mirror],
+    self: {
+      location: { href: scope + "service-worker.js?enableCache=true" },
+      addEventListener(type, listener) { if (type === "message") message = listener; },
+    },
+    caches: { async open() { return cache; } },
+    async maybeFromCache(event) { return context.fetch(event.request); },
+    async fetch(request) {
+      requests.push(request.url);
+      const url = new URL(request.url);
+      if (url.origin === new URL(scope).origin) throw new TypeError("SRI failed on RTD challenge");
+      if (url.pathname === "/go/deployment.json") {
+        return new Response(JSON.stringify({
+          commit: "b".repeat(40),
+          files: Object.fromEntries(Object.entries(assetHashes).map(([relative, sha256]) => [relative, { sha256 }])),
+        }));
+      }
+      const relative = url.pathname.slice(new URL(mirror).pathname.length);
+      const bytes = relative === "xpython-deploy-manifest.json"
+        ? '{"deploy_timestamp":"different mirror build"}'
+        : readFileSync(join(directory, relative), "utf8");
+      return fetch("data:application/octet-stream," + encodeURIComponent(bytes), { integrity: request.integrity });
+    },
+  });
+  vm.runInContext(
+    `(${fingerprints.installRuntimeCache.toString()})(hashes, mirrors, null, assetHashes);` +
+      `(${offline.installOfflineCache.toString()})(assets);`,
+    context,
+  );
+  const updates = [];
+  const tasks = [];
+  message({
+    data: { type: "datax-offline-download" }, source: { url: scope + "lab/" },
+    ports: [{ postMessage(update) { updates.push(update); } }],
+    waitUntil(task) { tasks.push(task); },
+  });
+  await Promise.all(tasks);
+  assert.equal(updates.at(-1).ready, true, updates.at(-1).error);
+  assert.equal(updates.at(-1).completed, Object.keys(assets).length);
+  assert.equal(updates.at(-1).bytes, Object.values(assets).reduce((total, asset) => total + asset.size, 0));
+  assert.equal(stored.size, Object.keys(assets).length + 1, "every required asset and the readiness marker must be stored");
+  assert.ok(requests.includes(mirror + "build/app.js"));
+  assert.ok(requests.includes(mirror + "xeus/runtime.wasm"));
+  assert.equal(requests.some(url => url.endsWith("/xpython-deploy-manifest.json")), false);
 });
 
 test("offline HTML remains integrity-checked when the host injects addons", async () => {
