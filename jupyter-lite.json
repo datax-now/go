@@ -10,9 +10,10 @@
     "xeusInitMainKernelWarm": "none",
     "xeusKernelPoolEnabled": true,
     "xeusKernelPoolMax": 100,
-    "xeusKernelPoolWarm": 2,
+    "xeusKernelPoolWarm": 0,
+    "xeusKernelPoolRecycleEnabled": true,
     "xeusKernelPoolTimeout": 300000,
-    "xeusAutoPrewarm": true,
+    "xeusAutoPrewarm": false,
     "xeusPrewarmDelay": 0,
     "appUrl": "./lab",
     "settingsOverrides": {

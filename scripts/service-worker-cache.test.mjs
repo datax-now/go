@@ -11,6 +11,50 @@ import startup from "./patch-wasm-startup.cjs";
 import offline from "./offline-cache.cjs";
 
 const root = new URL("../", import.meta.url);
+test("cold kernel messages wait for initialization and mounted filesystem in arrival order", async () => {
+  const source = `class Kernel {
+    constructor(initialize, mount) {
+      this._messageQueue=Promise.resolve();this._activeKernelRequestCount=0;
+      this._ready={promise:new Promise((resolve,reject)=>{this.resolveReady=resolve;this.rejectReady=reject}),
+        resolve:()=>this.resolveReady(),reject:error=>this.rejectReady(error)};
+      this.messages=[];
+      this.initRemote=()=>initialize;this.initFileSystem=()=>mount;
+      this.initRemote({}).then(()=>this.initFileSystem({})).then(this._ready.resolve.bind(this._ready));
+    }
+    get ready(){return this._ready.promise}
+    async handleMessage(e){let t="input_reply"!==e.header.msg_type,s=async()=>{
+      t&&(this._activeKernelRequestCount+=1),this._parent=e,this._parentHeader=e.header;
+      try{await this._sendMessageToWorker(e)}finally{t&&(this._activeKernelRequestCount=Math.max(0,this._activeKernelRequestCount-1))}
+    },i=this._messageQueue.then(s,s);this._messageQueue=i.then(()=>void 0,()=>void 0),await i}
+    async _sendMessageToWorker(message){this.messages.push(message.header.msg_type)}
+  }
+  globalThis.Kernel=Kernel;`;
+  const patched = startup.patchKernelMessages(source);
+  const context = vm.createContext({});
+  vm.runInContext(patched, context);
+  let initialize;
+  let mount;
+  const kernel = new context.Kernel(
+    new Promise(resolve => { initialize = resolve; }),
+    new Promise(resolve => { mount = resolve; }),
+  );
+  const open = kernel.handleMessage({ header: { msg_type: "comm_open" } });
+  const update = kernel.handleMessage({ header: { msg_type: "comm_msg" } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(kernel.messages.length, 0, "comm messages must not reach an uninitialized kernel");
+  initialize();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(kernel.messages.length, 0, "filesystem mounting must finish before comm messages");
+  mount();
+  await Promise.all([open, update]);
+  assert.deepEqual([...kernel.messages], ["comm_open", "comm_msg"]);
+  assert.equal(startup.patchKernelMessages(patched), patched, "patch must be idempotent");
+
+  const failed = new context.Kernel(Promise.reject(new Error("Kernel initialization failed")), Promise.resolve());
+  await assert.rejects(failed.handleMessage({ header: { msg_type: "kernel_info_request" } }), /Kernel initialization failed/);
+  assert.equal(failed.messages.length, 0);
+});
+
 test("duplicate libraries are removed only after worker fetch aliases are installed", async () => {
   const directory = mkdtempSync(join(tmpdir(), "datax-library-dedup-"));
   const runtime = "xeus/xeus-python-wasm-host/";
@@ -121,6 +165,8 @@ const brandingPatch = build.split('echo "🎨 Applying DataX.now branding..."')[
   .split("python3 <<'PY'\n")[1].split("\nPY")[0];
 const runtimeConfigPatch = build.split('echo "Restoring custom runtime config into built jupyter-lite.json files..."')[1]
   .split("python3 << 'EOFPATCH'\n")[1].split("\nEOFPATCH")[0];
+const configStaging = "for lite_file in " + build.split("for lite_file in ")[1]
+  .split("# Validate notebook fallback")[0];
 const upstream = `const CACHE="precache";let enableCache=!1;
 function onActivate(e){enableCache="true"===new URL(location.href).searchParams.get("enableCache"),e.waitUntil(self.clients.claim())}
 async function onFetch(event){event.respondWith(maybeFromCache(event))}
@@ -136,15 +182,103 @@ test("built app configs preserve service-worker caching from the source config",
     mkdirSync(join(directory, "temp/jupyterlite-lite-dir"), { recursive: true });
     mkdirSync(join(directory, "dist/lab"), { recursive: true });
     writeFileSync(join(directory, "temp/jupyterlite-lite-dir/jupyter-lite.json"), readFileSync(new URL("jupyter-lite.json", root)));
-    for (const relative of ["dist/jupyter-lite.json", "dist/lab/jupyter-lite.json"]) writeFileSync(join(directory, relative), "{}");
+    for (const relative of ["dist/jupyter-lite.json", "dist/lab/jupyter-lite.json"]) {
+      writeFileSync(join(directory, relative), JSON.stringify({
+        "jupyter-config-data": { federated_extensions: [
+          { name: "@jupyterlite/pyodide-kernel-extension" }, { name: "@jupyterlite/xeus-extension" },
+        ] },
+      }));
+    }
     const result = spawnSync("python3", ["-c", runtimeConfigPatch], { cwd: directory, encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
     for (const relative of ["dist/jupyter-lite.json", "dist/lab/jupyter-lite.json"]) {
       const config = JSON.parse(readFileSync(join(directory, relative), "utf8"));
       assert.equal(config.enableServiceWorkerCache, true);
       assert.equal(config["jupyter-config-data"].enableServiceWorkerCache, true);
+      assert.deepEqual(config["jupyter-config-data"].federated_extensions, [{ name: "@jupyterlite/xeus-extension" }]);
     }
   } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("all deployment hosts publish the same on-demand DataX runtime config", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-host-config-"));
+  const configs = [];
+  try {
+    for (const host of ["vercel", "github", "rtd"]) {
+      const folder = join(directory, host);
+      const lite = join(folder, "temp/jupyterlite-lite-dir");
+      mkdirSync(lite, { recursive: true });
+      mkdirSync(join(folder, "dist/consoles"), { recursive: true });
+      writeFileSync(join(folder, "jupyter-lite.json"), readFileSync(new URL("jupyter-lite.json", root)));
+      writeFileSync(join(folder, "dist/consoles/jupyter-lite.json"), "{}");
+      const staging = spawnSync("bash", ["-c", configStaging], {
+        cwd: folder, encoding: "utf8",
+        env: { ...process.env, LITE_BUILD_DIR: lite, READTHEDOCS: host === "rtd" ? "True" : "" },
+      });
+      assert.equal(staging.status, 0, staging.stderr);
+      const restore = spawnSync("python3", ["-c", runtimeConfigPatch], { cwd: folder, encoding: "utf8" });
+      assert.equal(restore.status, 0, restore.stderr);
+      configs.push(readFileSync(join(folder, "dist/consoles/jupyter-lite.json"), "utf8"));
+    }
+    const scope = "https://datax-now.readthedocs.io/en/latest/_static/";
+    const mirror = "https://datax-now.github.io/go/";
+    const relative = "consoles/jupyter-lite.json";
+    const sha256 = createHash("sha256").update(configs[2]).digest("hex");
+    const mirrorHash = createHash("sha256").update(configs[1]).digest("hex");
+    const stored = new Map();
+    let message;
+    const context = vm.createContext({
+      URL, Request, Response, Headers, btoa,
+      assets: { [relative]: { sha256, size: Buffer.byteLength(configs[2]) } },
+      hashes: { [relative]: sha256 },
+      self: {
+        location: { href: scope + "service-worker.js?enableCache=true" },
+        addEventListener(type, listener) { if (type === "message") message = listener; },
+      },
+      caches: { async open() { return {
+        async match(key) { return stored.get(key.url ?? key)?.clone(); },
+        async put(key, response) { stored.set(key.url ?? key, response.clone()); },
+        async keys() { return [...stored.keys()].map(url => new Request(url)); },
+      }; } },
+      async maybeFromCache(event) { return context.fetch(event.request); },
+      async fetch(request) {
+        if (new URL(request.url).origin === new URL(scope).origin) {
+          throw new TypeError("Fetch API cannot load RTD asset. SRI's integrity checks failed.");
+        }
+        if (request.url.endsWith("/deployment.json")) {
+          return new Response(JSON.stringify({ files: { [relative]: { sha256: mirrorHash } } }));
+        }
+        return fetch("data:application/json," + encodeURIComponent(configs[1]), { integrity: request.integrity });
+      },
+    });
+    vm.runInContext(
+      `(${fingerprints.installRuntimeCache.toString()})({}, ["${mirror}"], null, hashes);` +
+      `(${offline.installOfflineCache.toString()})(assets);`,
+      context,
+    );
+    const updates = [];
+    const tasks = [];
+    message({
+      data: { type: "datax-offline-download" }, source: { url: scope + "lab/" },
+      ports: [{ postMessage(update) { updates.push(update); } }],
+      waitUntil(task) { tasks.push(task); },
+    });
+    await Promise.all(tasks);
+    assert.equal(updates.at(-1).ready, true, updates.at(-1).error);
+    assert.equal(configs[2], configs[0], "RTD's config must be byte-identical to its mirror for verified offline fallback");
+    assert.equal(configs[1], configs[0]);
+    const config = JSON.parse(configs[0]);
+    assert.equal(config.defaultKernelName, "xpython");
+    assert.equal(config.xeusKernelPoolWarm, 0);
+    assert.equal(config.xeusAutoPrewarm, false);
+    assert.equal(config.xeusKernelPoolRecycleEnabled, true);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("build inputs remove Pyodide even from reused deployment environments", () => {
+  const environment = readFileSync(new URL("environment-deploy.yml", root), "utf8");
+  assert.doesNotMatch(environment, /^\s*-\s+jupyterlite-pyodide-kernel/m);
+  assert.match(build, /python -m pip uninstall[^\n]*jupyterlite-pyodide-kernel/);
 });
 
 test("manifest shortcuts stay within the deployment subpath", () => {

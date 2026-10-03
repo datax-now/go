@@ -27,3 +27,4 @@ vendor/kernel-bundle/
 vendor/xeus-x-kernel/
 .vercel/
 .env*
+.playwright-mcp/

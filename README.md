@@ -16,6 +16,23 @@ second application host.
 The RTD build runs `./build.sh -c` before Sphinx builds the documentation. The
 generated site is copied under the documentation `_static/` directory.
 
+DataX (`xpython`) is the only published kernel. The Pyodide kernel is not a
+build dependency, and incremental builds uninstall previously installed
+Pyodide packages before assembling the site.
+
+All hosts use the same on-demand kernel settings. Background pool warm-up is
+disabled; on-demand worker reuse retains its existing default. Kernels still
+start automatically when opening a notebook. A cold start may take longer than
+acquiring a prewarmed worker.
+The build also patches the kernel message queue to wait for initialization and
+filesystem mounting before delivering messages, preserving their arrival order.
+Initialization failures reject that readiness wait instead of leaving it pending.
+The bundled WASM kernel registers Python widget comm targets during startup,
+before JupyterLab's control-channel probe or the first cell. It also preserves
+explicit comm IDs and retains the comm module safely in its callbacks.
+Keeping the runtime settings identical across hosts also lets offline downloads
+recover verified configuration files from a mirror when RTD serves a challenge.
+
 ## Customize the site
 
 - Put notebooks and data files in `notebooks/`.
@@ -140,7 +157,7 @@ kernel initialization failure.
 Run the focused regression checks with:
 
 ```bash
-node --test scripts/service-worker-cache.test.mjs scripts/deployment-manifest.test.mjs
+node --test scripts/service-worker-cache.test.mjs scripts/deployment-manifest.test.mjs scripts/kernel-config.test.mjs
 ```
 
 After rebuilding and deploying, allow one initial load to populate the cache.

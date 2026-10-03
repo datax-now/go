@@ -47,6 +47,23 @@ function patchRuntime(source) {
     'Emscripten startup promise');
 }
 
+function patchKernelMessages(source) {
+  const marker = '/* datax-kernel-message-ready */';
+  const rejectReady = '.then(this._ready.resolve.bind(this._ready),this._ready.reject.bind(this._ready))';
+  if (source.includes(marker)) {
+    if (!source.includes(rejectReady)) throw new Error('Kernel message barrier is missing initialization error propagation');
+    return source;
+  }
+  source = replaceOnce(source,
+    /async handleMessage\(([\w$]+)\)\{let ([\w$]+)="input_reply"!==\1\.header\.msg_type,([\w$]+)=async\(\)=>\{/g,
+    match => match + marker + 'await this.ready;',
+    'kernel message readiness barrier');
+  return replaceOnce(source,
+    '.then(this._ready.resolve.bind(this._ready))',
+    rejectReady,
+    'kernel initialization failure propagation');
+}
+
 function patchLibraries(source, suffix = '.asm') {
   if (source.includes('dataxLibraryURL')) return source;
   source = replaceOnce(source,
@@ -61,11 +78,22 @@ function patchLibraries(source, suffix = '.asm') {
 
 function patchDirectory(directory) {
   const workers = path.join(directory, 'extensions/@jupyterlite/xeus-extension/static');
-  const files = fs.readdirSync(workers)
+  const scripts = fs.readdirSync(workers).filter(name => name.endsWith('.js'));
+  const files = scripts
     .filter(name => name.includes('.worker.') && name.endsWith('.js'))
     .map(name => [path.join(workers, name), patchWorker])
     .filter(([file]) => fs.readFileSync(file, 'utf8').includes('instantiateWasmWithProfiling'));
   if (!files.length) throw new Error('No Xeus WASM workers found');
+  const messageKernels = scripts.map(name => path.join(workers, name))
+    .filter(file => fs.readFileSync(file, 'utf8').includes('this._messageQueue.then('));
+  if (!messageKernels.length) throw new Error('No Xeus kernel message queues found');
+  for (const file of messageKernels) {
+    const existing = files.find(entry => entry[0] === file);
+    if (existing) {
+      const patch = existing[1];
+      existing[1] = source => patchKernelMessages(patch(source));
+    } else files.push([file, patchKernelMessages]);
+  }
   const runtime = path.join(directory, 'xeus/xeus-python-wasm-host');
   const suffix = (process.env.SAFE_EXT_SUFFIXES || 'whl so').split(/\s+/).includes('so')
     ? (process.env.SAFE_ASM_EXT || '.asm') : '';
@@ -129,7 +157,7 @@ function compactLibraries(directory, suffix = '.asm') {
   return { removedFiles: duplicates.length, savedBytes };
 }
 
-module.exports = { patchWorker, patchRuntime, patchLibraries, patchDirectory, installLibraryAliases, compactLibraries };
+module.exports = { patchWorker, patchRuntime, patchKernelMessages, patchLibraries, patchDirectory, installLibraryAliases, compactLibraries };
 if (require.main === module) {
   if (process.argv[3] === '--compact') compactLibraries(process.argv[2] || 'dist', process.env.SAFE_ASM_EXT || '.asm');
   else patchDirectory(process.argv[2] || 'dist');

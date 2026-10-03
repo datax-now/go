@@ -41,7 +41,6 @@ dependencies:
     # Use the PyPI wheel: the current conda package metadata is 0.8.3 but
     # still contains the JupyterLite 0.7.6 application archive.
     - jupyterlite-core==0.8.3
-    - jupyterlite-pyodide-kernel==0.8.3
     - jupyterlab-open-url-parameter
     - jupyterlab-plugin-playground==1.0.0
     # Pre-bundle transitive pip-only deps to avoid slow PyPI downloads on clean builds
@@ -62,5 +61,5 @@ dependencies:
     # jupyterlite_xeus must be explicit to use the bundled custom build with
     # the variable-inspector worker API; otherwise pip resolves from PyPI.
     - built-in-wheels/jupyterlite_xeus-5.0.3-py3-none-any.whl
-    - built-in-wheels/jupyterlite_xeus_x-20260916.1470.0-py3-none-any.whl
+    - built-in-wheels/jupyterlite_xeus_x-20261003.1474.3-py3-none-any.whl
     - built-in-wheels/variable_inspector-1.4.4-py3-none-any.whl

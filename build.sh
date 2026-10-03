@@ -1424,6 +1424,9 @@ install_hera_from_wheel
 # ==============================================================================
 # Clean stray JupyterLab extension artifacts
 # ==============================================================================
+echo "Removing the unused Pyodide kernel from reused build environments..."
+mamba_run_deploy python -m pip uninstall --root-user-action=ignore -y jupyterlite-pyodide-kernel
+
 echo "Cleaning stray JupyterLab extension artifacts (if any)..."
 LABEXT_DIR="$DEPLOY_PREFIX/share/jupyter/labextensions"
 if [ -d "$LABEXT_DIR/@jupyterlite" ]; then
@@ -1464,19 +1467,6 @@ for lite_file in jupyter-lite.json overrides.json jupyter_lite_config.json; do
   fi
 done
 
-if [ "${READTHEDOCS:-}" = "True" ]; then
-  node - "$LITE_BUILD_DIR/jupyter-lite.json" <<'RTDCONFIG'
-const fs = require('node:fs');
-const file = process.argv[2];
-const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-Object.assign(data['jupyter-config-data'], {
-  xeusKernelPoolWarm: 0,
-  xeusAutoPrewarm: false
-});
-fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n');
-RTDCONFIG
-fi
-
 # Validate notebook fallback settings against the published JupyterLite
 # contents layout before building. build.sh serves notebooks/ at the root,
 # so values like "00_agent_features.ipynb" are valid while
@@ -1503,6 +1493,7 @@ fi
 
 echo "Building JupyterLite..."
 mamba_run_deploy jupyter lite build "${JUPYTER_LITE_BUILD_ARGS[@]}"
+rm -rf "$PWD/dist/extensions/@jupyterlite/pyodide-kernel-extension"
 
 # JupyterLite 0.8.3 embeds the upstream JupyterLab security fixes.
 
@@ -1544,6 +1535,17 @@ def patch_json(path, app_name=None):
             changed = True
 
     config = data.setdefault('jupyter-config-data', {})
+
+    for container in (data, config):
+        extensions = container.get('federated_extensions')
+        if extensions is not None:
+            retained = [
+                extension for extension in extensions
+                if extension.get('name') != '@jupyterlite/pyodide-kernel-extension'
+            ]
+            if retained != extensions:
+                container['federated_extensions'] = retained
+                changed = True
 
     for key in ('appName', 'defaultKernelName', 'enableServiceWorkerCache'):
       value = source_config.get(key)
@@ -3802,6 +3804,7 @@ fi
 
 DATAX_BUILD_COMMIT="$(node "$REPO_ROOT/scripts/deployment-manifest.mjs" commit "$REPO_ROOT")"
 export DATAX_BUILD_COMMIT
+node "$REPO_ROOT/scripts/verify-kernel-config.mjs" dist
 SAFE_ASM_EXT="$SAFE_ASM_EXT" node "$REPO_ROOT/scripts/patch-wasm-startup.cjs" dist --compact
 node "$REPO_ROOT/scripts/fingerprint-runtime.cjs" dist
 
