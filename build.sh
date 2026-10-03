@@ -2909,11 +2909,12 @@ print("  ✓ Service worker adds COOP and COEP to controlled app navigations")
 EOFPATCH
 
 # ============================================================================
-# Reload the first static-host app visit after its service worker takes control.
+# Delay the JupyterLite loader until static-host isolation is available.
 # ============================================================================
 echo "Patching static-host app bootstrap for cross-origin isolation..."
 python3 << 'EOFPATCH'
 from pathlib import Path
+import re
 
 app_file = Path('dist/lab/index.html')
 if not app_file.exists():
@@ -2922,51 +2923,134 @@ if not app_file.exists():
 content = app_file.read_text()
 marker = 'datax-rtd-coep-bootstrap'
 bootstrap = '''<script id="datax-rtd-coep-bootstrap">
-(() => {
-  if (!(location.hostname.endsWith(".readthedocs.io") || location.hostname.endsWith(".github.io")) || !("serviceWorker" in navigator)) return;
-  const key = "datax-rtd-coep-reload";
-  if (crossOriginIsolated) {
-    sessionStorage.removeItem(key);
-    return;
+window.__dataxStaticHostReady = (() => {
+  const hostname = location.hostname;
+  const staticHost = hostname.endsWith(".readthedocs.io") || hostname.endsWith(".github.io");
+  if (!staticHost) return Promise.resolve(true);
+  const key = "datax-static-host-isolation-attempts-v2";
+  function showFailure(message) {
+    const error = document.createElement("div");
+    error.id = "datax-isolation-error";
+    error.setAttribute("role", "alert");
+    error.style.cssText = "position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;padding:2rem;box-sizing:border-box;background:#fff;color:#111;font:16px/1.5 sans-serif;text-align:center";
+    error.textContent = message;
+    document.documentElement.append(error);
+    console.error("[DataX.now] " + message);
   }
-  const attempts = Number(sessionStorage.getItem(key) || 0);
-  if (attempts >= 3) return;
-  sessionStorage.setItem(key, String(attempts + 1));
-  const serviceWorker = navigator.serviceWorker;
-  serviceWorker.ready.then(async () => {
-    await serviceWorker.ready;
-    if (!serviceWorker.controller) {
-      await new Promise(resolve => {
-        const onControllerChange = () => {
-          if (!serviceWorker.controller) return;
-          serviceWorker.removeEventListener("controllerchange", onControllerChange);
-          resolve();
-        };
-        serviceWorker.addEventListener("controllerchange", onControllerChange);
-        onControllerChange();
-      });
+  if (window.crossOriginIsolated) {
+    try {
+      sessionStorage.removeItem(key);
+      sessionStorage.removeItem("datax-rtd-coep-reload");
+    } catch (error) {
+      console.warn("[DataX.now] Could not clear static-host isolation retry state.", error);
     }
-    location.reload();
-  }).catch(() => sessionStorage.removeItem(key));
+    return Promise.resolve(true);
+  }
+  if (!("serviceWorker" in navigator)) {
+    showFailure("This browser cannot use the service worker required to isolate the Python runtime on this host.");
+    return Promise.resolve(false);
+  }
+  let attempts;
+  try {
+    attempts = Number(sessionStorage.getItem(key) || 0);
+  } catch (error) {
+    showFailure("Could not read the static-host isolation retry state: " + error.message);
+    return Promise.resolve(false);
+  }
+  if (!Number.isSafeInteger(attempts) || attempts < 0) {
+    showFailure("The static-host isolation retry state is invalid. Clear this site's session storage and reload.");
+    return Promise.resolve(false);
+  }
+  if (attempts >= 3) {
+    try {
+      sessionStorage.removeItem(key);
+    } catch (error) {
+      console.warn("[DataX.now] Could not reset static-host isolation retry state.", error);
+    }
+    showFailure("This host did not enable cross-origin isolation after three reloads. Reload to retry or try another deployment.");
+    return Promise.resolve(false);
+  }
+  const serviceWorker = navigator.serviceWorker;
+  function withTimeout(promise, message) {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error(message)), 15000);
+      Promise.resolve(promise).then(
+        value => { clearTimeout(timeout); resolve(value); },
+        error => { clearTimeout(timeout); reject(error); },
+      );
+    });
+  }
+  function waitForController() {
+    if (serviceWorker.controller) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      let timeout;
+      const cleanup = () => {
+        clearTimeout(timeout);
+        serviceWorker.removeEventListener("controllerchange", onControllerChange);
+      };
+      const onControllerChange = () => {
+        if (!serviceWorker.controller) return;
+        cleanup();
+        resolve();
+      };
+      timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error("The service worker did not take control within 15 seconds."));
+      }, 15000);
+      serviceWorker.addEventListener("controllerchange", onControllerChange);
+      onControllerChange();
+    });
+  }
+  return (async () => {
+    try {
+      const scope = new URL("../", location.href);
+      const workerUrl = new URL("service-worker.js?enableCache=true", scope);
+      await withTimeout(
+        serviceWorker.register(workerUrl.href, { scope: scope.pathname }),
+        "The service worker did not register within 15 seconds.",
+      );
+      await withTimeout(serviceWorker.ready, "The service worker did not become ready within 15 seconds.");
+      await waitForController();
+      sessionStorage.setItem(key, String(attempts + 1));
+      console.info("[DataX.now] Reloading the controlled page before starting JupyterLite.");
+      location.reload();
+      return false;
+    } catch (error) {
+      showFailure("Could not prepare the isolated Python runtime on this static host: " + error.message);
+      return false;
+    }
+  })();
 })();
 </script>'''
 
-if marker in content:
-  start = content.index('<script id="' + marker + '">')
+existing_bootstrap = '<script id="' + marker + '">'
+if existing_bootstrap in content:
+  start = content.index(existing_bootstrap)
   end = content.index('</script>', start) + len('</script>')
-  updated = content[:start] + bootstrap + content[end:]
-  if updated != content:
-    app_file.write_text(updated)
-    print("  ✓ Existing static-host bootstrap updated")
-  else:
-    print("  ✓ Static-host app bootstrap already installed")
-  raise SystemExit(0)
+  content = content[:start] + content[end:]
 
-if '</head>' not in content:
-  raise SystemExit(f"Error: Could not find </head> in {app_file}")
-content = content.replace('</head>', bootstrap + '\n</head>', 1)
+import_pattern = re.compile(r'''await import\(\s*(['"])\.\./config-utils\.js[^'"]*\1\s*\);?''')
+import_match = import_pattern.search(content)
+if not import_match:
+  raise SystemExit(f"Error: Could not find the JupyterLite config-utils loader in {app_file}")
+
+gate_marker = 'datax-rtd-coep-loader-gate'
+if gate_marker not in content:
+  gate = 'if (!(await window.__dataxStaticHostReady)) return; /* ' + gate_marker + ' */\n        '
+  content = content[:import_match.start()] + gate + content[import_match.start():]
+  import_match = import_pattern.search(content)
+elif 'if (!(await window.__dataxStaticHostReady)) return;' not in content:
+  raise SystemExit("Error: Static-host loader gate marker is present but the loader is not gated")
+
+script_start = content.rfind('<script', 0, import_match.start())
+script_end = content.find('</script>', import_match.end())
+if script_start < 0 or script_end < 0:
+  raise SystemExit(f"Error: Could not locate the JupyterLite loader script in {app_file}")
+
+if existing_bootstrap not in content:
+  content = content[:script_start] + bootstrap + '\n' + content[script_start:]
 app_file.write_text(content)
-print("  ✓ Static-host app reloads after its service worker takes control")
+print("  ✓ JupyterLite startup now waits for static-host isolation")
 EOFPATCH
 
 echo "JupyterLite build complete, applying post-build patches..."

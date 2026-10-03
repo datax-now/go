@@ -267,78 +267,169 @@ test("controlled app navigations add COOP and COEP without changing other respon
   }
 });
 
-test("RTD and GitHub Pages bootstraps reload after the service worker takes control", async () => {
+test("static-host app startup waits for an isolated service-worker-controlled page", async () => {
   const directory = mkdtempSync(join(tmpdir(), "datax-static-host-bootstrap-"));
   mkdirSync(join(directory, "dist/lab"), { recursive: true });
   const appPath = join(directory, "dist/lab/index.html");
-  writeFileSync(appPath, "<html><head></head><body></body></html>");
+  writeFileSync(appPath, `<!doctype html><html><head>
+<script>
+(async function () {
+  const { pathname, origin, search, hash } = window.location;
+  if (!pathname.endsWith("index.html")) {
+    window.location.href = origin + pathname + "/" + search + hash;
+    return;
+  }
+  await import('../config-utils.js?_=test');
+}.call(this));
+</script>
+<script id="datax-rtd-coep-bootstrap">legacy()</script>
+</head><body></body></html>`);
   try {
     const result = spawnSync("python3", ["-c", staticHostBootstrapPatch], { cwd: directory, encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
     const html = readFileSync(appPath, "utf8");
-    const script = html.split('<script id="datax-rtd-coep-bootstrap">')[1]?.split("</script>")[0];
-    assert.ok(script, "bootstrap should be inserted into the app head");
+    const bootstrap = html.match(/<script id="datax-rtd-coep-bootstrap">([\s\S]*?)<\/script>/)?.[1];
+    const loader = html.match(/<script>([\s\S]*?datax-rtd-coep-loader-gate[\s\S]*?)<\/script>/)?.[1];
+    assert.ok(bootstrap, "bootstrap should be inserted before the app loader");
+    assert.ok(loader, "the JupyterLite loader should wait for the bootstrap");
+    assert.ok(html.indexOf(bootstrap) < html.indexOf(loader));
+    const appLoader = loader.replace(/await import\([\s\S]*?\);/, "globalThis.dataxAppStarted = true;");
+    assert.doesNotMatch(appLoader, /await import\(/);
 
-    for (const hostname of ["datax-now.readthedocs.io", "ying.github.io"]) {
+    function createPage(hostname, href, ready, sessionValues = new Map()) {
       let controller = null;
-      let reloaded = false;
-      let resolveReady;
+      let reloads = 0;
       const listeners = new Set();
-      const values = new Map();
+      const registrations = [];
+      const errors = [];
       const serviceWorker = {
-        ready: new Promise(resolve => { resolveReady = resolve; }),
+        ready,
         get controller() { return controller; },
+        register(url, options) {
+          registrations.push({ url, options });
+          return Promise.resolve({});
+        },
         addEventListener(type, listener) { if (type === "controllerchange") listeners.add(listener); },
         removeEventListener(type, listener) { if (type === "controllerchange") listeners.delete(listener); },
       };
+      const location = new URL(href);
       const context = vm.createContext({
-        location: { hostname, reload() { reloaded = true; } },
+        URL,
+        location: {
+          hostname,
+          href: location.href,
+          pathname: location.pathname,
+          origin: location.origin,
+          search: location.search,
+          hash: location.hash,
+          reload() { reloads++; },
+        },
         navigator: { serviceWorker },
         crossOriginIsolated: false,
         sessionStorage: {
-          getItem(key) { return values.get(key) ?? null; },
-          setItem(key, value) { values.set(key, value); },
-          removeItem(key) { values.delete(key); },
+          getItem(key) { return sessionValues.get(key) ?? null; },
+          setItem(key, value) { sessionValues.set(key, String(value)); },
+          removeItem(key) { sessionValues.delete(key); },
         },
+        document: {
+          createElement() { return { style: {}, setAttribute() {} }; },
+          documentElement: { append() {} },
+        },
+        console: {
+          error(...args) { errors.push(args.join(" ")); },
+          info() {},
+          warn() {},
+        },
+        setTimeout,
+        clearTimeout,
       });
-      vm.runInContext(script, context);
-      await new Promise(resolve => setImmediate(resolve));
-      assert.equal(reloaded, false, "wait for JupyterLite's existing service-worker registration");
-      resolveReady();
-      await new Promise(resolve => setImmediate(resolve));
-      assert.equal(reloaded, false, "wait for the service worker to control the first page");
-
-      controller = {};
-      for (const listener of listeners) listener();
-      await new Promise(resolve => setImmediate(resolve));
-      assert.equal(reloaded, true, `${hostname} should reload after the service worker takes control`);
-
-      reloaded = false;
-      vm.runInContext(script, context);
-      await new Promise(resolve => setImmediate(resolve));
-      assert.equal(reloaded, true, `${hostname} should retry when the first reload is not isolated`);
-
-      reloaded = false;
-      vm.runInContext(script, context);
-      await new Promise(resolve => setImmediate(resolve));
-      assert.equal(reloaded, true, `${hostname} should allow a third navigation`);
-
-      reloaded = false;
-      vm.runInContext(script, context);
-      await new Promise(resolve => setImmediate(resolve));
-      assert.equal(reloaded, false, "reload retries must be bounded");
+      context.window = context;
+      return {
+        context,
+        registrations,
+        errors,
+        sessionValues,
+        setController(value) { controller = value; },
+        controllerChanged() { for (const listener of listeners) listener(); },
+        get controllerListeners() { return listeners.size; },
+        get reloads() { return reloads; },
+      };
     }
 
-    const legacyHtml = html.replace(
-      'if (!(location.hostname.endsWith(".readthedocs.io") || location.hostname.endsWith(".github.io")) || !("serviceWorker" in navigator)) return;',
-      'if (!location.hostname.endsWith(".readthedocs.io") || crossOriginIsolated',
+    for (const [hostname, href, scope] of [
+      ["datax-now.readthedocs.io", "https://datax-now.readthedocs.io/en/latest/_static/lab/index.html", "/en/latest/_static/"],
+      ["datax-now.github.io", "https://datax-now.github.io/go/lab/index.html", "/go/"],
+    ]) {
+      let resolveReady;
+      const ready = new Promise(resolve => { resolveReady = resolve; });
+      const page = createPage(hostname, href, ready);
+      vm.runInContext(bootstrap, page.context);
+      vm.runInContext(appLoader, page.context);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(page.context.dataxAppStarted, undefined, `${hostname} must not start JupyterLite before service-worker control`);
+      assert.equal(page.registrations.length, 1);
+      assert.equal(page.registrations[0].url, new URL("../service-worker.js?enableCache=true", href).href);
+      assert.equal(page.registrations[0].options.scope, scope);
+
+      resolveReady({});
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(
+        page.errors.length,
+        0,
+        `${hostname} should not fail while waiting for service-worker control: ${page.errors.join("; ")}`,
+      );
+      assert.equal(page.reloads, 0, `${hostname} should wait until the service worker controls the page`);
+      assert.equal(page.controllerListeners, 1, `${hostname} should be waiting for controllerchange`);
+      page.setController({});
+      page.controllerChanged();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(
+        page.errors.length,
+        0,
+        `${hostname} should not fail after controllerchange: ${page.errors.join("; ")}`,
+      );
+      assert.equal(page.reloads, 1, `${hostname} should reload after the service worker takes control`);
+      assert.equal(page.context.dataxAppStarted, undefined, `${hostname} must not start JupyterLite in the reloading document`);
+      assert.equal(page.errors.length, 0);
+
+      page.context.crossOriginIsolated = true;
+      vm.runInContext(bootstrap, page.context);
+      vm.runInContext(appLoader, page.context);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(page.context.dataxAppStarted, true, `${hostname} should start JupyterLite after isolation is available`);
+      assert.equal(page.sessionValues.size, 0, "successful isolation should clear the retry counter");
+    }
+
+    const exhaustedState = new Map([["datax-static-host-isolation-attempts-v2", "3"]]);
+    const exhausted = createPage(
+      "datax-now.github.io",
+      "https://datax-now.github.io/go/lab/index.html",
+      Promise.resolve({}),
+      exhaustedState,
     );
-    assert.notEqual(legacyHtml, html, "the generated bootstrap should include both static hosts");
-    writeFileSync(appPath, legacyHtml);
-    const upgrade = spawnSync("python3", ["-c", staticHostBootstrapPatch], { cwd: directory, encoding: "utf8" });
-    assert.equal(upgrade.status, 0, upgrade.stderr);
-    assert.match(readFileSync(appPath, "utf8"), /\.github\.io/);
-    assert.match(readFileSync(appPath, "utf8"), /attempts >= 3/);
+    vm.runInContext(bootstrap, exhausted.context);
+    vm.runInContext(appLoader, exhausted.context);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(exhausted.context.dataxAppStarted, undefined, "the app must stay stopped if isolation cannot be enabled");
+    assert.equal(exhausted.errors.length, 1, "the blocked app should report an explicit error");
+    assert.equal(exhausted.sessionValues.size, 0, "the user should be able to retry after reloading");
+
+    const preview = createPage(
+      "datax-preview.vercel.app",
+      "https://datax-preview.vercel.app/lab/index.html",
+      Promise.resolve({}),
+    );
+    vm.runInContext(bootstrap, preview.context);
+    vm.runInContext(appLoader, preview.context);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(preview.context.dataxAppStarted, true, "direct-header deployments should not wait for a service worker reload");
+    assert.equal(preview.registrations.length, 0);
+
+    const patchedAgain = spawnSync("python3", ["-c", staticHostBootstrapPatch], { cwd: directory, encoding: "utf8" });
+    assert.equal(patchedAgain.status, 0, patchedAgain.stderr);
+    const upgradedHtml = readFileSync(appPath, "utf8");
+    assert.equal(upgradedHtml.split('id="datax-rtd-coep-bootstrap"').length - 1, 1);
+    assert.equal(upgradedHtml.split("datax-rtd-coep-loader-gate").length - 1, 1);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

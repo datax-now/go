@@ -43,9 +43,12 @@ cross-origin isolation headers required by the WebAssembly runtime. Vercel and
 Cloudflare set these headers directly. Read the Docs provides COOP, so its
 service worker adds COEP to controlled app navigations; GitHub Pages provides
 neither header, so the service worker adds both. On a first visit to either
-static host, the app waits for JupyterLite's service worker to take control and
-reloads until cross-origin isolation is available (up to three attempts). This
-also covers a host that needs a second controlled navigation to add COEP. The
+static host, a preflight registers the service worker and waits for it to
+control the page before JupyterLite starts. The app loader stays paused while
+controlled navigations retry (up to three attempts) until cross-origin
+isolation is available, so notebooks and warmed kernels are not started in a
+document that is about to reload. If isolation still cannot be enabled, the
+page reports an error instead of starting a kernel that cannot work. The
 service worker also adds COEP and CORP to dedicated-worker script responses
 (such as `coincident.worker.*.js`), which Chrome blocks otherwise.
 Generated web-manifest shortcuts use relative URLs so they stay within the
