@@ -190,6 +190,52 @@ function installOfflineCache(assets) {
   });
 }
 
+// Upstream JupyterLite activates and claims every update immediately, which switches a page that is still
+// starting the previous cached release onto the new release's assets. Updates instead wait until a page
+// can reload before starting, or until every app tab has closed.
+function installUpdateLifecycle() {
+  if (typeof self.skipWaiting !== 'function') return;
+  const skipWaiting = self.skipWaiting.bind(self);
+  self.skipWaiting = () => Promise.resolve();
+  const scope = new URL('./', self.location.href);
+  const markerCache = 'datax-sw-lifecycle-v1';
+  const markerKey = new URL('datax-sw-lifecycle', scope).href;
+  const inScope = url => {
+    try {
+      const parsed = new URL(url);
+      return parsed.origin === scope.origin && parsed.pathname.startsWith(scope.pathname);
+    } catch { return false; }
+  };
+  async function activeUsesHandshake() {
+    try { return Boolean(await (await caches.open(markerCache)).match(markerKey)); }
+    catch { return false; }
+  }
+  self.addEventListener('install', event => {
+    // First installs must control the page, and pages from releases without the handshake cannot request activation.
+    event.waitUntil((async () => {
+      if (!self.registration?.active || !await activeUsesHandshake()) await skipWaiting();
+    })());
+  });
+  self.addEventListener('activate', event => {
+    event.waitUntil(caches.open(markerCache).then(cache => cache.put(markerKey, new Response(''))).catch(() => {}));
+  });
+  self.addEventListener('message', event => {
+    if (event.data?.type !== 'datax-activate-update') return;
+    const port = event.ports?.[0];
+    const source = event.source;
+    if (!port || !source?.url || !inScope(source.url)) return;
+    event.waitUntil((async () => {
+      let activating = false;
+      try {
+        const windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+        activating = !windows.some(client => client.id !== source.id && inScope(client.url));
+      } catch {}
+      port.postMessage({ type: 'datax-activate-update', activating });
+      if (activating) await skipWaiting();
+    })());
+  });
+}
+
 // Browser timers throw "Illegal invocation" when called as methods of another object.
 function createKernelIdleScheduler(onIdle, delayMs = 300000, now = () => Date.now(),
   timerApi = { setTimeout: (callback, delay) => setTimeout(callback, delay), clearTimeout: id => clearTimeout(id) }) {
@@ -637,4 +683,4 @@ function prepareOffline(directory, sourceDateEpoch = process.env.SOURCE_DATE_EPO
   return assets;
 }
 
-module.exports = { createKernelIdleScheduler, installOfflineCache, installOfflineUI, monitorKernelActivity, offlineStatusText, patchContentsManager, patchServiceWorkerManager, prepareOffline };
+module.exports = { createKernelIdleScheduler, installOfflineCache, installOfflineUI, installUpdateLifecycle, monitorKernelActivity, offlineStatusText, patchContentsManager, patchServiceWorkerManager, prepareOffline };

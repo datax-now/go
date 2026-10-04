@@ -810,6 +810,165 @@ test("static-host app startup waits for an isolated service-worker-controlled pa
   }
 });
 
+test("app startup activates a waiting release before loading and never reloads in a loop", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-release-handshake-"));
+  mkdirSync(join(directory, "dist/lab"), { recursive: true });
+  const appPath = join(directory, "dist/lab/index.html");
+  writeFileSync(appPath, `<!doctype html><html><head>
+<script>
+(async function () {
+  await import('../config-utils.js?_=test');
+}.call(this));
+</script>
+</head><body></body></html>`);
+  try {
+    const result = spawnSync("python3", ["-c", staticHostBootstrapPatch], { cwd: directory, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    const html = readFileSync(appPath, "utf8");
+    const bootstrap = html.match(/<script id="datax-rtd-coep-bootstrap">([\s\S]*?)<\/script>/)[1];
+    const loader = html.match(/<script>([\s\S]*?datax-rtd-coep-loader-gate[\s\S]*?)<\/script>/)[1]
+      .replace(/await import\([\s\S]*?\);/, "globalThis.dataxAppStarted = true;");
+
+    function start(hostname, { waiting = null, reply, sessionValues = new Map() } = {}) {
+      const listeners = new Set();
+      const messages = [];
+      let reloads = 0;
+      const worker = waiting && {
+        postMessage(message, [port]) {
+          messages.push(message);
+          if (reply === undefined) return;
+          setImmediate(() => {
+            port.onmessage?.({ data: reply });
+            if (reply.activating) for (const listener of listeners) listener();
+          });
+        },
+      };
+      const serviceWorker = {
+        controller: {},
+        getRegistration: async () => ({ waiting: worker }),
+        addEventListener(type, listener) { if (type === "controllerchange") listeners.add(listener); },
+        removeEventListener(type, listener) { if (type === "controllerchange") listeners.delete(listener); },
+      };
+      const context = vm.createContext({
+        URL,
+        MessageChannel: class { constructor() { this.port1 = {}; this.port2 = this.port1; } },
+        location: { hostname, href: `https://${hostname}/lab/index.html`, reload() { reloads++; } },
+        navigator: { serviceWorker },
+        crossOriginIsolated: true,
+        sessionStorage: {
+          getItem(key) { return sessionValues.get(key) ?? null; },
+          setItem(key, value) { sessionValues.set(key, String(value)); },
+          removeItem(key) { sessionValues.delete(key); },
+        },
+        console: { error() {}, info() {}, warn() {} },
+        setTimeout,
+        clearTimeout,
+      });
+      context.window = context;
+      vm.runInContext(bootstrap, context);
+      vm.runInContext(loader, context);
+      return {
+        context, messages, sessionValues,
+        get reloads() { return reloads; },
+        get listeners() { return listeners.size; },
+      };
+    }
+    const settle = () => new Promise(resolve => setTimeout(resolve, 20));
+
+    for (const hostname of ["datax-now.readthedocs.io", "datax-now.github.io", "datax-preview.vercel.app"]) {
+      const updated = start(hostname, { waiting: true, reply: { activating: true } });
+      await settle();
+      assert.deepEqual(updated.messages.map(message => message.type), ["datax-activate-update"]);
+      assert.equal(updated.reloads, 1, `${hostname} reloads into the waiting release`);
+      assert.equal(updated.context.dataxAppStarted, undefined, `${hostname} must not start the previous release`);
+      assert.equal(updated.listeners, 0);
+
+      const reloaded = start(hostname, { waiting: true, reply: { activating: true }, sessionValues: updated.sessionValues });
+      await settle();
+      assert.equal(reloaded.messages.length, 0, "a release published during the reload must not cause a reload loop");
+      assert.equal(reloaded.reloads, 0);
+      assert.equal(reloaded.context.dataxAppStarted, true);
+      assert.equal(reloaded.sessionValues.size, 0);
+    }
+
+    const shared = start("datax-now.github.io", { waiting: true, reply: { activating: false } });
+    await settle();
+    assert.equal(shared.reloads, 0, "other open tabs keep the current release");
+    assert.equal(shared.context.dataxAppStarted, true);
+
+    const current = start("datax-now.github.io");
+    await settle();
+    assert.equal(current.messages.length, 0);
+    assert.equal(current.context.dataxAppStarted, true);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("service-worker updates never take over a running page unless the previous release lacks the handshake", async () => {
+  const scope = "https://datax-now.readthedocs.io/en/latest/_static/";
+  const stored = new Map();
+  const cache = {
+    async match(key) { return stored.get(key.url ?? key)?.clone(); },
+    async put(key, response) { stored.set(key.url ?? key, response.clone()); },
+  };
+  function startWorker({ active = null, windows = [] } = {}) {
+    const listeners = {};
+    let skips = 0;
+    const self = {
+      location: { href: scope + "service-worker.js?enableCache=true" },
+      registration: { active },
+      clients: { async matchAll(options) {
+        assert.equal(options.type, "window");
+        assert.equal(options.includeUncontrolled, true);
+        return windows;
+      } },
+      skipWaiting() { skips++; return Promise.resolve(); },
+      addEventListener(type, listener) { (listeners[type] ??= []).push(listener); },
+    };
+    // Upstream JupyterLite's install listener calls skipWaiting directly.
+    self.addEventListener("install", () => self.skipWaiting());
+    const context = vm.createContext({ URL, Response, self, caches: { async open() { return cache; } } });
+    vm.runInContext(`(${offline.installUpdateLifecycle.toString()})();`, context);
+    const dispatch = async (type, extra = {}) => {
+      const tasks = [];
+      for (const listener of listeners[type]) listener({ ...extra, waitUntil(task) { tasks.push(task); } });
+      await Promise.all(tasks);
+    };
+    return { dispatch, get skips() { return skips; } };
+  }
+
+  const first = startWorker();
+  await first.dispatch("install");
+  assert.equal(first.skips, 1, "the first install controls the bootstrap page immediately");
+
+  const legacy = startWorker({ active: {} });
+  await legacy.dispatch("install");
+  assert.equal(legacy.skips, 1, "releases without the handshake keep the previous immediate update");
+  await legacy.dispatch("activate");
+
+  const update = startWorker({ active: {}, windows: [
+    { id: "lab", url: scope + "lab/index.html" },
+    { id: "docs", url: "https://datax-now.readthedocs.io/en/latest/index.html" },
+  ] });
+  await update.dispatch("install");
+  assert.equal(update.skips, 0, "an update must wait instead of replacing assets under a running page");
+
+  const replies = [];
+  const ask = (id, url = scope + "lab/index.html") => update.dispatch("message", {
+    data: { type: "datax-activate-update" }, source: { id, url },
+    ports: [{ postMessage(reply) { replies.push(reply.activating); } }],
+  });
+  await ask("lab");
+  assert.deepEqual(replies, [true], "the only app tab may activate the update before it starts");
+  assert.equal(update.skips, 1);
+  await ask("other");
+  assert.deepEqual(replies, [true, false], "another open app tab keeps the current release");
+  await ask("docs", "https://datax-now.readthedocs.io/en/latest/index.html");
+  assert.deepEqual(replies, [true, false], "pages outside the app scope cannot activate updates");
+  assert.equal(update.skips, 1);
+});
+
 test("runtime cache rejects mismatched bytes and retries without poisoning the hash", async () => {
   const directory = mkdtempSync(join(tmpdir(), "datax-integrity-"));
   const stored = new Map();
@@ -1531,6 +1690,8 @@ test("fingerprints reuse runtime bodies after restart and invalidate binary-only
     writeFileSync(join(directory, "service-worker.js"), "");
     const first = fingerprints.fingerprintRuntime(directory);
     assert.match(first["xeus/runtime.wasm"], /^[a-f0-9]{64}$/);
+    assert.match(readFileSync(join(directory, "service-worker.js"), "utf8"), /datax-activate-update/,
+      "the deployed worker must defer updates until a page can reload");
     const worker = startWorker();
     assert.deepEqual(await Promise.all([load(worker), load(worker)]), ["runtime body", "runtime body"]);
     assert.equal(downloads, 1, "parallel kernels must share the first download");

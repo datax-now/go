@@ -2949,6 +2949,46 @@ content = app_file.read_text()
 marker = 'datax-rtd-coep-bootstrap'
 bootstrap = '''<script id="datax-rtd-coep-bootstrap">
 window.__dataxStaticHostReady = (() => {
+const updateReloadKey = "datax-sw-update-reload";
+// A release update waits for this page instead of taking over mid-startup; activate it before JupyterLite loads.
+async function activateWaitingRelease() {
+  const serviceWorker = navigator.serviceWorker;
+  const reloaded = sessionStorage.getItem(updateReloadKey) === "1";
+  sessionStorage.removeItem(updateReloadKey);
+  const registration = await serviceWorker.getRegistration();
+  const waiting = registration && registration.waiting;
+  if (!waiting || reloaded) return false;
+  let onControllerChange;
+  const controllerChanged = new Promise(resolve => {
+    onControllerChange = resolve;
+    serviceWorker.addEventListener("controllerchange", onControllerChange);
+  });
+  try {
+    const reply = await new Promise(resolve => {
+      const channel = new MessageChannel();
+      const timeout = setTimeout(() => resolve(null), 5000);
+      channel.port1.onmessage = event => {
+        clearTimeout(timeout);
+        resolve(event.data);
+      };
+      waiting.postMessage({ type: "datax-activate-update" }, [channel.port2]);
+    });
+    if (!reply || !reply.activating) {
+      console.info("[DataX.now] A new release is ready. Close other DataX.now tabs, then reload to use it.");
+      return false;
+    }
+    let timeout;
+    await Promise.race([controllerChanged, new Promise(resolve => { timeout = setTimeout(resolve, 10000); })]);
+    clearTimeout(timeout);
+  } finally {
+    serviceWorker.removeEventListener("controllerchange", onControllerChange);
+  }
+  sessionStorage.setItem(updateReloadKey, "1");
+  console.info("[DataX.now] Reloading to start the new release.");
+  location.reload();
+  return true;
+}
+function prepareStaticHost() {
   const hostname = location.hostname;
   const staticHost = hostname.endsWith(".readthedocs.io") || hostname.endsWith(".github.io");
   if (!staticHost) return Promise.resolve(true);
@@ -3046,6 +3086,20 @@ window.__dataxStaticHostReady = (() => {
       return false;
     }
   })();
+}
+return (() => {
+  const serviceWorker = navigator.serviceWorker;
+  if (!serviceWorker || !serviceWorker.controller || typeof serviceWorker.getRegistration !== "function") {
+    return prepareStaticHost();
+  }
+  return activateWaitingRelease().then(
+    reloading => reloading ? false : prepareStaticHost(),
+    error => {
+      console.warn("[DataX.now] Could not apply the waiting release before startup.", error);
+      return prepareStaticHost();
+    },
+  );
+})();
 })();
 </script>'''
 

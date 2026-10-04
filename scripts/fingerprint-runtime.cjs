@@ -181,7 +181,8 @@ function fingerprintRuntime(directory, mirrorOrigins = DEFAULT_MIRROR_ORIGINS, b
   visit(runtime);
   const source = fs.readFileSync(worker, 'utf8').split(marker)[0];
   fs.writeFileSync(worker, source + marker + `(${installRuntimeCache.toString()})(${JSON.stringify(hashes)}, ${JSON.stringify(mirrorOrigins)}, ${JSON.stringify(buildCommit)}, ${JSON.stringify(assetHashes)});\n` +
-    `(${offline.installOfflineCache.toString()})(${JSON.stringify(assets)});\n`);
+    `(${offline.installOfflineCache.toString()})(${JSON.stringify(assets)});\n` +
+    `(${offline.installUpdateLifecycle.toString()})();\n`);
   console.log(`Fingerprinted ${Object.keys(hashes).length} runtime files for cache-first reuse`);
   return hashes;
 }

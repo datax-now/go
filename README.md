@@ -97,6 +97,16 @@ document that is about to reload. If isolation still cannot be enabled, the
 page reports an error instead of starting a kernel that cannot work. The
 service worker also adds COEP and CORP to dedicated-worker script responses
 (such as `coincident.worker.*.js`), which Chrome blocks otherwise.
+A new release's service worker never takes over a page that is already running:
+cached app assets are served cache-first, so a first visit after a deployment
+starts the previous release, and an immediate takeover would replace its assets
+during kernel startup and leave the kernel stuck initializing. The new worker
+waits instead. On the next load of the lab app, before JupyterLite starts, the
+page asks the waiting worker to activate and reloads into the new release. It
+does this only when no other app tab in the same scope is open; otherwise the
+update applies once those tabs close. A reload guard prevents loops. The first
+install still takes control immediately. Workers from releases without this
+handshake are still replaced immediately, one last time.
 Generated web-manifest shortcuts use relative URLs so they stay within the
 deployment path on Read the Docs and GitHub Pages.
 
