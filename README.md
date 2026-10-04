@@ -243,7 +243,10 @@ The kernel's conda-to-PyPI name mapping is also bundled locally. Its build input
 `scripts/conda-pypi-mapping.json`, is a snapshot of prefix-dev/parselmouth's
 `files/compressed_mapping.json` at commit
 `345e9bfbd11d932d63df2bc1146511337f7ba5dd`; kernel startup does not fetch it from
-GitHub.
+GitHub. The page and the kernel worker each load the mapping once per session,
+so the build patches that request to retry network failures after 1, 2, 4 and 8
+seconds; a single dropped request would otherwise break package installation
+until reload.
 
 Downloads are SHA-256 verified and reuse already cached files. An interrupted
 download can be retried without starting over. Failed downloads or insufficient
@@ -327,6 +330,16 @@ failed is not contacted again for 60 seconds, so a blocked host costs one round
 trip rather than one per file. For offline downloads, a mirror is accepted only
 when its manifest records the exact hash expected by this build; mismatched
 files are skipped, even if the mirror reports the same commit.
+
+If no mirror can supply the file (for example, the mirrors run another release,
+or Read the Docs challenges cross-origin requests), the worker retries the
+current host after 1, 2, 4 and 8 seconds before surfacing the failure. A
+transient GitHub Pages or Read the Docs rate limit during a cold start then
+delays the asset instead of failing it. A host rate limit usually appears as an
+SRI failure, because the browser checks integrity against the error page. One
+download is shared by every request for the same asset. It is not tied to the
+first requester, so a reload or closed worker cannot cancel the download for the
+next page.
 
 The browser can log an SRI failure for the original RTD response even when a
 verified mirror subsequently supplies the correct file. That console message

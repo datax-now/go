@@ -22,6 +22,8 @@ function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null, ass
   const manifests = new Map();
   const coolingUntil = new Map();
   const cooldownMs = 60000;
+  // When no mirror can serve a file, transient local failures (rate limits, resets) get a bounded retry.
+  const localRetryDelaysMs = [1000, 2000, 4000, 8000];
   const integrityOf = hex => 'sha256-' + btoa(String.fromCharCode(...hex.match(/../g).map(byte => parseInt(byte, 16))));
   const isCooling = origin => (coolingUntil.get(origin) ?? 0) > Date.now();
   const cool = origin => coolingUntil.set(origin, Date.now() + cooldownMs);
@@ -66,15 +68,23 @@ function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null, ass
     if (!isDeployment || !mirrorPath) return fetchOriginal();
     let failedResponse = null;
     let failedError = null;
-    if (!isCooling(url.origin)) {
+    async function tryOriginal() {
       try {
         const response = await fetchOriginal();
         if (!isBlocked(response)) return response;
         failedResponse = response;
+        failedError = null;
       } catch (error) {
         if (error?.name !== 'TypeError') throw error;
         failedError = error;
+        failedResponse = null;
       }
+      return null;
+    }
+    const triedOriginal = !isCooling(url.origin);
+    if (triedOriginal) {
+      const response = await tryOriginal();
+      if (response) return response;
       cool(url.origin);
     }
     for (const base of mirrors) {
@@ -98,9 +108,13 @@ function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null, ass
         cool(base.origin);
       }
     }
+    for (const delay of triedOriginal ? localRetryDelaysMs : [0, ...localRetryDelaysMs]) {
+      if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+      const response = await tryOriginal();
+      if (response) return response;
+    }
     if (failedResponse) return failedResponse;
-    if (failedError) throw failedError;
-    return fetchOriginal();
+    throw failedError;
   }
   self.dataxFetchOfflineAsset = request => fetchWithMirrors(request, () => fetch(request));
   async function fetchRuntime(request) {
@@ -125,7 +139,8 @@ function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null, ass
     // Older entries may contain mirror bytes verified against a different build's hash.
     key.searchParams.set('verified', 'local');
     const integrity = integrityOf(hash);
-    const verifiedRequest = new Request(request, { integrity, cache: 'no-cache' });
+    // Concurrent requests share this download, so one client's abort (reload, closed worker) must not cancel it.
+    const verifiedRequest = new Request(request, { integrity, cache: 'no-cache', signal: null });
     let cache;
     try {
       cache = await caches.open(cacheName);

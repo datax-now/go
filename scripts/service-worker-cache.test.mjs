@@ -1161,13 +1161,18 @@ artifact.unpack(root / "site.tar.gz", root / "rtd", sys.argv[3])
 
   const scope = "https://datax-now.readthedocs.io/en/latest/_static/";
   const mirror = "https://datax-now.github.io/go/";
+  let localAttempts = 0;
   const context = vm.createContext({
     URL, Request, Response, Headers, btoa, hashes,
+    setTimeout: callback => setImmediate(callback),
     self: { location: { href: scope + "service-worker.js?enableCache=true" } },
     caches: { async open() { throw new Error("cold profile"); } },
     async maybeFromCache(event) { return context.fetch(event.request); },
     async fetch(request) {
-      if (request.url.startsWith(scope)) throw new TypeError("Failed to fetch. SRI's integrity checks failed.");
+      if (request.url.startsWith(scope)) {
+        localAttempts++;
+        throw new TypeError("Failed to fetch. SRI's integrity checks failed.");
+      }
       if (request.url.endsWith("deployment.json")) return new Response(JSON.stringify(manifest));
       return fetch("data:application/octet-stream;base64," + bytes.toString("base64"), { integrity: request.integrity });
     },
@@ -1178,6 +1183,7 @@ artifact.unpack(root / "site.tar.gz", root / "rtd", sys.argv[3])
   vm.runInContext(install, context);
   const event = { request: new Request(scope + relative), waitUntil() {} };
   await assert.rejects(context.maybeFromCache(event), /SRI's integrity checks failed/);
+  assert.equal(localAttempts, 5, "a local failure is retried a bounded number of times before surfacing");
   context.hashes = hashes;
   vm.runInContext(install, context);
   const response = await context.maybeFromCache(event);
@@ -1344,6 +1350,101 @@ test("failed hosts fail over in priority order, skipping mismatched mirrors and 
   assert.equal(await (await load()).text(), bytes);
   assert.deepEqual(requests, [`https://datax-now.github.io/go/${runtimePath}`],
     "the preferred host is used again once its cooldown expires");
+});
+
+test("transient local failures are retried when no mirror can serve the file", async () => {
+  const assetPath = "conda-pypi-mapping.json";
+  const bytes = '{"numpy":"numpy"}';
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  const requests = [];
+  const delays = [];
+  let localFailures = 2;
+  const context = vm.createContext({
+    URL, Request, Response, Headers, btoa,
+    setTimeout(callback, delay) { delays.push(delay); setImmediate(callback); },
+    location: { href: "https://datax-now.github.io/go/service-worker.js" },
+    caches: { async open() { throw new Error("cache disabled"); } },
+    async fetch(request) {
+      requests.push(request.url);
+      const url = new URL(request.url);
+      if (url.origin === "https://datax-now.github.io") {
+        // A host rate limit fails SRI before the status is visible to the worker.
+        if (localFailures-- > 0) throw new TypeError("Failed to fetch. SRI's integrity checks failed.");
+        return fetch(`data:application/json,${encodeURIComponent(bytes)}`, { integrity: request.integrity });
+      }
+      if (url.origin === "https://datax-now.readthedocs.io") throw new TypeError("Failed to fetch");
+      if (url.pathname === "/deployment.json") return new Response(JSON.stringify({ files: {} }));
+      throw new Error("Unexpected mirror download " + request.url);
+    },
+  });
+  vm.runInContext("maybeFromCache = async event => fetch(event.request)", context);
+  context.self = context;
+  context.mirrors = fingerprints.DEFAULT_MIRROR_ORIGINS;
+  context.assetHashes = { [assetPath]: sha256 };
+  vm.runInContext(`(${fingerprints.installRuntimeCache.toString()})({}, mirrors, null, assetHashes)`, context);
+  const download = request => context.dataxFetchOfflineAsset(new Request(request, {
+    integrity: `sha256-${Buffer.from(sha256, "hex").toString("base64")}`,
+  }));
+
+  const response = await download(`https://datax-now.github.io/go/${assetPath}`);
+  assert.equal(await response.text(), bytes);
+  assert.deepEqual(delays, [1000, 2000], "local retries back off while mirrors are unavailable");
+  assert.equal(requests.filter(url => url.startsWith("https://datax-now.github.io/")).length, 3);
+  assert.ok(!requests.some(url => url === "https://datax.now/" + assetPath),
+    "a mirror on another release is never asked for a file it cannot verify");
+});
+
+test("shared downloads survive the first requester aborting", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-shared-abort-"));
+  const stored = new Map();
+  let release;
+  const released = new Promise(resolve => { release = resolve; });
+  let downloads = 0;
+  try {
+    mkdirSync(join(directory, "xeus"));
+    writeFileSync(join(directory, "xeus/runtime.wasm"), "runtime");
+    writeFileSync(join(directory, "conda-pypi-mapping.json"), "{}");
+    writeFileSync(join(directory, "service-worker.js"), "");
+    fingerprints.fingerprintRuntime(directory, []);
+    const context = vm.createContext({
+      URL, Request, Response, Headers, btoa,
+      self: { addEventListener() {}, location: { href: "https://example.com/service-worker.js?enableCache=true" } },
+      caches: { async open() { return {
+        async match(key) { return stored.get(key)?.clone(); },
+        async put(key, response) { stored.set(key, response.clone()); },
+        async keys() { return [...stored.keys()].map(key => new Request(key)); },
+        async delete(request) { return stored.delete(request.url); },
+      }; } },
+      async maybeFromCache(event) { return context.fetch(event.request); },
+      async fetch(request) {
+        downloads++;
+        await released;
+        if (request.signal.aborted) throw new DOMException("The user aborted a request.", "AbortError");
+        const body = new URL(request.url).pathname === "/xeus/runtime.wasm" ? "runtime" : "{}";
+        return fetch(`data:application/octet-stream,${encodeURIComponent(body)}`, { integrity: request.integrity });
+      },
+    });
+    vm.runInContext(readFileSync(join(directory, "service-worker.js"), "utf8"), context);
+    for (const [pathname, body] of [["xeus/runtime.wasm", "runtime"], ["conda-pypi-mapping.json", "{}"]]) {
+      downloads = 0;
+      const reloaded = new AbortController();
+      const tasks = [];
+      const load = signal => context.maybeFromCache({
+        request: new Request(`https://example.com/${pathname}`, { signal }),
+        waitUntil(task) { tasks.push(task); },
+      });
+      const first = load(reloaded.signal);
+      const second = load();
+      reloaded.abort();
+      release();
+      assert.equal(await (await second).text(), body, `${pathname} must not inherit the first client's abort`);
+      await first.catch(() => {});
+      await Promise.all(tasks);
+      assert.equal(downloads, 1, `${pathname} is downloaded once for both clients`);
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("data directory listings are byte-identical across clean deployments and remain mirror-downloadable", async t => {
@@ -2403,6 +2504,22 @@ test("kernel package mapping is bundled locally for pages and workers on every d
         assert.equal(fetched, "https://example.com" + prefix + "conda-pypi-mapping.json");
       }
     }
+    let attempts = 0;
+    const delays = [];
+    const flaky = vm.createContext({
+      URL,
+      location: { href: "https://example.com/go/" + extension + "worker.js" },
+      setTimeout(callback, delay) { delays.push(delay); setImmediate(callback); },
+      fetch() { return ++attempts < 3 ? Promise.reject(new TypeError("Failed to fetch")) : Promise.resolve("mapping"); },
+    });
+    assert.equal(await vm.runInContext(patched, flaky), "mapping", "a transient failure must not poison the mapping for the session");
+    assert.deepEqual(delays, [1000, 2000]);
+    const previouslyPatched = readFileSync(join(directory, extension, "mapping.js"), "utf8")
+      .replace(/^\(async url=>[\s\S]*?\}\}\}\)\(/, "fetch(");
+    writeFileSync(join(directory, extension, "mapping.js"), previouslyPatched);
+    offline.prepareOffline(directory);
+    assert.equal(readFileSync(join(directory, extension, "mapping.js"), "utf8"), patched,
+      "builds patched before the retry was added are upgraded");
     assert.deepEqual(offline.prepareOffline(directory), assets);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });

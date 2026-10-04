@@ -50,10 +50,11 @@ function installOfflineCache(assets) {
     if (!enabled || !relative || request.method !== 'GET' || request.headers.has('Range')) return original(event);
     const asset = assets[relative];
     const key = keyFor(relative, asset);
+    // No client signal: concurrent requests share the download, and one client's abort must not cancel it.
     const canonical = new Request(new URL(asset.source || relative, scope).href, {
       method: request.method, headers: request.headers, credentials: request.credentials,
       mode: request.mode === 'navigate' ? 'same-origin' : request.mode,
-      redirect: request.redirect, signal: request.signal,
+      redirect: request.redirect,
     });
     if (relative.startsWith('xeus/')) {
       return original({ request: canonical, waitUntil: task => event.waitUntil(task) });
@@ -622,11 +623,15 @@ function prepareOffline(directory, sourceDateEpoch = process.env.SOURCE_DATE_EPO
   if (fs.existsSync(extension)) {
     const remote = '"https://raw.githubusercontent.com/prefix-dev/parselmouth/main/files/compressed_mapping.json"';
     const local = 'new URL("conda-pypi-mapping.json",typeof document==="undefined"?new URL("../../../../",globalThis.location.href):new URL(JSON.parse(document.getElementById("jupyter-config-data").textContent).baseUrl||"../",document.baseURI)).href';
+    // Upstream fetches the mapping once per page and worker; a transient failure would break package installs for the session.
+    const retrying = `(async url=>{for(let attempt=0;;attempt++){try{return await fetch(url)}catch(error){if(attempt>=4)throw error;await new Promise(resolve=>setTimeout(resolve,1000*2**attempt))}}})(${local})`;
     fs.copyFileSync(path.join(__dirname, 'conda-pypi-mapping.json'), path.join(directory, 'conda-pypi-mapping.json'));
     for (const name of fs.readdirSync(extension).filter(name => name.endsWith('.js'))) {
       const filename = path.join(extension, name);
       const source = fs.readFileSync(filename, 'utf8');
-      if (source.includes(remote)) fs.writeFileSync(filename, source.split(remote).join(local));
+      const updated = source.split(`fetch(${remote})`).join(retrying).split(`fetch(${local})`).join(retrying)
+        .split(remote).join(local);
+      if (updated !== source) fs.writeFileSync(filename, updated);
     }
   }
   // Upstream pings the origin root, which is outside the worker scope on subpath deployments.
