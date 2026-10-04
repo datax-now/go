@@ -64,6 +64,60 @@ function patchKernelMessages(source) {
     'kernel initialization failure propagation');
 }
 
+// Kernel worker failures otherwise reach the page only as an empty rejection, so log them inside the worker.
+function patchWorkerStartupErrors(source) {
+  const marker = '/* datax-worker-startup-errors */';
+  if (source.includes(marker)) return source;
+  return replaceOnce(source,
+    /async initialize\(([\w$]+)\)\{let\{baseUrl:/g,
+    (_, options) => `async initialize(${options}){${marker}try{return await this.dataxInitialize(${options})}catch(error){` +
+      `console.error("[DataX.now] Kernel worker failed to start:",error);throw error}}` +
+      `async dataxInitialize(${options}){let{baseUrl:`,
+    'kernel worker initializer');
+}
+
+// Kernel logs only reach JupyterLab's Log Console; warnings and errors are mirrored to the browser console too.
+function patchKernelLogMirror(source) {
+  const marker = '/* datax-kernel-log-mirror */';
+  if (source.includes(marker)) return source;
+  return replaceOnce(source,
+    /([\w$]+)\.getLogger\(([\w$]+)\)\.log\(([\w$]+)\)\}\)/g,
+    (_, registry, logPath, payload) => `${registry}.getLogger(${logPath}).log(${payload});${marker}` +
+      `"critical"===${payload}?.level?console.error("[xeus kernel]",${payload}.data):` +
+      `"warning"===${payload}?.level&&console.warn("[xeus kernel]",${payload}.data)})`,
+    'kernel log forwarding');
+}
+
+// A kernel whose worker failed to start would otherwise stay "starting" forever; restart it a bounded number of times.
+function patchKernelStartupRecovery(source) {
+  const marker = '/* datax-kernel-startup-recovery */';
+  if (source.includes(marker)) return source;
+  return replaceOnce(source,
+    'console.warn("[xeus-startup] failed to capture session-attached snapshot",e)}})}',
+    `console.warn("[xeus-startup] failed to capture session-attached snapshot",e)}}).catch(error=>{${marker}
+      const attempts=globalThis.__dataxKernelStartupAttempts??=new Map(),attempt=(attempts.get(this.id)??0)+1;
+      attempts.set(this.id,attempt);
+      console.error("[DataX.now] Kernel "+this.id+" failed to start (attempt "+attempt+").",error??"");
+      if(attempt>2){console.error("[DataX.now] The kernel keeps failing to start; reload the page to try again.");return}
+      const restart=remaining=>setTimeout(()=>{
+        const shell=(globalThis.jupyter_app??globalThis.jupyterapp)?.shell;
+        for(const area of ["main","down"]){
+          for(const widget of shell?.widgets?.(area)??[]){
+            const kernel=widget.sessionContext?.session?.kernel;
+            if(kernel?.id!==this.id||kernel.isDisposed)continue;
+            console.warn("[DataX.now] Restarting kernel "+this.id+" after a failed start.");
+            kernel.restart().catch(reason=>console.error("[DataX.now] Kernel restart failed.",reason));
+            return;
+          }
+        }
+        if(remaining>1)return restart(remaining-1);
+        console.error("[DataX.now] No open document uses kernel "+this.id+"; restart it from the Kernel menu.");
+      },1000);
+      restart(15);
+    })}`,
+    'kernel startup failure handler');
+}
+
 function patchSocketMessages(source) {
   const marker = '/* datax-iopub-broadcast */';
   if (source.includes(marker)) return source;
@@ -116,6 +170,24 @@ function patchDirectory(directory) {
       existing[1] = source => patchKernelMessages(patch(source));
     } else files.push([file, patchKernelMessages]);
   }
+  const addPatch = (file, patch) => {
+    const existing = files.find(entry => entry[0] === file);
+    if (!existing) return files.push([file, patch]);
+    const previous = existing[1];
+    existing[1] = source => patch(previous(source));
+  };
+  const staticFiles = scripts.map(name => [path.join(workers, name)])
+    .map(([file]) => [file, fs.readFileSync(file, 'utf8')]);
+  const initializers = staticFiles.filter(([, source]) => /async initialize\([\w$]+\)\{let\{baseUrl:/.test(source)
+    || source.includes('/* datax-worker-startup-errors */'));
+  const kernelSessions = staticFiles.filter(([, source]) => source.includes('failed to capture session-attached snapshot'));
+  const logForwarders = staticFiles.filter(([, source]) => source.includes('xeus-kernel-logs-broadcast").addEventListener'));
+  if (!initializers.length || !kernelSessions.length || !logForwarders.length) {
+    throw new Error('Xeus kernel startup diagnostics could not locate their patch targets');
+  }
+  for (const [file] of initializers) addPatch(file, patchWorkerStartupErrors);
+  for (const [file] of kernelSessions) addPatch(file, patchKernelStartupRecovery);
+  for (const [file] of logForwarders) addPatch(file, patchKernelLogMirror);
   const core = path.join(directory, 'build');
   const routers = fs.readdirSync(core).filter(name => name.endsWith('.js'))
     .map(name => path.join(core, name))
@@ -185,7 +257,7 @@ function compactLibraries(directory, suffix = '.asm') {
   return { removedFiles: duplicates.length, savedBytes };
 }
 
-module.exports = { patchWorker, patchRuntime, patchKernelMessages, patchSocketMessages, patchCommInitialization, patchLibraries, patchDirectory, installLibraryAliases, compactLibraries };
+module.exports = { patchWorker, patchRuntime, patchKernelMessages, patchWorkerStartupErrors, patchKernelLogMirror, patchKernelStartupRecovery, patchSocketMessages, patchCommInitialization, patchLibraries, patchDirectory, installLibraryAliases, compactLibraries };
 if (require.main === module) {
   if (process.argv[3] === '--compact') compactLibraries(process.argv[2] || 'dist', process.env.SAFE_ASM_EXT || '.asm');
   else patchDirectory(process.argv[2] || 'dist');

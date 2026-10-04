@@ -13,6 +13,7 @@ import offline from "./offline-cache.cjs";
 import { createDeploymentManifest } from "./deployment-manifest.mjs";
 
 const root = new URL("../", import.meta.url);
+const serviceWorkerGlobals = { AbortController, Headers, atob, btoa, crypto: globalThis.crypto, setTimeout, clearTimeout, console };
 test("first-visit service-worker management preserves isolation and survives blocked updates", async t => {
   const source = `const version="1.0"; class Manager {
     async _initialize(e){let{serviceWorker:t}=navigator,s=null;
@@ -370,7 +371,7 @@ test("all deployment hosts publish the same on-demand DataX runtime config", asy
     const mirrorHash = createHash("sha256").update(configs[1]).digest("hex");
     const stored = new Map();
     let message;
-    const context = vm.createContext({
+    const context = vm.createContext({ ...serviceWorkerGlobals,
       URL, Request, Response, Headers, btoa,
       assets: { [relative]: { sha256, size: Buffer.byteLength(configs[2]) } },
       hashes: { [relative]: sha256 },
@@ -980,7 +981,7 @@ test("runtime cache rejects mismatched bytes and retries without poisoning the h
     writeFileSync(join(directory, "xeus/runtime.wasm"), "current deployment");
     writeFileSync(join(directory, "service-worker.js"), "");
     fingerprints.fingerprintRuntime(directory);
-    const context = vm.createContext({
+    const context = vm.createContext({ ...serviceWorkerGlobals,
       URL, Request, Response, btoa,
       self: { addEventListener() {}, location: { href: "https://example.com/service-worker.js?enableCache=true" } },
       caches: { async open() { return {
@@ -1003,7 +1004,7 @@ test("runtime cache rejects mismatched bytes and retries without poisoning the h
       request: new Request("https://example.com/xeus/runtime.wasm"),
       waitUntil(task) { tasks.push(task); },
     };
-    await assert.rejects(context.maybeFromCache(event), /fetch failed/);
+    await assert.rejects(context.maybeFromCache(event), /Integrity check failed/);
     await Promise.all(tasks);
     assert.equal(stored.size, 0);
     body = "current deployment";
@@ -1054,7 +1055,7 @@ for host, timestamp, owner in [("rtd", 1700000000, 1000), ("github", 1800000000,
   const localBytes = readFileSync(join(directory, "rtd", relative));
   const mirrorBytes = readFileSync(join(directory, "github", relative));
   const requests = [];
-  const context = vm.createContext({
+  const context = vm.createContext({ ...serviceWorkerGlobals,
     URL, Request, Response, Headers, btoa, hashes: localHashes,
     self: { location: { href: scope + "service-worker.js?enableCache=true" } },
     caches: { async open() { throw new Error("cache unavailable in a cold profile"); } },
@@ -1111,7 +1112,7 @@ test("RTD cold kernel metadata recovers from independently ordered mirror enviro
   assert.deepEqual(fingerprints.fingerprintRuntime(join(directory, "rtd"), [mirror]), hashes);
   assert.deepEqual(readFileSync(join(directory, "rtd", relative)), localBytes, "normalization must be idempotent");
   const mirrorBytes = readFileSync(join(directory, "github", relative));
-  const context = vm.createContext({
+  const context = vm.createContext({ ...serviceWorkerGlobals,
     URL, Request, Response, Headers, btoa, hashes,
     self: { location: { href: scope + "service-worker.js?enableCache=true" } },
     caches: { async open() { throw new Error("cache unavailable in a cold profile"); } },
@@ -1162,9 +1163,9 @@ artifact.unpack(root / "site.tar.gz", root / "rtd", sys.argv[3])
   const scope = "https://datax-now.readthedocs.io/en/latest/_static/";
   const mirror = "https://datax-now.github.io/go/";
   let localAttempts = 0;
-  const context = vm.createContext({
+  const context = vm.createContext({ ...serviceWorkerGlobals,
     URL, Request, Response, Headers, btoa, hashes,
-    setTimeout: callback => setImmediate(callback),
+    setTimeout: (callback, delay) => delay >= 10000 ? setTimeout(callback, delay) : setImmediate(callback),
     self: { location: { href: scope + "service-worker.js?enableCache=true" } },
     caches: { async open() { throw new Error("cold profile"); } },
     async maybeFromCache(event) { return context.fetch(event.request); },
@@ -1193,12 +1194,11 @@ artifact.unpack(root / "site.tar.gz", root / "rtd", sys.argv[3])
 test("RTD challenges retry fingerprinted runtime assets and the web manifest", async () => {
   const requests = [];
   const packageHash = createHash("sha256").update("verified package").digest("hex");
-  const packageIntegrity = `sha256-${Buffer.from(packageHash, "hex").toString("base64")}`;
   const packagePath = "xeus/xeus-python-wasm-host/kernel_packages/openssl-4.0.2-hb2bca66_0.tar.gz";
   const runtimePath = "xeus/xeus-python-wasm-host/xpython.wasm";
   let failRtdRequest = false;
   let clock = 0;
-  const context = vm.createContext({
+  const context = vm.createContext({ ...serviceWorkerGlobals,
     URL, Request, Response, Headers, btoa,
     Date: { now: () => clock },
     location: { href: "https://datax-now.readthedocs.io/en/latest/_static/service-worker.js" },
@@ -1249,7 +1249,7 @@ test("RTD challenges retry fingerprinted runtime assets and the web manifest", a
   assert.equal(requests[2].mode, "cors");
   assert.equal(requests[2].credentials, "omit");
   assert.equal(requests[2].headers.has("Authorization"), false);
-  assert.equal(requests[2].integrity, packageIntegrity, "mirror bytes must match this build's hash");
+  assert.equal(requests[2].integrity, "", "the worker verifies mirror bytes itself so download progress stays observable");
 
   clock += 61000;
   const manifest = await context.maybeFromCache({
@@ -1271,7 +1271,7 @@ test("RTD challenges retry fingerprinted runtime assets and the web manifest", a
   });
   assert.equal(runtime.status, 200);
   assert.equal(new URL(requests[6].url).href, "https://datax-now.github.io/go/xeus/xeus-python-wasm-host/xpython.wasm");
-  assert.equal(requests[6].integrity, packageIntegrity, "runtime mirror response remains integrity-checked");
+  assert.equal(requests[6].integrity, "", "runtime mirror bytes are verified by the worker, not by SRI");
 
   const unrelated = await context.maybeFromCache({
     request: new Request("https://datax-now.readthedocs.io/en/latest/_static/jupyter-lite.json"),
@@ -1306,7 +1306,7 @@ test("failed hosts fail over in priority order, skipping mismatched mirrors and 
     "https://datax.now/deployment.json": { commit: release, files: { [runtimePath]: { sha256: "c".repeat(64) } } },
     "https://datax-now.pages.dev/deployment.json": { commit: release, files: { [runtimePath]: { sha256 } } },
   };
-  const context = vm.createContext({
+  const context = vm.createContext({ ...serviceWorkerGlobals,
     URL, Request, Response, Headers, btoa,
     Date: { now: () => clock },
     location: { href: "https://datax-now.github.io/go/service-worker.js" },
@@ -1359,9 +1359,9 @@ test("transient local failures are retried when no mirror can serve the file", a
   const requests = [];
   const delays = [];
   let localFailures = 2;
-  const context = vm.createContext({
+  const context = vm.createContext({ ...serviceWorkerGlobals,
     URL, Request, Response, Headers, btoa,
-    setTimeout(callback, delay) { delays.push(delay); setImmediate(callback); },
+    setTimeout(callback, delay) { if (delay >= 10000) return setTimeout(callback, delay); delays.push(delay); setImmediate(callback); },
     location: { href: "https://datax-now.github.io/go/service-worker.js" },
     caches: { async open() { throw new Error("cache disabled"); } },
     async fetch(request) {
@@ -1406,7 +1406,7 @@ test("shared downloads survive the first requester aborting", async () => {
     writeFileSync(join(directory, "conda-pypi-mapping.json"), "{}");
     writeFileSync(join(directory, "service-worker.js"), "");
     fingerprints.fingerprintRuntime(directory, []);
-    const context = vm.createContext({
+    const context = vm.createContext({ ...serviceWorkerGlobals,
       URL, Request, Response, Headers, btoa,
       self: { addEventListener() {}, location: { href: "https://example.com/service-worker.js?enableCache=true" } },
       caches: { async open() { return {
@@ -1503,7 +1503,7 @@ test("offline inventories normalize generated listing timestamps and HTML cache 
   const assets = inventories[0];
   const stored = new Map();
   let message;
-  const context = vm.createContext({
+  const context = vm.createContext({ ...serviceWorkerGlobals,
     URL, Request, Response, Headers, btoa, assets,
     self: {
       location: { href: scope + "service-worker.js?enableCache=true" },
@@ -1602,7 +1602,7 @@ test("mirrors on another release serve byte-identical runtime files", async () =
   const bytes = "shared library";
   const sha256 = createHash("sha256").update(bytes).digest("hex");
   const requests = [];
-  const context = vm.createContext({
+  const context = vm.createContext({ ...serviceWorkerGlobals,
     URL, Request, Response, Headers, btoa, Date,
     location: { href: "https://datax-now.readthedocs.io/en/latest/_static/service-worker.js" },
     caches: { async open() { throw new Error("cache disabled"); } },
@@ -1632,7 +1632,13 @@ test("mirrors on another release serve byte-identical runtime files", async () =
 
 test("hosts outside the deployment set never fail over", async () => {
   const requests = [];
-  const context = vm.createContext({
+  const delays = [];
+  const context = vm.createContext({ ...serviceWorkerGlobals,
+    setTimeout(callback, delay) {
+      if (delay >= 10000) return setTimeout(callback, delay);
+      delays.push(delay);
+      return setTimeout(callback, 0);
+    },
     URL, Request, Response, Headers, btoa,
     location: { href: "http://localhost:8000/service-worker.js" },
     async fetch(request) { requests.push(request.url); return new Response("", { status: 503 }); },
@@ -1647,7 +1653,9 @@ test("hosts outside the deployment set never fail over", async () => {
     waitUntil() {},
   });
   assert.equal(response.status, 503);
-  assert.deepEqual(requests, ["http://localhost:8000/xeus/runtime.wasm"]);
+  // The host retries its own file locally but never contacts the public mirrors.
+  assert.deepEqual(new Set(requests), new Set(["http://localhost:8000/xeus/runtime.wasm"]));
+  assert.deepEqual(delays, [1000, 2000, 4000, 8000]);
 });
 
 test("range requests bypass both runtime and upstream caches", async () => {
@@ -1759,7 +1767,7 @@ test("fingerprints reuse runtime bodies after restart and invalidate binary-only
     async delete(request) { return stored.delete(request.url); },
   };
   function startWorker() {
-    const context = vm.createContext({
+    const context = vm.createContext({ ...serviceWorkerGlobals,
       URL, Request, Response, btoa,
       enableCache: false,
       self: { addEventListener() {}, location: { href: "https://example.com/_static/service-worker.js?enableCache=true" } },
@@ -1768,7 +1776,7 @@ test("fingerprints reuse runtime bodies after restart and invalidate binary-only
       async fetch(request) {
         if (request.headers.has("Range")) return new Response("part", { status: 206 });
         downloads++;
-        return new Response("runtime body");
+        return new Response(readFileSync(join(directory, "xeus/runtime.wasm")));
       },
     });
     vm.runInContext(readFileSync(join(directory, "service-worker.js"), "utf8"), context);
@@ -1794,9 +1802,9 @@ test("fingerprints reuse runtime bodies after restart and invalidate binary-only
     assert.match(readFileSync(join(directory, "service-worker.js"), "utf8"), /datax-activate-update/,
       "the deployed worker must defer updates until a page can reload");
     const worker = startWorker();
-    assert.deepEqual(await Promise.all([load(worker), load(worker)]), ["runtime body", "runtime body"]);
+    assert.deepEqual(await Promise.all([load(worker), load(worker)]), ["binary-v1", "binary-v1"]);
     assert.equal(downloads, 1, "parallel kernels must share the first download");
-    assert.equal(await load(startWorker()), "runtime body");
+    assert.equal(await load(startWorker()), "binary-v1");
     assert.equal(downloads, 1, "reload must transfer no runtime body");
     assert.equal(await load(worker, "xeus/runtime.wasm", { headers: { Range: "bytes=0-3" } }), "part");
     assert.equal(await load(worker, "jupyter-lite.json"), "fallback");
@@ -1805,12 +1813,12 @@ test("fingerprints reuse runtime bodies after restart and invalidate binary-only
     const second = fingerprints.fingerprintRuntime(directory);
     assert.notEqual(first["xeus/runtime.wasm"], second["xeus/runtime.wasm"]);
     assert.equal(first["xeus/runtime.js"], second["xeus/runtime.js"]);
-    assert.equal(await load(startWorker()), "runtime body");
+    assert.equal(await load(startWorker()), "binary-v2");
     assert.equal(downloads, 2, "changed binary must download once");
     assert.equal(stored.size, 1, "superseded versions of this file must be removed");
     const failing = startWorker();
     failing.caches.open = async () => { throw new Error("Storage unavailable"); };
-    assert.equal(await load(failing), "runtime body");
+    assert.equal(await load(failing), "binary-v2");
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -1906,7 +1914,7 @@ test("offline downloads recover indexed assets from mirrors only when their hash
     async keys() { return [...stored.keys()].map(key => new Request(key)); },
     async delete(key) { return stored.delete(key.url ?? key); },
   };
-  const context = vm.createContext({
+  const context = vm.createContext({ ...serviceWorkerGlobals,
     URL, Request, Response, Headers, btoa, assets, hashes, mirrorHashes,
     mirrors: [mirror], buildCommit: "a".repeat(40),
     self: {
@@ -2041,7 +2049,7 @@ test("offline upgrades ignore old runtime entries without losing verified applic
   ]);
   const listeners = {};
   const downloads = [];
-  const context = vm.createContext({
+  const context = vm.createContext({ ...serviceWorkerGlobals,
     URL, Request, Response, Headers, btoa, assets,
     hashes: { "xeus/runtime.wasm": assets["xeus/runtime.wasm"].sha256 },
     self: {
@@ -2103,7 +2111,7 @@ test("offline downloads resume, verify every asset, and survive worker restarts"
   };
   function startWorker() {
     let message;
-    const context = vm.createContext({
+    const context = vm.createContext({ ...serviceWorkerGlobals,
       URL, Request, Response, btoa, assets,
       self: { location: { href: scope + "service-worker.js?enableCache=true" }, addEventListener(type, listener) { if (type === "message") message = listener; } },
       caches: { async open() { return cache; } },
@@ -2113,7 +2121,7 @@ test("offline downloads resume, verify every asset, and survive worker restarts"
         const relative = new URL(request.url).pathname.slice(new URL(scope).pathname.length);
         downloads.push(relative);
         if (relative === fail) return new Response("unavailable", { status: 503 });
-        assert.equal(request.integrity, "sha256-" + Buffer.from(assets[relative].sha256, "hex").toString("base64"));
+        assert.equal(request.integrity, "", "the worker verifies bytes itself so stalled downloads are detected");
         return new Response(bodies[relative]);
       },
     });
@@ -2180,7 +2188,7 @@ test("offline-ready installs cache the next release before activating and prune 
     const assets = Object.fromEntries(Object.entries(bodies).map(([relative, body]) => [relative, {
       sha256: createHash("sha256").update(body).digest("hex"), size: body.length,
     }]));
-    const context = vm.createContext({
+    const context = vm.createContext({ ...serviceWorkerGlobals,
       URL, Request, Response, btoa, assets,
       self: { location: { href: scope + "service-worker.js?enableCache=true" }, addEventListener(type, listener) { listeners[type] = listener; } },
       caches: { async open() { return cache; } },
@@ -2600,7 +2608,7 @@ test("RTD offline download completes despite unavailable timestamped diagnostics
     async delete(key) { return stored.delete(key.url ?? key); },
   };
   let message;
-  const context = vm.createContext({
+  const context = vm.createContext({ ...serviceWorkerGlobals,
     URL, Request, Response, Headers, btoa, assets, hashes, assetHashes, mirrors: [mirror],
     self: {
       location: { href: scope + "service-worker.js?enableCache=true" },
@@ -2788,4 +2796,191 @@ test("service worker caches across restarts and revalidates without runtime bodi
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+function stallHarness({ location = "https://example.com/service-worker.js?enableCache=true", mirrors = [], respond }) {
+  const watchdogs = new Map();
+  const retryDelays = [];
+  const warnings = [];
+  const requests = [];
+  const stored = new Map();
+  let nextTimer = 1;
+  const runtime = "runtime bytes";
+  const context = vm.createContext({ ...serviceWorkerGlobals,
+    console: { ...console, warn(...args) { warnings.push(args.join(" ")); } },
+    setTimeout(callback, delay) {
+      if (delay >= 10000) {
+        const id = nextTimer++;
+        watchdogs.set(id, { callback, delay });
+        return id;
+      }
+      retryDelays.push(delay);
+      return setTimeout(callback, 0);
+    },
+    clearTimeout(id) { watchdogs.delete(id); },
+    URL, Request, Response,
+    self: { addEventListener() {}, location: { href: location } },
+    caches: { async open() { return {
+      async match(key) { return stored.get(key)?.clone(); },
+      async put(key, response) { stored.set(key, response.clone()); },
+      async keys() { return []; },
+      async delete() { return false; },
+    }; } },
+    async maybeFromCache() { throw new Error("Unexpected fallback"); },
+    async fetch(request) {
+      requests.push(request);
+      if (request.url.endsWith("/deployment.json")) return new Response("", { status: 404 });
+      return respond(request, requests.length, runtime);
+    },
+  });
+  context.hashes = { "xeus/runtime.wasm": createHash("sha256").update(runtime).digest("hex") };
+  context.mirrors = mirrors;
+  vm.runInContext(`(${fingerprints.installRuntimeCache.toString()})(hashes, mirrors)`, context);
+  return {
+    context, requests, retryDelays, warnings, runtime,
+    async fire(delay) {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const entry = [...watchdogs].find(([, timer]) => timer.delay === delay);
+        if (entry) { watchdogs.delete(entry[0]); entry[1].callback(); return; }
+        await new Promise(resolve => setImmediate(resolve));
+      }
+      throw new Error(`No ${delay} ms watchdog was armed`);
+    },
+    load(url) {
+      return context.maybeFromCache({ request: new Request(url), waitUntil() {} });
+    },
+  };
+}
+
+function hangUntilAborted(request) {
+  return new Promise((resolve, reject) => {
+    request.signal.addEventListener("abort", () => reject(new DOMException("The operation was aborted.", "AbortError")));
+  });
+}
+
+test("stalled runtime responses are aborted and retried instead of waiting for the browser timeout", async () => {
+  const harness = stallHarness({
+    respond(request, count, runtime) {
+      assert.equal(request.integrity, "");
+      return count === 1 ? hangUntilAborted(request) : new Response(runtime);
+    },
+  });
+  const loading = harness.load("https://example.com/xeus/runtime.wasm");
+  await harness.fire(45000);
+  const response = await loading;
+  assert.equal(await response.text(), harness.runtime);
+  assert.equal(harness.requests.length, 2);
+  assert.deepEqual(harness.retryDelays, [1000]);
+  assert.match(harness.warnings.join("\n"), /Download stalled and was aborted for retry: https:\/\/example\.com\/xeus\/runtime\.wasm/);
+});
+
+test("runtime bodies that stop making progress are aborted and retried", async () => {
+  const harness = stallHarness({
+    respond(request, count, runtime) {
+      if (count > 1) return new Response(runtime);
+      const body = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("runtime "));
+          request.signal.addEventListener("abort", () => controller.error(new DOMException("The operation was aborted.", "AbortError")));
+        },
+      });
+      return new Response(body);
+    },
+  });
+  const loading = harness.load("https://example.com/xeus/runtime.wasm");
+  await harness.fire(30000);
+  assert.equal(await (await loading).text(), harness.runtime);
+  assert.equal(harness.requests.length, 2);
+  assert.match(harness.warnings.join("\n"), /Download stalled/);
+});
+
+test("mirror bytes that do not match the build hash are rejected", async () => {
+  const harness = stallHarness({
+    location: "https://datax-now.readthedocs.io/en/latest/_static/service-worker.js?enableCache=true",
+    mirrors: ["https://datax-now.github.io/go/"],
+    respond(request) {
+      if (request.url.startsWith("https://datax-now.github.io/")) return new Response("tampered bytes");
+      return new Response("", { status: 503 });
+    },
+  });
+  const response = await harness.load("https://datax-now.readthedocs.io/en/latest/_static/xeus/runtime.wasm");
+  assert.equal(response.status, 503);
+  assert.equal(harness.requests.filter(request => request.url.startsWith("https://datax-now.github.io/go/xeus/")).length, 1);
+  assert.deepEqual(harness.retryDelays, [1000, 2000, 4000, 8000]);
+});
+
+test("kernel worker startup failures are logged in the worker before crossing to the page", async () => {
+  const source = "class p{get Module(){return 1}async initialize(g){let{baseUrl:I}=g;if(!I)throw new Error(\"no baseUrl\");return I}}";
+  const patched = startup.patchWorkerStartupErrors(source);
+  assert.equal(startup.patchWorkerStartupErrors(patched), patched);
+  assert.throws(() => startup.patchWorkerStartupErrors("changed upstream code"), /kernel worker initializer/);
+  const errors = [];
+  const context = vm.createContext({ console: { error(...args) { errors.push(args); } } });
+  const Worker = vm.runInContext(`${patched};p`, context);
+  assert.equal(await new Worker().initialize({ baseUrl: "/xeus/" }), "/xeus/");
+  await assert.rejects(new Worker().initialize({}), /no baseUrl/);
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0][0], "[DataX.now] Kernel worker failed to start:");
+});
+
+test("critical and warning kernel logs are mirrored to the browser console", () => {
+  const source = 'o&&new BroadcastChannel("/xeus-kernel-logs-broadcast").addEventListener("message",t=>{let{payload:a}=t.data,s="";o.getLogger(s).log(a)})';
+  const patched = startup.patchKernelLogMirror(source);
+  assert.equal(startup.patchKernelLogMirror(patched), patched);
+  assert.throws(() => startup.patchKernelLogMirror("changed upstream code"), /kernel log forwarding/);
+  const logged = [];
+  const mirrored = [];
+  let listener;
+  const context = vm.createContext({
+    o: { getLogger: path => ({ log: payload => logged.push([path, payload]) }) },
+    BroadcastChannel: class { addEventListener(type, callback) { listener = callback; } },
+    console: { error: (...args) => mirrored.push(["error", ...args]), warn: (...args) => mirrored.push(["warn", ...args]) },
+  });
+  vm.runInContext(patched, context);
+  for (const level of ["critical", "warning", "info"]) listener({ data: { payload: { level, data: `${level} message` } } });
+  assert.equal(logged.length, 3);
+  assert.deepEqual(mirrored, [["error", "[xeus kernel]", "critical message"], ["warn", "[xeus kernel]", "warning message"]]);
+});
+
+test("kernels whose worker fails to start are restarted a bounded number of times", async () => {
+  const source = 'class M{constructor(e){this.id=e.id,this.ready=e.ready,this.ready.then(async()=>{try{await this.getStartupStatus()}catch(e){console.warn("[xeus-startup] failed to capture session-attached snapshot",e)}})}getStartupStatus(){}}';
+  const patched = startup.patchKernelStartupRecovery(source);
+  assert.equal(startup.patchKernelStartupRecovery(patched), patched);
+  assert.throws(() => startup.patchKernelStartupRecovery("changed upstream code"), /kernel startup failure handler/);
+  const messages = [];
+  const restarts = [];
+  const widgets = { main: [], down: [] };
+  const timers = [];
+  const context = vm.createContext({
+    console: { error: (...args) => messages.push(args.join(" ")), warn: (...args) => messages.push(args.join(" ")) },
+    setTimeout: (callback, delay) => { assert.equal(delay, 1000); timers.push(callback); },
+    jupyter_app: { shell: { widgets: area => widgets[area] } },
+  });
+  context.globalThis = context;
+  const Kernel = vm.runInContext(`${patched};M`, context);
+  const settle = async () => {
+    await new Promise(resolve => setImmediate(resolve));
+    timers.splice(0).forEach(callback => callback());
+  };
+  const fail = () => new Kernel({ id: "k1", ready: Promise.reject(undefined) });
+
+  fail();
+  await settle();
+  widgets.main.push({ sessionContext: { session: { kernel: { id: "k1", isDisposed: false, async restart() { restarts.push("k1"); } } } } });
+  await settle();
+  assert.deepEqual(restarts, ["k1"], "the restart waits until the kernel's document is attached");
+  fail();
+  await settle();
+  assert.deepEqual(restarts, ["k1", "k1"]);
+  fail();
+  await settle();
+  assert.deepEqual(restarts, ["k1", "k1"], "a kernel that keeps failing is not restarted forever");
+  assert.match(messages.join("\n"), /failed to start \(attempt 3\)[\s\S]*reload the page/);
+
+  widgets.main.length = 0;
+  new Kernel({ id: "k2", ready: Promise.reject(new Error("boom")) });
+  for (let tick = 0; tick < 20; tick++) await settle();
+  assert.match(messages.join("\n"), /No open document uses kernel k2/);
+  new Kernel({ id: "k3", ready: Promise.resolve() });
+  await settle();
+  assert.doesNotMatch(messages.join("\n"), /k3/);
 });

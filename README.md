@@ -175,10 +175,18 @@ Simultaneous kernel requests share a download. Existing runtime URLs stay stable
 fingerprints are local cache keys, not renamed server files. Other assets retain
 background ETag revalidation. URL alias rewrites preserve these validators and
 accept `304` responses without retrying.
-Runtime cache misses revalidate the HTTP cache and require fetch integrity to
-match the build's SHA-256 digest before returning or storing a response. A
-deployment mismatch fails the download and can be retried; it is not cached
-under the expected hash. Mirror runtime bytes must match the local build's hash,
+Runtime cache misses revalidate the HTTP cache. The service worker checks the
+bytes against the build's SHA-256 digest before it returns or stores a response.
+A deployment mismatch fails the download and is not cached under the expected
+hash. Only a mirror is tried after a mismatch, because the same host would return
+the same bytes. The worker checks the hash itself rather than using fetch
+integrity (SRI). With SRI, `fetch()` resolves only after the whole body has
+arrived, so a stalled download looked like a slow one. Instead, a runtime or
+offline download is aborted if there is no response within 45 seconds, or if its
+body stops making progress for 30 seconds. The worker logs `[DataX.now] Download
+stalled and was aborted for retry` and handles the abort like a network failure,
+so the download is retried. Before this change, a stalled cold-start request
+kept the kernel at "starting" until Chrome gave up after about five minutes. Mirror runtime bytes must match the local build's hash,
 even when both deployments report the same commit. Runtime cache keys now include
 `verified=local`: older entries that could contain a different mirror's bytes are
 not reused or counted toward offline readiness. Already verified application
@@ -247,6 +255,16 @@ GitHub. The page and the kernel worker each load the mapping once per session,
 so the build patches that request to retry network failures after 1, 2, 4 and 8
 seconds; a single dropped request would otherwise break package installation
 until reload.
+
+If the kernel worker still fails to start (for example, a runtime file could not
+be downloaded), the browser console shows `[DataX.now] Kernel worker failed to
+start:` with the worker's error. Without this, the page only reported `Uncaught
+(in promise) undefined`. The page then restarts that kernel automatically, up to
+two times, and logs `[DataX.now] Restarting kernel …`. If the third start also
+fails, it logs that the page should be reloaded. Kernel log messages at the
+critical and warning levels also go to the browser console with a `[xeus
+kernel]` prefix, as well as to JupyterLab's Log Console. Include these lines when
+reporting a startup failure.
 
 Downloads are SHA-256 verified and reuse already cached files. An interrupted
 download can be retried without starting over. Failed downloads or insufficient
@@ -324,8 +342,10 @@ Cloudflare Pages), the service worker retries fingerprinted runtime files and
 other build-inventoried assets on the other hosts in priority order: Read the Docs
 (`https://datax-now.readthedocs.io/en/latest/_static/`), GitHub Pages
 (`https://datax-now.github.io/go/`), Vercel (`https://datax.now/`), then
-Cloudflare Pages (`https://datax-now.pages.dev/`). The current host is skipped,
-and hosts outside this set (such as `localhost`) never fail over. A host that
+Cloudflare Pages (`https://datax-now.pages.dev/`). The current host is skipped.
+Hosts outside this set (such as `localhost` or a preview URL) never fail over to
+these mirrors, but they still get the local retries described below for their own
+files. A host that
 failed is not contacted again for 60 seconds, so a blocked host costs one round
 trip rather than one per file. For offline downloads, a mirror is accepted only
 when its manifest records the exact hash expected by this build; mismatched
@@ -334,14 +354,15 @@ files are skipped, even if the mirror reports the same commit.
 If no mirror can supply the file (for example, the mirrors run another release,
 or Read the Docs challenges cross-origin requests), the worker retries the
 current host after 1, 2, 4 and 8 seconds before surfacing the failure. A
-transient GitHub Pages or Read the Docs rate limit during a cold start then
-delays the asset instead of failing it. A host rate limit usually appears as an
-SRI failure, because the browser checks integrity against the error page. One
+transient rate limit, dropped connection or stalled download during a cold start
+then delays the asset instead of failing it. A host rate limit can appear as an
+`Integrity check failed` error, because the error page does not match the
+expected hash. One
 download is shared by every request for the same asset. It is not tied to the
 first requester, so a reload or closed worker cannot cancel the download for the
 next page.
 
-The browser can log an SRI failure for the original RTD response even when a
+The browser can log a failed request for the original RTD response even when a
 verified mirror subsequently supplies the correct file. That console message
 alone does not mean the offline download failed. **Offline ready** requires every
 inventory entry to be stored under its local build hash; otherwise the status

@@ -24,7 +24,62 @@ function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null, ass
   const cooldownMs = 60000;
   // When no mirror can serve a file, transient local failures (rate limits, resets) get a bounded retry.
   const localRetryDelaysMs = [1000, 2000, 4000, 8000];
-  const integrityOf = hex => 'sha256-' + btoa(String.fromCharCode(...hex.match(/../g).map(byte => parseInt(byte, 16))));
+  // A stalled connection never fails on its own (Chrome gives up after five minutes), which left cold kernels
+  // waiting silently. Downloads that stop making progress are aborted and handled like any transient failure.
+  const responseTimeoutMs = 45000;
+  const idleTimeoutMs = 30000;
+  const hexOf = bytes => Array.from(new Uint8Array(bytes), byte => byte.toString(16).padStart(2, '0')).join('');
+  const hashOfIntegrity = integrity => {
+    const match = /^sha256-([A-Za-z0-9+/]+={0,2})$/.exec(integrity || '');
+    return match ? hexOf(Uint8Array.from(atob(match[1]), character => character.charCodeAt(0))) : null;
+  };
+  // SRI makes fetch() resolve only after the whole body arrived, hiding progress, so the hash is verified here instead.
+  async function guardedFetch(request, expectedHash = null) {
+    expectedHash = expectedHash || hashOfIntegrity(request.integrity);
+    if (request.integrity && !expectedHash) return fetch(request);
+    const controller = new AbortController();
+    let timer = null;
+    let stalled = false;
+    const arm = delay => {
+      clearTimeout(timer);
+      timer = setTimeout(() => { stalled = true; controller.abort(); }, delay);
+    };
+    try {
+      arm(responseTimeoutMs);
+      const response = await fetch(new Request(request, { integrity: '', signal: controller.signal }));
+      if (!response.body) return response;
+      const reader = response.body.getReader();
+      const chunks = [];
+      let size = 0;
+      for (;;) {
+        arm(idleTimeoutMs);
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        size += value.byteLength;
+      }
+      clearTimeout(timer);
+      const bytes = new Uint8Array(size);
+      let offset = 0;
+      for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+      if (expectedHash && response.ok && hexOf(await crypto.subtle.digest('SHA-256', bytes)) !== expectedHash) {
+        // Retrying the same origin would return the same wrong bytes; only a mirror can help.
+        throw Object.assign(new TypeError(`Integrity check failed for ${request.url}`), { dataxIntegrity: true });
+      }
+      const headers = new Headers(response.headers);
+      headers.delete('Content-Encoding');
+      headers.set('Content-Length', String(size));
+      return new Response(bytes, { status: response.status, statusText: response.statusText, headers });
+    } catch (error) {
+      if (stalled) {
+        console.warn(`[DataX.now] Download stalled and was aborted for retry: ${request.url}`);
+        throw new TypeError(`Download stalled: ${request.url}`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
   const isCooling = origin => (coolingUntil.get(origin) ?? 0) > Date.now();
   const cool = origin => coolingUntil.set(origin, Date.now() + cooldownMs);
   const isBlocked = response => [429, 502, 503, 504].includes(response.status)
@@ -50,9 +105,7 @@ function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null, ass
     } catch { return null; }
   }
   async function fetchWithMirrors(request, fetchOriginal) {
-    if (!mirrors.length || request.method !== 'GET' || request.headers.has('Range')) {
-      return fetchOriginal();
-    }
+    if (request.method !== 'GET' || request.headers.has('Range')) return fetchOriginal();
     const url = new URL(request.url);
     const runtimePath = url.pathname.match(/(\/xeus\/.+)$/);
     const runtimeHash = runtimePath && hashes[runtimePath[1].slice(1)];
@@ -61,11 +114,13 @@ function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null, ass
     const isManifest = url.pathname.endsWith('/manifest.webmanifest');
     const isDeployment = url.hostname === 'readthedocs.io' || url.hostname.endsWith('.readthedocs.io')
       || mirrors.some(base => base.origin === url.origin);
+    // Hosts outside the mirror set (e.g. Vercel, previews) still retry their own files after transient failures.
+    const isOwnScope = url.origin === scope.origin && url.pathname.startsWith(scope.pathname);
     const mirrorPath = runtimeHash
       ? runtimePath[1]
       : assetHash ? `/${assetPath}`
       : isManifest ? '/manifest.webmanifest' : null;
-    if (!isDeployment || !mirrorPath) return fetchOriginal();
+    if (!(isDeployment || isOwnScope) || !mirrorPath) return fetchOriginal();
     let failedResponse = null;
     let failedError = null;
     async function tryOriginal() {
@@ -87,20 +142,19 @@ function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null, ass
       if (response) return response;
       cool(url.origin);
     }
-    for (const base of mirrors) {
+    for (const base of isDeployment ? mirrors : []) {
       if (base.origin === url.origin || isCooling(base.origin)) continue;
       const mirrorUrl = new URL(mirrorPath.slice(1), base);
       mirrorUrl.search = url.search;
       const mirrorRequest = { method: 'GET', mode: 'cors', credentials: 'omit', cache: 'no-cache' };
-      if (runtimeHash || assetHash) {
+      const expectedHash = runtimeHash || assetHash;
+      if (expectedHash) {
         const manifest = await loadMirrorManifest(base);
-        const expectedHash = runtimeHash || assetHash;
         const mirrorHash = manifest?.files[decodeURIComponent(mirrorPath.slice(1))]?.sha256;
         if (manifest && mirrorHash !== expectedHash) continue;
-        mirrorRequest.integrity = integrityOf(expectedHash);
       }
       try {
-        const response = await fetch(new Request(mirrorUrl.href, mirrorRequest));
+        const response = await guardedFetch(new Request(mirrorUrl.href, mirrorRequest), expectedHash);
         if (response.ok) return response;
         if (isBlocked(response)) cool(base.origin);
       } catch (error) {
@@ -109,6 +163,7 @@ function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null, ass
       }
     }
     for (const delay of triedOriginal ? localRetryDelaysMs : [0, ...localRetryDelaysMs]) {
+      if (failedError?.dataxIntegrity) break;
       if (delay) await new Promise(resolve => setTimeout(resolve, delay));
       const response = await tryOriginal();
       if (response) return response;
@@ -116,9 +171,9 @@ function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null, ass
     if (failedResponse) return failedResponse;
     throw failedError;
   }
-  self.dataxFetchOfflineAsset = request => fetchWithMirrors(request, () => fetch(request));
-  async function fetchRuntime(request) {
-    return fetchWithMirrors(request, () => fetch(request));
+  self.dataxFetchOfflineAsset = request => fetchWithMirrors(request, () => guardedFetch(request));
+  async function fetchRuntime(request, hash) {
+    return fetchWithMirrors(request, () => guardedFetch(request, hash));
   }
   maybeFromCache = async function(event) {
     const request = event.request;
@@ -138,20 +193,19 @@ function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null, ass
     key.searchParams.set('sha256', hash);
     // Older entries may contain mirror bytes verified against a different build's hash.
     key.searchParams.set('verified', 'local');
-    const integrity = integrityOf(hash);
     // Concurrent requests share this download, so one client's abort (reload, closed worker) must not cancel it.
-    const verifiedRequest = new Request(request, { integrity, cache: 'no-cache', signal: null });
+    const verifiedRequest = new Request(request, { cache: 'no-cache', signal: null });
     let cache;
     try {
       cache = await caches.open(cacheName);
       const cached = await cache.match(key.href);
       if (cached) return cached;
     } catch {
-      return fetchRuntime(verifiedRequest);
+      return fetchRuntime(verifiedRequest, hash);
     }
     if (!pending.has(key.href)) {
       const download = (async () => {
-        const response = await fetchRuntime(verifiedRequest);
+        const response = await fetchRuntime(verifiedRequest, hash);
         if (response.ok && response.status !== 206) {
           try {
             await cache.put(key.href, response.clone());
