@@ -170,13 +170,15 @@ function installOfflineCache(assets) {
       port.postMessage({ type: 'datax-offline', unavailable: true, error: 'Offline caching is disabled in the app configuration.' });
       return;
     }
+    // Acknowledge before CacheStorage access, which can be slow while other workers are starting.
+    port.postMessage(progress || { type: 'datax-offline', checking: true, completed: 0, total: entries.length,
+      bytes: 0, totalBytes, ready: false, downloading: false });
     const task = (async () => {
       if (event.data.type === 'datax-offline-status') {
         port.postMessage(await status());
         return;
       }
       ports.add(port);
-      if (progress) port.postMessage(progress);
       try {
         await download();
         const update = { ...await status(), downloading: false };
@@ -346,6 +348,7 @@ function offlineStatusText(state, mode, online, controlled = true) {
   if (state.error) {
     return mode === 'automatic' ? 'Automatic offline download failed' : 'Offline download incomplete';
   }
+  if (state.checking) return 'Offline: checking cached files';
   if (state.downloading) {
     const qualifier = mode === 'automatic' ? ' automatically' : '';
     return 'Downloading offline' + qualifier + ': ' + state.completed + '/' + state.total;
@@ -386,9 +389,10 @@ function installOfflineUI() {
   let lastLoggedError = null;
   let completionLogged = false;
   let stallTimer = null;
+  let responseTimeout = null;
   function canAutoDownload() {
     return navigator.onLine && !!navigator.serviceWorker.controller && !!current
-      && !current.ready && !current.downloading && !current.unavailable;
+      && !current.ready && !current.checking && !current.downloading && !current.unavailable;
   }
   const idleScheduler = createKernelIdleScheduler(() => startDownload(true));
   const updateIdleScheduler = () => idleScheduler.update(kernelStatuses, canAutoDownload());
@@ -401,35 +405,46 @@ function installOfflineUI() {
       }
       return;
     }
+    clearTimeout(responseTimeout);
     channel?.port1.close();
     const requestChannel = new MessageChannel();
     channel = requestChannel;
-    let responseTimeout = setTimeout(() => {
+    function failRequest(error) {
       if (channel !== requestChannel) return;
+      clearTimeout(responseTimeout);
+      clearTimeout(stallTimer);
       requestChannel.port1.close();
       channel = null;
-      current = { ...(current || {}), unavailable: true };
+      current = { ...(current || {}), unavailable: true, checking: false, downloading: false, error };
       label.textContent = 'Offline cache unavailable';
-      panel.title = type === 'datax-offline-status'
-        ? 'The offline service worker did not respond. Reload the app to retry.'
-        : 'The offline download did not respond. Reload the app to retry.';
-      button.disabled = true;
+      panel.title = error + ' Select Retry offline check to try again.';
+      button.textContent = 'Retry offline check';
+      button.disabled = false;
+      button.hidden = false;
       updateIdleScheduler();
-      console.error('[DataX.now] Offline service worker did not respond to ' + type + '.');
+      console.error('[DataX.now] ' + error);
+    }
+    responseTimeout = setTimeout(() => {
+      failRequest('Offline service worker did not respond to ' + type + '.');
     }, 10000);
-    let receivedResponse = false;
     requestChannel.port1.onmessage = event => {
-      if (!receivedResponse) {
-        clearTimeout(responseTimeout);
-        responseTimeout = null;
-        receivedResponse = true;
-      }
+      if (channel !== requestChannel) return;
+      clearTimeout(responseTimeout);
+      responseTimeout = null;
       const state = event.data;
       current = state;
       clearTimeout(stallTimer);
+      if (state.checking) {
+        button.disabled = true;
+        label.textContent = offlineStatusText(state, downloadMode, navigator.onLine);
+        panel.title = 'The service worker is checking cached files.';
+        updateIdleScheduler();
+        responseTimeout = setTimeout(() => failRequest('Offline cache check did not finish within 60 seconds.'), 60000);
+        return;
+      }
       // A terminated worker drops its ports silently; resubscribing resumes from cached files.
       stallTimer = state.downloading ? setTimeout(() => request('datax-offline-download'), 60000) : null;
-      button.disabled = state.downloading || state.ready || state.unavailable;
+      button.disabled = !!(state.downloading || state.ready || state.unavailable);
       button.hidden = state.ready;
       updateIdleScheduler();
       if (state.error) {
@@ -452,6 +467,7 @@ function installOfflineUI() {
           }
         }
       } else {
+        button.textContent = 'Download for offline use';
         panel.title = state.total + ' files; ' + Math.ceil(state.totalBytes / 1048576)
           + ' MiB; automatic download after 5 minutes with every kernel idle';
         label.textContent = offlineStatusText(state, downloadMode, navigator.onLine);
@@ -462,13 +478,7 @@ function installOfflineUI() {
       }
     };
     requestChannel.port1.onmessageerror = () => {
-      clearTimeout(responseTimeout);
-      responseTimeout = null;
-      channel = null;
-      label.textContent = 'Offline cache unavailable';
-      panel.title = 'Could not read the offline service worker response.';
-      button.disabled = true;
-      console.error('[DataX.now] Could not read the offline service worker response.');
+      failRequest('Could not read the offline service worker response.');
     };
     navigator.serviceWorker.controller.postMessage({ type }, [requestChannel.port2]);
   }
@@ -488,7 +498,10 @@ function installOfflineUI() {
     button.disabled = true;
     request('datax-offline-download');
   }
-  button.addEventListener('click', () => startDownload());
+  button.addEventListener('click', () => {
+    if (current?.unavailable) request('datax-offline-status');
+    else startDownload();
+  });
   navigator.serviceWorker.ready.then(() => request('datax-offline-status')).catch(() => {
     label.textContent = 'Offline cache unavailable';
   });
@@ -510,6 +523,9 @@ function installOfflineUI() {
     stopKernelMonitor();
     idleScheduler.dispose();
     clearTimeout(stallTimer);
+    clearTimeout(responseTimeout);
+    channel?.port1.close();
+    channel = null;
   });
 }
 

@@ -86,7 +86,7 @@ function installRuntimeCache(hashes, mirrorOrigins = [], buildCommit = null, ass
     || response.headers.get('cf-mitigated') === 'challenge';
   function loadMirrorManifest(base) {
     if (!manifests.has(base.href)) {
-      manifests.set(base.href, fetch(new Request(new URL('deployment.json', base).href, {
+      manifests.set(base.href, guardedFetch(new Request(new URL('deployment.json', base).href, {
         mode: 'cors', credentials: 'omit', cache: 'no-cache',
       })).then(response => response.ok ? response.json() : null)
         .catch(() => null)

@@ -239,6 +239,12 @@ automatically. Manual downloads ask you to confirm the download size. Wait for
 downloads and reports their progress or failure; the browser console logs when
 they start, reach progress milestones, complete, or fail. If the service worker
 does not control the page yet, the status bar reports that while waiting.
+The worker acknowledges offline requests before scanning Cache Storage, so a
+slow cache check is not mistaken for an unresponsive worker. Cache checks show
+**Offline: checking cached files** and have a 60-second deadline. If the worker
+does not answer within 10 seconds or the cache check times out, select
+**Retry offline check** to retry without reloading. Neither an acknowledgement
+nor a timeout counts as offline readiness.
 This downloads the complete local application, lazy-loaded extensions, bundled
 notebooks and data, and the WebAssembly kernel packages. The installed PWA can
 then reopen, start a fresh kernel, run Python, and access locally saved
@@ -276,6 +282,13 @@ previous offline-ready release stays active and the update is retried on a
 later visit. Activation then removes cached files that no current release
 uses. If progress stalls, for example because the browser stopped the service
 worker, the app resumes the download from the files already cached.
+On Read the Docs and GitHub Pages, startup checks for a waiting release before
+loading JupyterLite, waits for a newly discovered worker to finish installing,
+and reloads into it when activation is safe. An already waiting release does
+not require another network update check. The update check and installation
+wait each have a 10-second deadline; failures are logged and the active
+isolated worker is retained, so blocked corporate networks and large update
+downloads do not leave startup waiting indefinitely.
 Offline files and notebooks belong to the selected origin and browser
 profile, not to all deployment mirrors.
 Timestamped build diagnostics (`xpython-deploy-manifest.json`) are not offline
@@ -377,6 +390,10 @@ also retries `manifest.webmanifest`; that optional metadata request does not
 gate kernel startup. Unindexed or unrelated resources are not retried. The
 client network must permit access to the mirror hosts; this fallback does not
 remove the hosting provider's protection.
+Mirror manifest downloads use the same 45-second response and 30-second
+body-idle deadlines as assets, so a stalled proxy connection cannot block
+fallback indefinitely. If metadata cannot be loaded, the asset still has to
+pass the build's SHA-256 check before use.
 Every mirror must include CORS headers for build-inventoried asset paths,
 `/deployment.json` and `/manifest.webmanifest`, and must contain the same
 runtime package filenames (a package version that floated between builds is

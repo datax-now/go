@@ -2956,8 +2956,43 @@ async function activateWaitingRelease() {
   const reloaded = sessionStorage.getItem(updateReloadKey) === "1";
   sessionStorage.removeItem(updateReloadKey);
   const registration = await serviceWorker.getRegistration();
-  const waiting = registration && registration.waiting;
-  if (!waiting || reloaded) return false;
+  if (!registration || reloaded) return false;
+  if (!registration.waiting) {
+    let timeout;
+    try {
+      await Promise.race([
+        registration.update(),
+        new Promise((resolve, reject) => {
+          timeout = setTimeout(() => reject(new Error("The service worker update check timed out.")), 10000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timeout);
+    }
+    const installing = registration.installing;
+    if (installing) {
+      await new Promise((resolve, reject) => {
+        const cleanup = () => {
+          clearTimeout(timeout);
+          installing.removeEventListener("statechange", onStateChange);
+        };
+        const onStateChange = () => {
+          if (installing.state !== "installed" && installing.state !== "redundant") return;
+          cleanup();
+          if (installing.state === "redundant") reject(new Error("The service worker update failed to install."));
+          else resolve();
+        };
+        timeout = setTimeout(() => {
+          cleanup();
+          reject(new Error("The service worker update is still installing; keeping the active release."));
+        }, 10000);
+        installing.addEventListener("statechange", onStateChange);
+        onStateChange();
+      });
+    }
+  }
+  const waiting = registration.waiting;
+  if (!waiting) return false;
   let onControllerChange;
   const controllerChanged = new Promise(resolve => {
     onControllerChange = resolve;

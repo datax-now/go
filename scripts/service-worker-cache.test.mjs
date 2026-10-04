@@ -830,11 +830,21 @@ test("app startup activates a waiting release before loading and never reloads i
     const loader = html.match(/<script>([\s\S]*?datax-rtd-coep-loader-gate[\s\S]*?)<\/script>/)[1]
       .replace(/await import\([\s\S]*?\);/, "globalThis.dataxAppStarted = true;");
 
-    function start(hostname, { waiting = null, reply, sessionValues = new Map() } = {}) {
+    function start(hostname, {
+      waiting = false, publishWaitingOnUpdate = false, installOnUpdate = false, stallInstall = false,
+      updateError = null, stallUpdate = false, reply, sessionValues = new Map(),
+    } = {}) {
       const listeners = new Set();
       const messages = [];
+      const warnings = [];
+      const timeouts = new Map();
+      const workerListeners = new Set();
+      let updateChecks = 0;
       let reloads = 0;
-      const worker = waiting && {
+      const worker = (waiting || publishWaitingOnUpdate || installOnUpdate) && {
+        state: "installing",
+        addEventListener(_type, listener) { workerListeners.add(listener); },
+        removeEventListener(_type, listener) { workerListeners.delete(listener); },
         postMessage(message, [port]) {
           messages.push(message);
           if (reply === undefined) return;
@@ -844,9 +854,31 @@ test("app startup activates a waiting release before loading and never reloads i
           });
         },
       };
+      let hasWaitingWorker = waiting;
+      let installing = null;
+      const registration = {
+        get waiting() { return hasWaitingWorker ? worker : null; },
+        get installing() { return installing; },
+        async update() {
+          updateChecks++;
+          if (updateError) throw updateError;
+          if (stallUpdate) return new Promise(() => {});
+          if (publishWaitingOnUpdate) hasWaitingWorker = true;
+          if (installOnUpdate) {
+            installing = worker;
+            if (stallInstall) return;
+            setImmediate(() => {
+              worker.state = "installed";
+              hasWaitingWorker = true;
+              installing = null;
+              for (const listener of workerListeners) listener();
+            });
+          }
+        },
+      };
       const serviceWorker = {
         controller: {},
-        getRegistration: async () => ({ waiting: worker }),
+        getRegistration: async () => registration,
         addEventListener(type, listener) { if (type === "controllerchange") listeners.add(listener); },
         removeEventListener(type, listener) { if (type === "controllerchange") listeners.delete(listener); },
       };
@@ -861,17 +893,24 @@ test("app startup activates a waiting release before loading and never reloads i
           setItem(key, value) { sessionValues.set(key, String(value)); },
           removeItem(key) { sessionValues.delete(key); },
         },
-        console: { error() {}, info() {}, warn() {} },
-        setTimeout,
-        clearTimeout,
+        console: { error() {}, info() {}, warn(...args) { warnings.push(args); } },
+        setTimeout(callback, delay) {
+          if (delay < 10000) return setTimeout(callback, delay);
+          const timer = {};
+          timeouts.set(timer, { callback, delay });
+          return timer;
+        },
+        clearTimeout(timer) { timeouts.delete(timer); clearTimeout(timer); },
       });
       context.window = context;
       vm.runInContext(bootstrap, context);
       vm.runInContext(loader, context);
       return {
-        context, messages, sessionValues,
+        context, messages, sessionValues, warnings, timeouts,
+        get updateChecks() { return updateChecks; },
         get reloads() { return reloads; },
         get listeners() { return listeners.size; },
+        get workerListeners() { return workerListeners.size; },
       };
     }
     const settle = () => new Promise(resolve => setTimeout(resolve, 20));
@@ -901,6 +940,55 @@ test("app startup activates a waiting release before loading and never reloads i
     await settle();
     assert.equal(current.messages.length, 0);
     assert.equal(current.context.dataxAppStarted, true);
+
+    const discovered = start("datax-now.readthedocs.io", {
+      publishWaitingOnUpdate: true, reply: { activating: true },
+    });
+    await settle();
+    assert.equal(discovered.updateChecks, 1, "startup checks for a release before loading the application");
+    assert.deepEqual(discovered.messages.map(message => message.type), ["datax-activate-update"]);
+    assert.equal(discovered.reloads, 1, "a release discovered during the update check activates before startup");
+    assert.equal(discovered.context.dataxAppStarted, undefined);
+
+    const installing = start("datax-now.readthedocs.io", {
+      installOnUpdate: true, reply: { activating: true },
+    });
+    await settle();
+    assert.equal(installing.reloads, 1, "update() can resolve before the installing worker becomes waiting");
+    assert.equal(installing.context.dataxAppStarted, undefined);
+    assert.equal(installing.workerListeners, 0);
+    assert.equal(installing.timeouts.size, 0);
+
+    const blocked = start("datax-now.readthedocs.io", {
+      waiting: true, updateError: new TypeError("Corporate proxy blocked update"), reply: { activating: true },
+    });
+    await settle();
+    assert.equal(blocked.reloads, 1, "an already waiting release must not depend on another network request");
+    assert.equal(blocked.updateChecks, 0);
+
+    const stalled = start("datax-now.readthedocs.io", { stallUpdate: true });
+    await settle();
+    assert.equal(stalled.context.dataxAppStarted, undefined);
+    const timeout = [...stalled.timeouts.values()].find(timer => timer.delay === 10000);
+    assert.ok(timeout, "a corporate proxy cannot leave startup waiting forever for update()");
+    timeout.callback();
+    await settle();
+    assert.equal(stalled.context.dataxAppStarted, true, "a failed optional update retains the isolated active worker");
+    assert.equal(stalled.reloads, 0);
+    assert.equal(stalled.warnings.length, 1, "the failed update check is surfaced");
+    assert.equal(stalled.timeouts.size, 0);
+
+    const slowInstall = start("datax-now.readthedocs.io", { installOnUpdate: true, stallInstall: true });
+    await settle();
+    const installTimeout = [...slowInstall.timeouts.values()].find(timer => timer.delay === 10000);
+    assert.ok(installTimeout, "pre-caching a large update cannot block the app indefinitely");
+    installTimeout.callback();
+    await settle();
+    assert.equal(slowInstall.context.dataxAppStarted, true);
+    assert.equal(slowInstall.reloads, 0);
+    assert.equal(slowInstall.workerListeners, 0);
+    assert.equal(slowInstall.timeouts.size, 0);
+    assert.equal(slowInstall.warnings.length, 1);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -2267,7 +2355,7 @@ test("offline download subscribers receive current progress immediately", async 
   };
   const first = [];
   const firstDone = send(first);
-  while (!first.length) await new Promise(resolve => setImmediate(resolve));
+  while (!first.some(update => update.downloading)) await new Promise(resolve => setImmediate(resolve));
   const second = [];
   const secondDone = send(second);
   await new Promise(resolve => setImmediate(resolve));
@@ -2453,6 +2541,73 @@ test("generated offline client includes the kernel idle monitor", async () => {
     assert.equal(label.textContent, "Offline: not downloaded");
     assert.ok(!panel.children[1].disabled);
     for (const timer of timeouts.values()) assert.notEqual(timer.delay, 0);
+
+    let message;
+    let releaseStorage;
+    let storage = new Promise(resolve => { releaseStorage = resolve; });
+    const workerTasks = [];
+    const worker = vm.createContext({ ...serviceWorkerGlobals, URL, Request, Response,
+      self: {
+        location: { href: "https://datax-now.readthedocs.io/en/latest/_static/service-worker.js?enableCache=true" },
+        addEventListener(type, listener) { if (type === "message") message = listener; },
+      },
+      async maybeFromCache() { throw new Error("No download should start during the cache check"); },
+      caches: { async open() { await storage; return { async keys() { return []; } }; } },
+    });
+    vm.runInContext(`(${offline.installOfflineCache.toString()})({
+      "lab/index.html": { sha256: "${"a".repeat(64)}", size: 4096 }
+    });`, worker);
+    serviceWorker.controller = {
+      postMessage(data, ports) {
+        message({ data, ports, source: { url: "https://datax-now.readthedocs.io/en/latest/_static/lab/" },
+          waitUntil(task) { workerTasks.push(task); } });
+      },
+    };
+    serviceWorkerListeners.controllerchange();
+    const initialDeadline = [...timeouts.values()].find(timer => timer.delay === 10000);
+    initialDeadline?.callback();
+    assert.notEqual(label.textContent, "Offline cache unavailable",
+      "slow CacheStorage must not reproduce the logged service-worker response timeout");
+    assert.equal(label.textContent, "Offline: checking cached files",
+      "a responsive worker must not be called unavailable while CacheStorage is slow");
+    assert.equal(panel.children[1].disabled, true);
+    assert.ok(![...timeouts.values()].some(timer => timer.delay === 10000),
+      "the acknowledgement clears the initial worker-response deadline");
+    releaseStorage();
+    await Promise.all(workerTasks);
+    assert.equal(label.textContent, "Offline: not downloaded");
+    assert.equal(panel.children[1].disabled, false);
+
+    storage = new Promise(() => {});
+    serviceWorkerListeners.controllerchange();
+    const cacheCheckTimeout = [...timeouts.values()].find(timer => timer.delay === 60000);
+    assert.ok(cacheCheckTimeout, "acknowledgement must not leave a stalled storage check unbounded");
+    cacheCheckTimeout.callback();
+    assert.equal(panel.children[1].disabled, false, "a timeout must allow an explicit retry without reload");
+    assert.equal(panel.children[1].textContent, "Retry offline check");
+    let retriedType;
+    serviceWorker.controller = {
+      postMessage(data, [port]) {
+        retriedType = data.type;
+        port.postMessage({ completed: 0, total: 1, bytes: 0, totalBytes: 4096, ready: false, downloading: false });
+      },
+    };
+    panel.children[1].listeners.click();
+    assert.equal(retriedType, "datax-offline-status", "retry checks availability before asking for download size");
+    assert.equal(label.textContent, "Offline: not downloaded");
+    assert.equal(panel.children[1].textContent, "Download for offline use");
+
+    let unresponsivePort;
+    serviceWorker.controller = { postMessage(_data, [port]) { unresponsivePort = port; } };
+    serviceWorkerListeners.controllerchange();
+    const noResponseTimeout = [...timeouts.values()].find(timer => timer.delay === 10000);
+    assert.ok(noResponseTimeout);
+    noResponseTimeout.callback();
+    assert.equal(label.textContent, "Offline cache unavailable");
+    assert.equal(panel.children[1].disabled, false);
+    assert.equal(panel.children[1].textContent, "Retry offline check");
+    unresponsivePort.postMessage({ ready: true });
+    assert.equal(label.textContent, "Offline cache unavailable", "a timed-out port cannot report false readiness");
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -2797,7 +2952,10 @@ test("service worker caches across restarts and revalidates without runtime bodi
     rmSync(directory, { recursive: true, force: true });
   }
 });
-function stallHarness({ location = "https://example.com/service-worker.js?enableCache=true", mirrors = [], respond }) {
+function stallHarness({
+  location = "https://example.com/service-worker.js?enableCache=true", mirrors = [], respond,
+  respondManifest = () => new Response("", { status: 404 }),
+}) {
   const watchdogs = new Map();
   const retryDelays = [];
   const warnings = [];
@@ -2828,7 +2986,7 @@ function stallHarness({ location = "https://example.com/service-worker.js?enable
     async maybeFromCache() { throw new Error("Unexpected fallback"); },
     async fetch(request) {
       requests.push(request);
-      if (request.url.endsWith("/deployment.json")) return new Response("", { status: 404 });
+      if (request.url.endsWith("/deployment.json")) return respondManifest(request);
       return respond(request, requests.length, runtime);
     },
   });
@@ -2856,6 +3014,27 @@ function hangUntilAborted(request) {
     request.signal.addEventListener("abort", () => reject(new DOMException("The operation was aborted.", "AbortError")));
   });
 }
+
+test("a stalled mirror manifest cannot block kernel fallback to the next mirror", async () => {
+  const harness = stallHarness({
+    location: "https://datax-now.readthedocs.io/en/latest/_static/service-worker.js?enableCache=true",
+    mirrors: ["https://datax.now/", "https://datax-now.github.io/go/"],
+    respondManifest(request) {
+      return request.url.startsWith("https://datax.now/")
+        ? hangUntilAborted(request) : new Response("", { status: 404 });
+    },
+    respond(request, _count, runtime) {
+      if (request.url.startsWith("https://datax.now/")) throw new TypeError("Corporate proxy blocked mirror");
+      return request.url.startsWith("https://datax-now.readthedocs.io/")
+        ? new Response("blocked", { status: 503 }) : new Response(runtime);
+    },
+  });
+  const loading = harness.load("https://datax-now.readthedocs.io/en/latest/_static/xeus/runtime.wasm");
+  await harness.fire(45000);
+  assert.equal(await (await loading).text(), harness.runtime);
+  assert.ok(harness.requests.some(request => request.url === "https://datax-now.github.io/go/xeus/runtime.wasm"),
+    "the next mirror must still be tried after a manifest stalls");
+});
 
 test("stalled runtime responses are aborted and retried instead of waiting for the browser timeout", async () => {
   const harness = stallHarness({
