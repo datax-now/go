@@ -61,5 +61,5 @@ dependencies:
     # jupyterlite_xeus must be explicit to use the bundled custom build with
     # the variable-inspector worker API; otherwise pip resolves from PyPI.
     - built-in-wheels/jupyterlite_xeus-5.0.3-py3-none-any.whl
-    - built-in-wheels/jupyterlite_xeus_x-20261003.1474.3-py3-none-any.whl
+    - built-in-wheels/jupyterlite_xeus_x-20261005.1472.0-py3-none-any.whl
     - built-in-wheels/variable_inspector-1.4.4-py3-none-any.whl

@@ -175,6 +175,10 @@ Simultaneous kernel requests share a download. Existing runtime URLs stay stable
 fingerprints are local cache keys, not renamed server files. Other assets retain
 background ETag revalidation. URL alias rewrites preserve these validators and
 accept `304` responses without retrying.
+The esbuild browser bundle and WASM under `packages/esbuild-wasm/` are also in
+the deployment and offline-download inventories. Kernel workers must request
+them with `GET` from the app-scoped URL so they remain available offline on
+subpath deployments.
 Runtime cache misses revalidate the HTTP cache. The service worker checks the
 bytes against the build's SHA-256 digest before it returns or stores a response.
 A deployment mismatch fails the download and is not cached under the expected

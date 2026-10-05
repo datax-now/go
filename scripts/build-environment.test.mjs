@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import offline from "./offline-cache.cjs";
+import { createDeploymentManifest } from "./deployment-manifest.mjs";
 
 const build = readFileSync(new URL("../build.sh", import.meta.url), "utf8");
 const initialization = build.split("# Pinned dependency versions")[0];
@@ -58,6 +60,24 @@ test("kernel archives are normalized with the pinned deployment Python before in
   assert.match(build, /DATAX_BUILD_PYTHON="\$DEPLOY_PREFIX\/bin\/python" node "\$REPO_ROOT\/scripts\/fingerprint-runtime\.cjs" dist/);
   const offline = readFileSync(new URL("./offline-cache.cjs", import.meta.url), "utf8");
   assert.ok(offline.indexOf("normalize-kernel-packages.py") < offline.indexOf("assets[relative] ="));
+});
+
+test("bundled esbuild files are included in the offline and deployment inventories", async t => {
+  assert.match(build, /ESBUILD_VERSION="0\.28\.2"/);
+
+  const directory = mkdtempSync(join(tmpdir(), "datax-esbuild-offline-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const packageDirectory = join(directory, "packages", "esbuild-wasm");
+  mkdirSync(packageDirectory, { recursive: true });
+  writeFileSync(join(packageDirectory, "browser.min.js"), "esbuild browser bundle");
+  writeFileSync(join(packageDirectory, "esbuild.wasm"), "esbuild wasm module");
+
+  const offlineAssets = offline.prepareOffline(directory, "0");
+  const deployment = await createDeploymentManifest(directory, "a".repeat(40));
+  for (const asset of ["packages/esbuild-wasm/browser.min.js", "packages/esbuild-wasm/esbuild.wasm"]) {
+    assert.ok(offlineAssets[asset], `${asset} is available for offline download`);
+    assert.ok(deployment.files[asset], `${asset} is included in deployment.json`);
+  }
 });
 
 test("kernel archive normalization preserves payloads, links, modes and member order", t => {
