@@ -110,6 +110,98 @@ handshake are still replaced immediately, one last time.
 Generated web-manifest shortcuts use relative URLs so they stay within the
 deployment path on Read the Docs and GitHub Pages.
 
+### PWA installation, updates, and mobile support
+
+The shared build adds 192px and 512px install icons, a separate opaque maskable
+icon, an Apple touch icon, iOS installation metadata, and portrait/landscape
+launch images for 20 current iPhone/iPad screen sizes. Wide and narrow manifest
+screenshots populate Chromium's richer install dialog. Manifest identity, launch
+URL, shortcuts, icons, screenshots, file handlers, and scope stay relative to the deployment root: `/` on Vercel,
+`/go/` on GitHub Pages, and `/en/latest/_static/` on RTD. The installed app opens
+the lab directly. The manifest allows either orientation and prefers standalone
+display with a minimal-UI fallback. Notebook storage remains separate on each origin.
+
+Browsers that emit `beforeinstallprompt` get an **Install app** button; no
+installation dialog is opened automatically. On iOS, the UI explains Safari's
+**Share > Add to Home Screen** workflow instead. Installation does not guarantee
+that the complete application or kernel is cached.
+
+On Chromium desktop browsers, the installed app is registered as a handler for
+`.ipynb` files. A notebook opened from the operating system is validated,
+copied into the app's browser storage under a unique name (for example
+`report (1).ipynb`), and opened in the lab. Edits apply to the browser copy and
+are **not** written back to the original file; download the notebook to keep
+changes outside the browser. No `launch_handler` is set, so manifest shortcuts
+still open their own window.
+
+The build copies `exposeAppInBrowser` into JupyterLite's `jupyter-config-data`,
+which is the only place JupyterLite reads it. File launches and the automatic
+offline download after five idle kernel minutes both depend on the resulting
+`window.jupyterapp`.
+
+A small, versioned offline explanation page and its icon are cached during
+service-worker installation. They provide a fallback when a navigation cannot
+be served, without downloading the large WASM runtime or claiming **Offline
+ready**. The existing verified full-download flow is still required for offline
+notebook execution.
+The offline status tooltip distinguishes a downloaded runtime from installation
+and warns that new packages, remote APIs, and AI providers still need a network.
+When the browser is disconnected, a fully cached app shows **Offline ready
+(disconnected)**. Export important notebooks as a backup even when persistent
+browser storage has been granted.
+
+An update discovered while the app is running shows **Save work and update**.
+The user must confirm after saving notebooks; reloading stops running kernels.
+The button uses the existing single-tab activation handshake and asks users to
+close other app tabs when necessary. It never forces a running app to reload.
+The startup handshake and session reload guard remain unchanged.
+An update already downloading when the client attaches is observed as well.
+Returning to the visible app or reconnecting checks for updates at most once a
+minute, without concurrent checks or automatically reloading running kernels.
+
+App controls use JupyterLab light/dark theme variables, visible keyboard focus,
+touch-friendly mobile sizing, and notch/home-indicator safe-area insets. On
+screens up to 600px wide, the offline control floats above the 24px status bar
+instead of being clipped inside it, and the plugin playground log badge moves
+above the control. Mobile menus are bounded to the available viewport without replacing Lumino's menu
+positioning or keyboard behavior.
+
+Vercel and Cloudflare set `nosniff`, Referrer-Policy, Permissions-Policy, and a
+baseline CSP (`base-uri 'self'; object-src 'none'`) directly. Shared HTML carries
+the CSP and referrer metadata; controlled navigation responses add the headers
+on GitHub Pages and RTD as well. Uncontrolled first responses on those static
+hosts remain subject to host-provided headers. The CSP deliberately does not
+restrict scripts, workers, or network connections: notebooks execute user code,
+load WASM, and connect to user-selected APIs. It is not a strict script-injection
+defense. Permissions are limited to the app origin, not disabled there.
+Vercel and Cloudflare also set a one-year HSTS policy for the served hostname,
+without opting unrelated subdomains into HSTS. GitHub Pages and RTD manage
+transport security themselves; service-worker response headers are not a
+substitute for host-level HTTPS enforcement or HSTS.
+
+Static scripts linked in generated HTML get SHA-384 SRI **after** build patches
+are applied. Runtime and lazy-loaded assets retain the existing SHA-256
+verification. Canonical links resolve within each host's deployment path; the
+Open Graph preview image uses the stable GitHub Pages icon URL. All generated
+PWA assets are included in the same offline and deployment inventories.
+Builds, the GitHub Pages workflow, and RTD (including restored canonical artifacts)
+validate install-icon, screenshot, and iOS launch-image bytes and dimensions,
+manifest scope, launch and file-handler paths, the exposed JupyterLite app,
+all three app routes, script integrity, and service-worker integration before
+publishing. Run the same check on a generated or restored site with:
+
+```bash
+node scripts/pwa.cjs verify dist
+```
+
+The audit score is not a feature roadmap: push notifications, background sync,
+and real-time room re-subscription are not required for local notebook kernels.
+Current-inventory cache pruning bounds release assets without expiring files
+needed for offline use. JupyterLab's ARIA landmarks and Lumino menu positioning
+are retained. Inspect production network responses for compression: verified
+service-worker responses are decoded and remove `Content-Encoding`, so an
+absent header on a cached response does not prove the origin lacks compression.
+
 Each build writes `dist/deployment.json` with its checked-out Git commit and a
 SHA-256 inventory of the static assets. Compare the active GitHub Pages, Vercel
 and Cloudflare deployments, listed in priority order, with:
@@ -223,7 +315,7 @@ kernel initialization failure.
 Run the focused regression checks with:
 
 ```bash
-node --test scripts/build-environment.test.mjs scripts/service-worker-cache.test.mjs scripts/deployment-manifest.test.mjs scripts/kernel-config.test.mjs
+node --test scripts/build-environment.test.mjs scripts/service-worker-cache.test.mjs scripts/deployment-manifest.test.mjs scripts/kernel-config.test.mjs scripts/pwa.test.mjs
 python3 -B -m unittest discover -s scripts -p 'test_deployment_artifact.py'
 ```
 
@@ -256,6 +348,15 @@ notebooks without an internet connection.
 App navigation remains available when notebook query parameters change.
 The idle monitor's kernel connections do not handle widget comms, leaving
 comm ownership with notebook connections even when monitoring starts first.
+
+Where the Network Information API is available, automatic downloads are paused
+on data-saver and slow (`slow-2g`, `2g`, or `3g`) connections; manual downloads
+remain available. Before starting, the app checks the storage estimate when
+supported and reports insufficient space without deleting saved notebooks.
+Persistent-storage failures or declined requests are logged with a reminder to
+export important notebooks. Returning to the foreground refreshes the offline
+check or resumes an interrupted download. Storage estimates are advisory:
+browser eviction, quota changes, and write failures can still prevent readiness.
 
 The kernel's conda-to-PyPI name mapping is also bundled locally. Its build input,
 `scripts/conda-pypi-mapping.json`, is a snapshot of prefix-dev/parselmouth's

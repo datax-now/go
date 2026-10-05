@@ -2,6 +2,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
+const pwa = require('./pwa.cjs');
 
 function installOfflineCache(assets) {
   const original = maybeFromCache;
@@ -353,8 +354,12 @@ function offlineStatusText(state, mode, online, controlled = true) {
     const qualifier = mode === 'automatic' ? ' automatically' : '';
     return 'Downloading offline' + qualifier + ': ' + state.completed + '/' + state.total;
   }
-  if (state.ready) return 'Offline ready' + (mode === 'automatic' ? ' (automatic)' : '');
+  if (state.ready) return 'Offline ready' + (!online ? ' (disconnected)' : mode === 'automatic' ? ' (automatic)' : '');
   return online ? 'Offline: not downloaded' : 'Offline: incomplete';
+}
+
+function allowsAutomaticOfflineDownload(connection) {
+  return !connection?.saveData && !['slow-2g', '2g', '3g'].includes(connection?.effectiveType);
 }
 
 function installOfflineUI() {
@@ -372,15 +377,22 @@ function installOfflineUI() {
   button.disabled = true;
   panel.append(label, button);
   const style = document.createElement('style');
-  style.textContent = '#datax-offline-control{display:flex;align-items:center;gap:8px;padding:2px 8px;font:12px var(--jp-ui-font-family,sans-serif);color:var(--jp-ui-font-color1,#222);background:var(--jp-layout-color1,#fff);max-width:100%;box-sizing:border-box}#datax-offline-control[data-floating]{position:fixed;bottom:0;right:0;z-index:1000;border:1px solid #aaa}#datax-offline-control button{font:inherit;color:inherit;background:var(--jp-layout-color2,#eee);border:1px solid #999;border-radius:3px;padding:3px 6px;cursor:pointer;flex-shrink:0}#datax-offline-control button:disabled{cursor:default;opacity:.65}@media(max-width:600px){#datax-offline-control{position:fixed;bottom:0;right:0;z-index:1000;max-width:100vw;flex-wrap:wrap;font-size:11px;gap:4px}}';
+  style.textContent = '#datax-offline-control{display:flex;align-items:center;gap:8px;padding:2px 8px;font:12px var(--jp-ui-font-family,sans-serif);color:var(--jp-ui-font-color1,#222);background:var(--jp-layout-color1,#fff);max-width:100%;box-sizing:border-box}#datax-offline-control[data-floating]{position:fixed;bottom:0;right:0;z-index:1000;border:1px solid #aaa}#datax-offline-control button{font:inherit;color:inherit;background:var(--jp-layout-color2,#eee);border:1px solid #999;border-radius:3px;padding:3px 6px;cursor:pointer;flex-shrink:0}#datax-offline-control button:disabled{cursor:default;opacity:.65}@media(max-width:600px){#datax-offline-control{max-width:calc(100vw - env(safe-area-inset-left,0px) - env(safe-area-inset-right,0px));flex-wrap:wrap;font-size:11px;gap:4px}#datax-offline-control[data-floating]{bottom:calc(env(safe-area-inset-bottom,0px) + var(--jp-statusbar-height,24px));right:env(safe-area-inset-right,0px)}}';
   document.head.append(style);
-  panel.dataset.floating = '';
-  document.body.append(panel);
-  const observer = new MutationObserver(() => {
+  // The 24px status bar clips 44px touch targets, so narrow screens float the control above it.
+  const narrow = window.matchMedia?.('(max-width: 600px)');
+  function place() {
     const bar = document.querySelector('.jp-StatusBar-Right');
-    if (bar) { delete panel.dataset.floating; bar.append(panel); observer.disconnect(); }
-  });
+    const target = bar && !narrow?.matches ? bar : document.body;
+    if (target === bar) delete panel.dataset.floating;
+    else panel.dataset.floating = '';
+    if (panel.parentElement !== target) target.append(panel);
+    return !!bar;
+  }
+  place();
+  const observer = new MutationObserver(() => { if (place()) observer.disconnect(); });
   observer.observe(document.body, { childList: true, subtree: true });
+  narrow?.addEventListener?.('change', place);
   let current = null;
   let channel = null;
   let kernelStatuses = null;
@@ -390,8 +402,10 @@ function installOfflineUI() {
   let completionLogged = false;
   let stallTimer = null;
   let responseTimeout = null;
+  let startingDownload = false;
   function canAutoDownload() {
-    return navigator.onLine && !!navigator.serviceWorker.controller && !!current
+    return navigator.onLine && allowsAutomaticOfflineDownload(navigator.connection)
+      && !startingDownload && !!navigator.serviceWorker.controller && !!current
       && !current.ready && !current.checking && !current.downloading && !current.unavailable;
   }
   const idleScheduler = createKernelIdleScheduler(() => startDownload(true));
@@ -468,8 +482,11 @@ function installOfflineUI() {
         }
       } else {
         button.textContent = 'Download for offline use';
-        panel.title = state.total + ' files; ' + Math.ceil(state.totalBytes / 1048576)
-          + ' MiB; automatic download after 5 minutes with every kernel idle';
+        panel.title = state.ready
+          ? 'The bundled app and runtime are cached. New packages, remote APIs, and AI providers still require a connection. Export important notebooks as a backup.'
+          : 'Installing the app does not download its runtime. ' + state.total + ' files; '
+            + Math.ceil(state.totalBytes / 1048576)
+            + ' MiB; automatic download after 5 minutes with every kernel idle';
         label.textContent = offlineStatusText(state, downloadMode, navigator.onLine);
         if (state.ready && downloadMode === 'automatic' && !completionLogged) {
           console.info('[DataX.now] Automatic offline download complete. Offline use is ready.');
@@ -484,8 +501,11 @@ function installOfflineUI() {
   }
   async function startDownload(automatic = false) {
     if (automatic && !canAutoDownload()) return;
+    if (startingDownload || current?.downloading) return;
     const remaining = Math.ceil(((current?.totalBytes ?? 0) - (current?.bytes ?? 0)) / 1048576);
     if (!automatic && !confirm('Download ' + remaining + ' MiB for offline use on this device?')) return;
+    startingDownload = true;
+    button.disabled = true;
     downloadMode = automatic ? 'automatic' : 'manual';
     lastLoggedProgress = 0;
     lastLoggedError = null;
@@ -494,16 +514,38 @@ function installOfflineUI() {
       label.textContent = 'Starting automatic offline download';
       console.info('[DataX.now] Starting automatic offline download after five minutes with all kernels idle.');
     }
-    try { await navigator.storage?.persist?.(); } catch {}
-    button.disabled = true;
-    request('datax-offline-download');
+    try {
+      let estimate;
+      try { estimate = await navigator.storage?.estimate?.(); }
+      catch (error) { console.warn('[DataX.now] Could not estimate available browser storage.', error); }
+      const bytesNeeded = Math.max(0, (current?.totalBytes ?? 0) - (current?.bytes ?? 0));
+      if (estimate && Number.isFinite(estimate.quota) && Number.isFinite(estimate.usage)
+          && bytesNeeded > estimate.quota - estimate.usage) {
+        label.textContent = 'Not enough browser storage for offline use';
+        panel.title = 'Free browser storage, then retry. Saved notebooks have not been deleted.';
+        console.error('[DataX.now] Insufficient browser storage for the offline download.', estimate);
+        button.disabled = false;
+        return;
+      }
+      try {
+        const persisted = await navigator.storage?.persist?.();
+        if (persisted === false) console.warn('[DataX.now] Persistent storage was not granted; export important notebooks as a backup.');
+      } catch (error) {
+        console.warn('[DataX.now] Could not request persistent browser storage.', error);
+      }
+      request('datax-offline-download');
+    } finally {
+      startingDownload = false;
+      updateIdleScheduler();
+    }
   }
   button.addEventListener('click', () => {
     if (current?.unavailable) request('datax-offline-status');
     else startDownload();
   });
-  navigator.serviceWorker.ready.then(() => request('datax-offline-status')).catch(() => {
+  navigator.serviceWorker.ready.then(() => request('datax-offline-status')).catch(error => {
     label.textContent = 'Offline cache unavailable';
+    console.error('[DataX.now] Could not connect to the offline service worker.', error);
   });
   navigator.serviceWorker.addEventListener('controllerchange', () => {
     request(current?.downloading ? 'datax-offline-download' : 'datax-offline-status');
@@ -514,6 +556,13 @@ function installOfflineUI() {
     updateIdleScheduler();
   });
   window.addEventListener('offline', () => { if (!current?.downloading) request('datax-offline-status'); });
+  navigator.connection?.addEventListener('change', updateIdleScheduler);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      request(current?.downloading ? 'datax-offline-download' : 'datax-offline-status');
+      updateIdleScheduler();
+    }
+  });
   const stopKernelMonitor = monitorKernelActivity(statuses => {
     kernelStatuses = statuses;
     updateIdleScheduler();
@@ -654,7 +703,21 @@ function prepareOffline(directory, sourceDateEpoch = process.env.SOURCE_DATE_EPO
   const heartbeat = 'fetch("/api/service-worker-heartbeat")';
   const localHeartbeat = 'fetch(typeof document==="undefined"?"/api/service-worker-heartbeat":new URL("api/service-worker-heartbeat",new URL(JSON.parse(document.getElementById("jupyter-config-data").textContent).baseUrl||"../",document.baseURI)).href)';
   const client = 'datax-offline.js';
-  fs.writeFileSync(path.join(directory, client), `${createKernelIdleScheduler.toString()}\n${monitorKernelActivity.toString()}\n${offlineStatusText.toString()}\n(${installOfflineUI.toString()})();\n`);
+  fs.writeFileSync(path.join(directory, client), `${createKernelIdleScheduler.toString()}\n${monitorKernelActivity.toString()}\n${offlineStatusText.toString()}\n${allowsAutomaticOfflineDownload.toString()}\n(${installOfflineUI.toString()})();\n`);
+  function patchJavaScript(folder) {
+    for (const entry of fs.readdirSync(folder, { withFileTypes: true })) {
+      const filename = path.join(folder, entry.name);
+      if (entry.isDirectory()) patchJavaScript(filename);
+      else if (entry.isFile() && entry.name.endsWith('.js') && entry.name !== 'service-worker.js') {
+        const source = fs.readFileSync(filename, 'utf8');
+        let updated = source.split(heartbeat).join(localHeartbeat);
+        if (updated.includes('_unregisterOldServiceWorkers(')) updated = patchServiceWorkerManager(updated);
+        if (updated.includes('async _getServerDirectory(')) updated = patchContentsManager(updated);
+        if (updated !== source) fs.writeFileSync(filename, updated);
+      }
+    }
+  }
+  patchJavaScript(directory);
   const assets = {};
   function visit(folder) {
     for (const entry of fs.readdirSync(folder, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
@@ -667,13 +730,6 @@ function prepareOffline(directory, sourceDateEpoch = process.env.SOURCE_DATE_EPO
         'service-worker.js', 'deployment.json', 'xpython-deploy-manifest.json', 'datax-now.zip', 'cors_server.py',
         'xeus/xeus-python-wasm-host/built-in-local/conda/generate_repodata.py',
       ].includes(relative)) continue;
-      if (entry.name.endsWith('.js')) {
-        const source = fs.readFileSync(filename, 'utf8');
-        let updated = source.split(heartbeat).join(localHeartbeat);
-        if (updated.includes('_unregisterOldServiceWorkers(')) updated = patchServiceWorkerManager(updated);
-        if (updated.includes('async _getServerDirectory(')) updated = patchContentsManager(updated);
-        if (updated !== source) fs.writeFileSync(filename, updated);
-      }
       if (entry.name.endsWith('.html') && sourceDateEpoch !== undefined) {
         const html = fs.readFileSync(filename, 'utf8');
         const updated = html.replace(/([^"'<> \t\r\n?]+\.js)\?_=[a-f0-9]+/g, (match, script) => {
@@ -689,7 +745,8 @@ function prepareOffline(directory, sourceDateEpoch = process.env.SOURCE_DATE_EPO
       if (entry.name === 'index.html') {
         const html = fs.readFileSync(filename, 'utf8');
         const script = `<script id="datax-offline-client" src="${path.relative(path.dirname(filename), path.join(directory, client)).split(path.sep).join('/')}" defer></script>`;
-        const updated = html.includes('id="datax-offline-client"') ? html : html.replace('</body>', script + '</body>');
+        let updated = html.includes('id="datax-offline-client"') ? html : html.replace('</body>', script + '</body>');
+        if (updated.includes('id="datax-pwa-metadata"')) updated = pwa.addScriptIntegrity(updated, filename, directory);
         if (updated !== html) fs.writeFileSync(filename, updated);
       }
       const bytes = fs.readFileSync(filename);
@@ -704,4 +761,4 @@ function prepareOffline(directory, sourceDateEpoch = process.env.SOURCE_DATE_EPO
   return assets;
 }
 
-module.exports = { createKernelIdleScheduler, installOfflineCache, installOfflineUI, installUpdateLifecycle, monitorKernelActivity, offlineStatusText, patchContentsManager, patchServiceWorkerManager, prepareOffline };
+module.exports = { allowsAutomaticOfflineDownload, createKernelIdleScheduler, installOfflineCache, installOfflineUI, installUpdateLifecycle, monitorKernelActivity, offlineStatusText, patchContentsManager, patchServiceWorkerManager, prepareOffline };

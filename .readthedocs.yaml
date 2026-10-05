@@ -10,6 +10,7 @@ build:
       - python -m pip install --upgrade pip
       - python -m pip install -r docs/requirements.txt
       - python scripts/deployment-artifact.py restore
+      - node scripts/pwa.cjs verify dist
 
 sphinx:
   builder: html

@@ -1557,7 +1557,7 @@ def patch_json(path, app_name=None):
                 container['federated_extensions'] = retained
                 changed = True
 
-    for key in ('appName', 'defaultKernelName', 'enableServiceWorkerCache'):
+    for key in ('appName', 'defaultKernelName', 'exposeAppInBrowser', 'enableServiceWorkerCache'):
       value = source_config.get(key)
       if value is not None and config.get(key) != value:
         config[key] = value
@@ -3907,7 +3907,9 @@ DATAX_BUILD_COMMIT="$(node "$REPO_ROOT/scripts/deployment-manifest.mjs" commit "
 export DATAX_BUILD_COMMIT
 node "$REPO_ROOT/scripts/verify-kernel-config.mjs" dist
 SAFE_ASM_EXT="$SAFE_ASM_EXT" node "$REPO_ROOT/scripts/patch-wasm-startup.cjs" dist --compact
+node "$REPO_ROOT/scripts/pwa.cjs" dist
 DATAX_BUILD_PYTHON="$DEPLOY_PREFIX/bin/python" node "$REPO_ROOT/scripts/fingerprint-runtime.cjs" dist
+node "$REPO_ROOT/scripts/pwa.cjs" verify dist
 
   # Include the local CORS server for users serving the generated directory.
   cp "$REPO_ROOT/cors_server.py" "dist/cors_server.py"

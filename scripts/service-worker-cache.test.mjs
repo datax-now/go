@@ -2414,6 +2414,8 @@ test("offline status distinguishes controller wait and automatic download lifecy
   assert.equal(offline.offlineStatusText({ downloading: true, completed: 2, total: 10 }, "automatic", true),
     "Downloading offline automatically: 2/10");
   assert.equal(offline.offlineStatusText({ ready: true }, "automatic", true), "Offline ready (automatic)");
+  assert.equal(offline.offlineStatusText({ ready: true }, null, false), "Offline ready (disconnected)");
+  assert.equal(offline.offlineStatusText({ ready: true }, "automatic", false), "Offline ready (disconnected)");
   assert.equal(offline.offlineStatusText({ error: "quota exceeded" }, "automatic", true),
     "Automatic offline download failed");
   assert.equal(offline.offlineStatusText({}, null, false), "Offline: incomplete");
@@ -2497,6 +2499,7 @@ test("generated offline client includes the kernel idle monitor", async () => {
       body: makeElement("body"),
       createElement: makeElement,
       querySelector() { return null; },
+      addEventListener() {},
     };
     const serviceWorker = {
       controller: null,

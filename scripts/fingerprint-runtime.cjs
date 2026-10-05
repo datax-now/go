@@ -2,6 +2,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const offline = require('./offline-cache.cjs');
+const pwa = require('./pwa.cjs');
 
 // Ordered by priority: a host later in the list is only tried after every earlier one failed.
 const DEFAULT_MIRROR_ORIGINS = [
@@ -251,6 +252,7 @@ function fingerprintRuntime(directory, mirrorOrigins = DEFAULT_MIRROR_ORIGINS, b
   const source = fs.readFileSync(worker, 'utf8').split(marker)[0];
   fs.writeFileSync(worker, source + marker + `(${installRuntimeCache.toString()})(${JSON.stringify(hashes)}, ${JSON.stringify(mirrorOrigins)}, ${JSON.stringify(buildCommit)}, ${JSON.stringify(assetHashes)});\n` +
     `(${offline.installOfflineCache.toString()})(${JSON.stringify(assets)});\n` +
+    (assets['offline.html'] ? `(${pwa.installPwaNavigation.toString()})(${JSON.stringify(pwa.fallbackInventory(assets))}, ${JSON.stringify(pwa.CONTENT_SECURITY_POLICY)}, ${JSON.stringify(pwa.PERMISSIONS_POLICY)});\n` : '') +
     `(${offline.installUpdateLifecycle.toString()})();\n`);
   console.log(`Fingerprinted ${Object.keys(hashes).length} runtime files for cache-first reuse`);
   return hashes;

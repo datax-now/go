@@ -36,6 +36,7 @@ jobs:
         run: |
           python3 -B -m unittest discover -s scripts -p 'test_deployment_artifact.py'
           node --test --test-name-pattern='RTD restored artifacts' scripts/service-worker-cache.test.mjs
+          node --test scripts/pwa.test.mjs
 
       - name: Restore the canonical deployment if already published
         id: artifact
@@ -63,6 +64,7 @@ jobs:
           set -euo pipefail
           test -s dist/deployment.json
           test -f dist/cors_server.py
+          node scripts/pwa.cjs verify dist
           commit="$(git rev-parse HEAD)"
           test "$(jq -er '.commit' dist/deployment.json)" = "$commit"
           echo "commit=${commit}" >> "$GITHUB_OUTPUT"
