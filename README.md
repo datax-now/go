@@ -381,12 +381,17 @@ Downloads are SHA-256 verified and reuse already cached files. An interrupted
 download can be retried without starting over. Failed downloads or insufficient
 browser storage never report readiness. The app requests persistent storage,
 but browsers may decline it or evict data; the readiness check runs again when
-the app opens. Once a download has completed, each later release downloads its
-changed files before its service worker activates. Until that finishes, the
-previous offline-ready release stays active and the update is retried on a
-later visit. Activation then removes cached files that no current release
-uses. If progress stalls, for example because the browser stopped the service
-worker, the app resumes the download from the files already cached.
+the app opens. If CacheStorage rejects a write, the offline download reports the
+browser's error instead of hiding it behind a generic storage message. Declining
+persistent storage does not itself prevent downloads. The small PWA fallback
+cache is separate from the full offline cache: its cached icon and fallback page
+must also be stored in the full cache before the app reports **Offline ready**.
+Once a download has completed, each later release downloads its changed files
+before its service worker activates. Until that finishes, the previous offline-ready
+release stays active and the update is retried on a later visit. Activation then
+removes cached files that no current release uses. If progress stalls, for
+example because the browser stopped the service worker, the app resumes the
+download from the files already cached.
 On Read the Docs and GitHub Pages, startup checks for a waiting release before
 loading JupyterLite, waits for a newly discovered worker to finish installing,
 and reloads into it when activation is safe. An already waiting release does
@@ -484,7 +489,10 @@ The browser can log a failed request for the original RTD response even when a
 verified mirror subsequently supplies the correct file. That console message
 alone does not mean the offline download failed. **Offline ready** requires every
 inventory entry to be stored under its local build hash; otherwise the status
-bar reports the failing asset instead of readiness.
+bar reports the failing asset instead of readiness. Optional JavaScript source
+maps (`.map`) are excluded from the offline inventory because they are only
+debugging aids and some hosts deny them even when the application assets are
+available.
 
 These requests use CORS without credentials. Runtime requests are checked
 against the mirror's `deployment.json`; offline downloads additionally require

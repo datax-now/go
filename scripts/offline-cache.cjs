@@ -10,8 +10,10 @@ function installOfflineCache(assets) {
   const enabled = new URL(self.location.href).searchParams.get('enableCache') === 'true';
   const cacheName = 'datax-runtime-sha256-v2';
   const pending = new Map();
+  const cacheWriteErrors = new Map();
   const entries = Object.entries(assets);
   let preparation = null;
+  let recordingCacheWriteErrors = false;
   const ports = new Set();
   const keyFor = (relative, asset) => {
     const key = new URL(relative, scope);
@@ -45,7 +47,7 @@ function installOfflineCache(assets) {
       return drop(request, url);
     };
   }
-  maybeFromCache = async function(event) {
+  async function fromOfflineCache(event) {
     const request = event.request;
     const relative = relativeFor(request);
     if (!enabled || !relative || request.method !== 'GET' || request.headers.has('Range')) return original(event);
@@ -83,7 +85,12 @@ function installOfflineCache(assets) {
           response = new Response(response.body, { status: response.status, statusText: response.statusText, headers });
         }
         if (response.ok && response.status !== 206) {
-          try { await cache.put(key, response.clone()); } catch {}
+          try {
+            await cache.put(key, response.clone());
+            cacheWriteErrors.delete(key);
+          } catch (error) {
+            if (recordingCacheWriteErrors) cacheWriteErrors.set(key, error);
+          }
         }
         return response;
       })();
@@ -91,7 +98,8 @@ function installOfflineCache(assets) {
       event.waitUntil(download.then(() => {}, () => {}).finally(() => pending.delete(key)));
     }
     return (await pending.get(key)).clone();
-  };
+  }
+  maybeFromCache = fromOfflineCache;
   const totalBytes = entries.reduce((total, [, asset]) => total + asset.size, 0);
   // Marks that the user opted into offline use, so later releases are cached before they activate.
   const readyKey = new URL('datax-offline-ready', scope).href;
@@ -111,6 +119,8 @@ function installOfflineCache(assets) {
   }
   function download() {
     if (preparation) return preparation;
+    cacheWriteErrors.clear();
+    recordingCacheWriteErrors = true;
     preparation = (async () => {
       const cache = await caches.open(cacheName);
       const keys = await cachedKeys(cache);
@@ -125,14 +135,22 @@ function installOfflineCache(assets) {
         while (queue.length && !failure) {
           const [relative, asset] = queue.shift();
           try {
-            const response = await maybeFromCache({
+            // Later PWA wrappers can return files from a separate cache, which does not count toward readiness.
+            const response = await fromOfflineCache({
               request: new Request(new URL(relative, scope).href),
               waitUntil() {},
             });
             if (!response.ok) throw new Error('HTTP ' + response.status + ': ' + relative);
-            if (!await cache.match(keyFor(relative, asset))) {
+            const key = keyFor(relative, asset);
+            if (!await cache.match(key)) {
+              const writeError = cacheWriteErrors.get(key);
+              cacheWriteErrors.delete(key);
+              if (writeError) {
+                throw new Error('Unable to store ' + relative + ': ' + String(writeError));
+              }
               throw new Error('Unable to store ' + relative + '. Check available browser storage.');
             }
+            cacheWriteErrors.delete(key);
             progress = { ...progress, completed: progress.completed + 1, bytes: progress.bytes + asset.size };
             report();
           } catch (error) { failure = new Error(relative + ': ' + error.message); }
@@ -141,6 +159,8 @@ function installOfflineCache(assets) {
       if (failure) throw failure;
       try { await cache.put(readyKey, new Response('')); } catch {}
     })().finally(() => {
+      recordingCacheWriteErrors = false;
+      cacheWriteErrors.clear();
       preparation = null;
       progress = null;
     });
@@ -729,7 +749,7 @@ function prepareOffline(directory, sourceDateEpoch = process.env.SOURCE_DATE_EPO
       if ([
         'service-worker.js', 'deployment.json', 'xpython-deploy-manifest.json', 'datax-now.zip', 'cors_server.py',
         'xeus/xeus-python-wasm-host/built-in-local/conda/generate_repodata.py',
-      ].includes(relative)) continue;
+      ].includes(relative) || entry.name.endsWith('.map')) continue;
       if (entry.name.endsWith('.html') && sourceDateEpoch !== undefined) {
         const html = fs.readFileSync(filename, 'utf8');
         const updated = html.replace(/([^"'<> \t\r\n?]+\.js)\?_=[a-f0-9]+/g, (match, script) => {

@@ -2255,7 +2255,7 @@ test("offline downloads resume, verify every asset, and survive worker restarts"
   online = true;
   rejectWrites = true;
   const quota = await restarted.send("datax-offline-download");
-  assert.match(quota.at(-1).error, /browser storage/);
+  assert.match(quota.at(-1).error, /Quota exceeded/);
   assert.equal(quota.at(-1).ready, false);
   assert.equal(stored.size, 0);
 });
@@ -2742,6 +2742,95 @@ test("offline inventory includes lazy assets but excludes archives and mutable d
       assert.equal(asset.size, bytes.length);
     }
   } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("manual offline download succeeds when hosts deny source maps", async t => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-offline-source-maps-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  mkdirSync(join(directory, "build"), { recursive: true });
+  writeFileSync(join(directory, "build/app.js"), "app bundle");
+  writeFileSync(join(directory, "build/app.js.map"), '{"sources":[]}');
+  const assets = offline.prepareOffline(directory);
+  assert.equal(assets["build/app.js.map"], undefined, "debug-only source maps are not required offline assets");
+  const stored = new Map();
+  const requests = [];
+  let message;
+  const cache = {
+    async match(key) { return stored.get(key.url ?? key)?.clone(); },
+    async put(key, response) { stored.set(key.url ?? key, response.clone()); },
+    async keys() { return [...stored.keys()].map(url => new Request(url)); },
+  };
+  const scope = "https://datax.now/";
+  const context = vm.createContext({
+    URL, Request, Response, Headers, btoa, assets,
+    self: {
+      location: { href: scope + "service-worker.js?enableCache=true" },
+      addEventListener(type, listener) { if (type === "message") message = listener; },
+      async dataxFetchOfflineAsset(request) {
+        requests.push(request.url);
+        return request.url.endsWith(".map")
+          ? new Response("Forbidden", { status: 403 })
+          : new Response("asset");
+      },
+    },
+    caches: { async open() { return cache; } },
+    async maybeFromCache(event) { return context.fetch(event.request); },
+    async fetch() { return new Response("asset"); },
+  });
+  vm.runInContext(`(${offline.installOfflineCache.toString()})(assets);`, context);
+  const updates = [];
+  const tasks = [];
+  message({
+    data: { type: "datax-offline-download" }, source: { url: scope + "lab/" },
+    ports: [{ postMessage(update) { updates.push(update); } }],
+    waitUntil(task) { tasks.push(task); },
+  });
+  await Promise.all(tasks);
+  assert.equal(updates.at(-1).ready, true, updates.at(-1).error);
+  assert.equal(requests.some(url => url.endsWith(".map")), false);
+});
+
+test("manual offline download reports CacheStorage write failures", async t => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-offline-storage-error-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  writeFileSync(join(directory, "icon-192x192.png"), "icon");
+  const assets = offline.prepareOffline(directory);
+  const stored = new Map();
+  let message;
+  const cache = {
+    async match(key) { return stored.get(key.url ?? key)?.clone(); },
+    async put(key, response) {
+      if ((key.url ?? key).includes("icon-192x192.png")) {
+        const error = new Error("Storage quota exceeded");
+        error.name = "QuotaExceededError";
+        throw error;
+      }
+      stored.set(key.url ?? key, response.clone());
+    },
+    async keys() { return [...stored.keys()].map(url => new Request(url)); },
+  };
+  const scope = "https://datax.now/";
+  const context = vm.createContext({
+    URL, Request, Response, Headers, btoa, assets,
+    self: {
+      location: { href: scope + "service-worker.js?enableCache=true" },
+      addEventListener(type, listener) { if (type === "message") message = listener; },
+      async dataxFetchOfflineAsset() { return new Response("asset"); },
+    },
+    caches: { async open() { return cache; } },
+    async maybeFromCache(event) { return context.fetch(event.request); },
+    async fetch() { return new Response("asset"); },
+  });
+  vm.runInContext(`(${offline.installOfflineCache.toString()})(assets);`, context);
+  const updates = [];
+  const tasks = [];
+  message({
+    data: { type: "datax-offline-download" }, source: { url: scope + "lab/" },
+    ports: [{ postMessage(update) { updates.push(update); } }],
+    waitUntil(task) { tasks.push(task); },
+  });
+  await Promise.all(tasks);
+  assert.match(updates.at(-1).error, /QuotaExceededError: Storage quota exceeded/);
 });
 
 test("RTD offline download completes despite unavailable timestamped diagnostics", async t => {

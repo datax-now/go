@@ -451,6 +451,119 @@ test('small offline fallback and security headers stay in scope without claiming
   }
 });
 
+test('full offline download stores assets already cached by the PWA fallback', async () => {
+  const icon = { 'icon-192x192.png': 'png' };
+  const app = {
+    ...icon,
+    'offline.html': '<html><head></head><body>offline</body></html>',
+    'lab/index.html': '<html><head></head><body>app</body></html>',
+    'xeus/runtime.wasm': 'runtime',
+  };
+  for (const [prefix, files] of [['/', icon], ['/', app], ['/go/', app], ['/en/latest/_static/', app]]) {
+    const scope = 'https://example.com' + prefix;
+    const stores = new Map();
+    const handlers = new Map();
+    const assets = Object.fromEntries(Object.entries(files).map(([relative, body]) => [relative, {
+      sha256: createHash('sha256').update(body).digest('hex'), size: Buffer.byteLength(body),
+      ...(relative.endsWith('.html') ? { source: relative + '.offline' } : {}),
+    }]));
+    const hashes = Object.fromEntries(Object.entries(assets)
+      .filter(([relative]) => relative.startsWith('xeus/')).map(([relative, asset]) => [relative, asset.sha256]));
+    let online = true;
+    let rejectIconWrites = false;
+    const requests = [];
+    const context = vm.createContext({
+      URL, Request, Response, Headers, btoa, atob, AbortController,
+      crypto: globalThis.crypto, setTimeout, clearTimeout, console,
+      caches: { async open(name) {
+        if (!stores.has(name)) stores.set(name, new Map());
+        const stored = stores.get(name);
+        return {
+          async match(key) { return stored.get(key.url ?? key)?.clone(); },
+          async put(key, response) {
+            if (rejectIconWrites && name === 'datax-runtime-sha256-v2'
+                && (key.url ?? key).includes('icon-192x192.png')) {
+              throw Object.assign(new Error('Storage quota exceeded'), { name: 'QuotaExceededError' });
+            }
+            stored.set(key.url ?? key, response.clone());
+          },
+          async keys() { return [...stored.keys()].map(url => new Request(url)); },
+        };
+      } },
+      self: {
+        location: { href: scope + 'service-worker.js?enableCache=true' },
+        addEventListener(type, handler) {
+          if (!handlers.has(type)) handlers.set(type, []);
+          handlers.get(type).push(handler);
+        },
+      },
+      async maybeFromCache(event) { return context.fetch(event.request); },
+      async fetch(request) {
+        assert.equal(online, true, 'offline request must use cached bytes: ' + request.url);
+        const relative = new URL(request.url).pathname.slice(prefix.length).replace(/\.offline$/, '');
+        requests.push(relative);
+        assert.ok(files[relative], relative);
+        return new Response(files[relative]);
+      },
+    });
+    vm.runInContext(
+      `(${fingerprints.installRuntimeCache.toString()})(${JSON.stringify(hashes)});` +
+      `(${offline.installOfflineCache.toString()})(${JSON.stringify(assets)});` +
+      `(${pwa.installPwaNavigation.toString()})(${JSON.stringify(pwa.fallbackInventory(assets))},
+        ${JSON.stringify(pwa.CONTENT_SECURITY_POLICY)}, ${JSON.stringify(pwa.PERMISSIONS_POLICY)});`,
+      context,
+    );
+    const dispatch = async (type, extra = {}) => {
+      const tasks = [];
+      for (const handler of handlers.get(type)) handler({ ...extra, waitUntil(task) { tasks.push(task); } });
+      await Promise.all(tasks);
+    };
+    const send = async type => {
+      const updates = [];
+      await dispatch('message', {
+        data: { type }, source: { url: scope + 'lab/' },
+        ports: [{ postMessage(update) { updates.push(update); } }],
+      });
+      return updates.at(-1);
+    };
+    await dispatch('install');
+    assert.equal(stores.get('datax-pwa-fallback-v1').size, pwa.fallbackInventory(assets).length);
+    assert.equal((await send('datax-offline-status')).ready, false);
+    requests.length = 0;
+    const result = await send('datax-offline-download');
+    assert.equal(result.ready, true, result.error);
+    assert.equal(result.completed, Object.keys(assets).length);
+    assert.equal(result.bytes, result.totalBytes);
+    const runtime = stores.get('datax-runtime-sha256-v2');
+    for (const [relative, asset] of Object.entries(assets)) {
+      const key = scope + relative + '?sha256=' + asset.sha256
+        + (relative.startsWith('xeus/') ? '&verified=local' : '');
+      assert.equal(await runtime.get(key)?.clone().text(), files[relative], relative);
+    }
+    assert.ok(runtime.has(scope + 'datax-offline-ready'));
+    online = false;
+    const count = requests.length;
+    assert.equal((await send('datax-offline-download')).ready, true, 'a completed download can be retried offline');
+    for (const [relative, body] of Object.entries(files)) {
+      const response = await context.maybeFromCache({ request: new Request(scope + relative), waitUntil() {} });
+      assert.equal(await response.text(), body);
+    }
+    assert.equal(requests.length, count);
+    const iconKey = scope + 'icon-192x192.png?sha256=' + assets['icon-192x192.png'].sha256;
+    runtime.delete(iconKey);
+    online = true;
+    rejectIconWrites = true;
+    const failed = await send('datax-offline-download');
+    assert.equal(failed.ready, false, 'the fallback cache must not mask a failed full-cache write');
+    assert.match(failed.error, /icon-192x192\.png: Unable to store .*QuotaExceededError: Storage quota exceeded/);
+    assert.equal((await send('datax-offline-status')).ready, false);
+    rejectIconWrites = false;
+    requests.length = 0;
+    assert.equal((await send('datax-offline-download')).ready, true);
+    assert.deepEqual(requests, ['icon-192x192.png'], 'retries must reuse other fully cached assets');
+  }
+});
+
 test('automatic offline downloads respect slow and data-saver connections', () => {
   for (const connection of [undefined, {}, { effectiveType: '4g', saveData: false }]) {
     assert.equal(offline.allowsAutomaticOfflineDownload(connection), true);
