@@ -27,6 +27,11 @@
       "datax-now-front:plugin": {
         "startupNotebook": "00_agent_features.ipynb"
       }
+    },
+    "briefcaseImport": {
+      "enabled": true,
+      "allowLinkImport": true,
+      "destinationDirectory": "Imports"
     }
   }
 }

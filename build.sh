@@ -1458,7 +1458,9 @@ fi
 # Build JupyterLite
 # ==============================================================================
 echo "Cleaning up old build output..."
-rm -rf _output dist
+# doit skips tasks whose inputs are unchanged, even though dist is deleted, which drops the
+# jupyter-lite.json merge and every custom jupyter-config-data key with it.
+rm -rf _output dist .jupyterlite.doit.db
 
 LITE_BUILD_DIR="$PWD/temp/jupyterlite-lite-dir"
 rm -rf "$LITE_BUILD_DIR"

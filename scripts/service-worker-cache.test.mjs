@@ -1634,6 +1634,27 @@ test("offline inventories normalize generated listing timestamps and HTML cache 
   assert.equal(updates.at(-1).completed, Object.keys(assets).length);
 });
 
+test("same-named notebooks in different folders get separate sessions", async () => {
+  const source = `const m={UUID:{uuid4:()=>"id-"+ ++globalThis.n}},u={PathExt:{dirname:p=>p.includes("/")?p.slice(0,p.lastIndexOf("/")):""}};
+    class Client{constructor(){this._sessions=[];this._kernelClient={startNew:async e=>({id:e.id,name:e.name})}}
+    async startNew(e){var t,s,n,r;let{path:a,name:i}=e,o=this._sessions.find(e=>e.name===i);if(o)return o;let l=null==(t=e.kernel)?void 0:t.id;if(l){let e=this._sessions.find(e=>{var t;return(null==(t=e.kernel)?void 0:t.id)===l});if(e){let t={id:m.UUID.uuid4(),path:a,name:null!=i?i:a,type:"notebook",kernel:e.kernel};return this._sessions.push(t),t}}let h=null!=(n=null==(s=e.kernel)?void 0:s.name)?n:"",c=m.UUID.uuid4(),d=null!=(r=e.name)?r:e.path,p=u.PathExt.dirname(e.name)||u.PathExt.dirname(e.path),g=d.includes(":")?d.split(":")[0]:"",f=p.includes(g)?p:\`\${g}:\${p}\`,_=await this._kernelClient.startNew({id:c,name:h,location:f}),y={id:c,path:a,name:null!=i?i:a,type:"notebook",kernel:{id:_.id,name:_.name}};return this._sessions.push(y),y}
+  } globalThis.Client=Client;`;
+  const patched = offline.patchSessionClient(source);
+  assert.equal(offline.patchSessionClient(patched), patched, "patch must be idempotent");
+  assert.throws(() => offline.patchSessionClient("changed upstream code"), /Expected one session lookup by name/);
+
+  const context = { n: 0 };
+  vm.runInNewContext(patched, context);
+  const client = new context.Client();
+  const kernel = { name: "xpython" };
+  const first = await client.startNew({ path: "a/0d2f", name: "check.ipynb", kernel });
+  const second = await client.startNew({ path: "b/9c41", name: "check.ipynb", kernel });
+  assert.notEqual(second.id, first.id);
+  assert.notEqual(second.kernel.id, first.kernel.id);
+  assert.equal(second.path, "b/9c41");
+  assert.equal(await client.startNew({ path: "b/9c41", name: "check.ipynb", kernel }), second);
+});
+
 test("failed bundled directory requests surface an error and remain retryable instead of caching an empty data folder", async t => {
   const directory = mkdtempSync(join(tmpdir(), "datax-contents-retry-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -1681,6 +1702,16 @@ test("failed bundled directory requests surface an error and remain retryable in
     assert.equal(fetches, before, "successful listings retain the upstream cache behavior");
   }
   assert.equal(errors.length, 4, "each failure must be reported explicitly");
+  // Folders created in the browser have no bundled listing; like upstream JupyterLite,
+  // they are empty on the server side so that files can be saved into them.
+  failure = new Response("Not Found", { status: 404 });
+  const created = new context.Contents();
+  const empty = await created._getServerDirectory("data/created-in-browser");
+  assert.equal(empty.size, 0);
+  const before = fetches;
+  assert.equal(await created._getServerDirectory("data/created-in-browser"), empty);
+  assert.equal(fetches, before, "missing listings are cached like upstream");
+  assert.equal(errors.length, 4, "a missing listing is not an error");
   offline.prepareOffline(directory);
   assert.equal(readFileSync(join(directory, "build/contents.js"), "utf8"), patched);
 });

@@ -643,6 +643,7 @@ function patchContentsManager(source) {
         const url=${utilities}.URLExt.join(${utilities}.PageConfig.getBaseUrl(),"api/contents",directory,file);
         try{
           const response=await fetch(url);
+          if(response.status===404){this._serverContents.set(directory,listing);return listing}
           if(!response.ok)throw new Error("HTTP "+response.status);
           const model=JSON.parse(await response.text());
           if(!Array.isArray(model.content))throw new Error("Invalid bundled directory listing");
@@ -657,6 +658,23 @@ function patchContentsManager(source) {
     },
   );
   if (count !== 1) throw new Error(`Expected one bundled-directory loader, found ${count}`);
+  return patched;
+}
+
+// Upstream reuses any session with the same name (the file's basename), so opening a/x.ipynb then
+// b/x.ipynb hands b the session of a, which JupyterLab then shuts down. Jupyter Server keys by path.
+function patchSessionClient(source) {
+  const marker = '/* datax-session-by-path */';
+  if (source.includes(marker)) return source;
+  let count = 0;
+  const patched = source.replace(
+    /(async startNew\(([\w$]+)\)\{(?:var [\w$,]+;)?let\{path:([\w$]+),name:([\w$]+)\}=\2,[\w$]+=this\._sessions\.find\(([\w$]+)=>\5\.)name===\4\)/g,
+    (_, prefix, options, path) => {
+      count++;
+      return `${prefix}path===${path}${marker})`;
+    },
+  );
+  if (count !== 1) throw new Error(`Expected one session lookup by name, found ${count}`);
   return patched;
 }
 
@@ -733,6 +751,7 @@ function prepareOffline(directory, sourceDateEpoch = process.env.SOURCE_DATE_EPO
         let updated = source.split(heartbeat).join(localHeartbeat);
         if (updated.includes('_unregisterOldServiceWorkers(')) updated = patchServiceWorkerManager(updated);
         if (updated.includes('async _getServerDirectory(')) updated = patchContentsManager(updated);
+        if (/this\._sessions\.find\([\w$]+=>[\w$]+\.name===/.test(updated)) updated = patchSessionClient(updated);
         if (updated !== source) fs.writeFileSync(filename, updated);
       }
     }
@@ -781,4 +800,4 @@ function prepareOffline(directory, sourceDateEpoch = process.env.SOURCE_DATE_EPO
   return assets;
 }
 
-module.exports = { allowsAutomaticOfflineDownload, createKernelIdleScheduler, installOfflineCache, installOfflineUI, installUpdateLifecycle, monitorKernelActivity, offlineStatusText, patchContentsManager, patchServiceWorkerManager, prepareOffline };
+module.exports = { allowsAutomaticOfflineDownload, createKernelIdleScheduler, installOfflineCache, installOfflineUI, installUpdateLifecycle, monitorKernelActivity, offlineStatusText, patchContentsManager, patchServiceWorkerManager, patchSessionClient, prepareOffline };
