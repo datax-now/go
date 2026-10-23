@@ -22,52 +22,22 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     permissions:
       contents: write
     outputs:
-      release_commit: ${{ steps.release.outputs.commit }}
+      release_commit: ${{ steps.site.outputs.commit }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
         with:
           ref: ${{ inputs.release_ref || github.sha }}
 
-      - name: Test deployment artifact transport
-        run: |
-          python3 -B -m unittest discover -s scripts -p 'test_deployment_artifact.py'
-          node --test --test-name-pattern='RTD restored artifacts' scripts/service-worker-cache.test.mjs
-          node --test scripts/pwa.test.mjs
-
-      - name: Restore the canonical deployment if already published
-        id: artifact
-        shell: bash
-        run: |
-          set -euo pipefail
-          status=0
-          python3 scripts/deployment-artifact.py restore --wait-seconds 0 --allow-missing || status=$?
-          if [ "$status" -eq 0 ]; then
-            echo "restored=true" >> "$GITHUB_OUTPUT"
-          elif [ "$status" -ne 3 ]; then
-            exit "$status"
-          else
-            echo "restored=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Build JupyterLite deployment
-        if: steps.artifact.outputs.restored != 'true'
-        run: bash ./build.sh -c
-
-      - name: Verify deployment and record release
-        id: release
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -s dist/deployment.json
-          test -f dist/cors_server.py
-          node scripts/pwa.cjs verify dist
-          commit="$(git rev-parse HEAD)"
-          test "$(jq -er '.commit' dist/deployment.json)" = "$commit"
-          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+      - name: Prepare the canonical site
+        id: site
+        uses: ./.github/actions/prepare-site
+        with:
+          github-token: ${{ github.token }}
 
       - name: Check the site size against the GitHub Pages limit
         shell: bash
@@ -84,23 +54,6 @@ jobs:
             echo "::warning::dist uses over 95% of the 1 GB GitHub Pages limit (${bytes} bytes)"
           fi
 
-      - name: Publish the canonical deployment for Read the Docs
-        if: steps.artifact.outputs.restored != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_COMMIT: ${{ steps.release.outputs.commit }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/datax-site.tar.gz"
-          python3 scripts/deployment-artifact.py pack dist "$archive" --commit "$RELEASE_COMMIT"
-          tag="site-${RELEASE_COMMIT}"
-          gh release create "$tag" "$archive" \
-            --target "$RELEASE_COMMIT" --draft \
-            --title "JupyterLite site ${RELEASE_COMMIT}" \
-            --notes "Canonical deployment shared by GitHub Pages and Read the Docs. Do not replace this artifact; publish a new commit instead."
-          gh release edit "$tag" --draft=false --latest=false
-
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
 
@@ -112,6 +65,7 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       pages: write
       id-token: write
@@ -126,11 +80,18 @@ jobs:
       - name: Report public deployment URLs
         env:
           EXPECTED_COMMIT: ${{ needs.build.outputs.release_commit }}
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
         run: |
           set -euo pipefail
-          page_url="${{ steps.deployment.outputs.page_url }}"
-          page_url="${page_url%/}/"
-          deployed_commit="$(curl --fail --silent --show-error "${page_url}deployment.json" | jq -er '.commit')"
+          page_url="${PAGE_URL%/}/"
+          # The CDN can serve the previous deployment for a short while after the deploy job succeeds.
+          deployed_commit=""
+          for attempt in $(seq 1 12); do
+            deployed_commit="$(curl --fail --silent --show-error --max-time 30 "${page_url}deployment.json?verify=${GITHUB_RUN_ID}-${attempt}" | jq -er '.commit' || true)"
+            [ "$deployed_commit" = "$EXPECTED_COMMIT" ] && break
+            echo "Attempt ${attempt}: ${page_url} serves '${deployed_commit}', expected ${EXPECTED_COMMIT}"
+            sleep 10
+          done
           test "$deployed_commit" = "$EXPECTED_COMMIT"
           echo "JupyterLite: ${page_url}"
           {
@@ -139,3 +100,36 @@ jobs:
             echo "- Release: ${deployed_commit}"
             echo "- Site: ${page_url}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Read the Docs cannot build a commit until its release exists. A push-triggered RTD build usually starts
+  # earlier than that, so request a fresh build of `latest` once the artifact is public.
+  notify-read-the-docs:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Trigger the Read the Docs build
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RTD_TOKEN: ${{ secrets.RTD_TOKEN }}
+          RTD_PROJECT: ${{ vars.RTD_PROJECT }}
+          RELEASE_COMMIT: ${{ needs.build.outputs.release_commit }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RTD_TOKEN:-}" ] || [ -z "${RTD_PROJECT:-}" ]; then
+            echo "::notice::Set the RTD_TOKEN secret and RTD_PROJECT variable to start Read the Docs builds automatically."
+            exit 0
+          fi
+          default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch)"
+          tip="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${default_branch}" --jq .sha)"
+          if [ "$tip" != "$RELEASE_COMMIT" ]; then
+            echo "::notice::${RELEASE_COMMIT} is not the tip of ${default_branch}; Read the Docs builds only the tip."
+            exit 0
+          fi
+          curl --fail --silent --show-error --retry 3 --retry-all-errors --max-time 60 -X POST \
+            -H "Authorization: Token ${RTD_TOKEN}" \
+            "https://app.readthedocs.org/api/v3/projects/${RTD_PROJECT}/versions/latest/builds/" > /dev/null
+          echo "Requested a Read the Docs build of latest for ${RELEASE_COMMIT}"

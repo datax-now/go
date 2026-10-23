@@ -21,11 +21,23 @@ the complete file inventory, and every file's size and SHA-256 before publishing
 RTD does not rebuild or re-fingerprint the application.
 
 An automatic RTD build may start before GitHub Actions finishes. It waits up to
-ten minutes for that commit's artifact. If the artifact is still unavailable,
-the build fails explicitly: finish the GitHub Pages workflow, then retry RTD.
-There is no fallback to another commit or to an independent build. Public
-release downloads require no GitHub secret in RTD. Historical commits without
-an artifact must first be published using the Pages workflow's `release_ref`.
+ten minutes for that commit's artifact (`--wait-seconds 600` in
+`.readthedocs.yaml`; RTD's public-project build limit is 15 minutes, and the
+restore, verification and Sphinx copy take well under two). If the artifact is
+still unavailable, the build fails explicitly. There is no fallback to another
+commit or to an independent build. Public release downloads require no GitHub
+secret in RTD. Transient download failures (HTTP 408/429/5xx, resets, truncated
+bodies) are retried; `restore --force` replaces a leftover `dist/`, but only
+after the new artifact has downloaded and verified.
+
+To avoid a manual retry, the Pages workflow asks RTD to build `latest` once the
+artifact is public (the `notify-read-the-docs` job; it only acts when the
+published commit is the tip of the default branch). Enable it with a Read the
+Docs API token stored as the GitHub secret `RTD_TOKEN` and the project slug
+stored as the repository variable `RTD_PROJECT`. Without them the job logs a
+notice and does nothing. Historical commits without an artifact must first be
+published using the Pages workflow's `release_ref`; that ref must contain
+`.github/actions/prepare-site`.
 
 DataX (`xpython`) is the only published kernel. The Pyodide kernel is not a
 build dependency, and incremental builds uninstall previously installed
@@ -209,7 +221,9 @@ are retained. Inspect production network responses for compression: verified
 service-worker responses are decoded and remove `Content-Encoding`, so an
 absent header on a cached response does not prove the origin lacks compression.
 
-Each build writes `dist/deployment.json` with its checked-out Git commit and a
+Vercel and Cloudflare reuse the same artifact when one exists
+(see their sections), so their inventories match the canonical build without
+setting a shared `SOURCE_DATE_EPOCH`. Each build writes `dist/deployment.json` with its checked-out Git commit and a
 SHA-256 inventory of the static assets. Compare the active GitHub Pages, Vercel
 and Cloudflare deployments, listed in priority order, with:
 
@@ -418,9 +432,9 @@ the build's own Unix time, not checkout file timestamps. Every built-in entry's
 created and modified times are pinned to this value, so they never show the
 Unix epoch. Hosts that build at different times produce different values, and
 the kernel package tar mtimes (below) follow the same value. To make them match
-across mirrors, set the same `SOURCE_DATE_EPOCH` on every host. The Vercel
-project must not keep `SOURCE_DATE_EPOCH=0`, or built-in notebooks show 1970
-again. The timestamp is excluded from the JupyterLite build subprocess:
+across mirrors, set the same `SOURCE_DATE_EPOCH` on every host. An epoch of `0`, as
+some hosts inject, is ignored with a warning, or built-in notebooks would show
+1970. The timestamp is excluded from the JupyterLite build subprocess:
 JupyterLite 0.8.3 otherwise recursively timestamps the output directory's parent,
 including Micromamba caches and broken sysroot symlinks. It remains available to
 the post-build directory-index and offline-inventory normalization.
@@ -562,11 +576,17 @@ set **Pages > Build and deployment > Source** to **GitHub Actions**. The `github
 environment's deployment branch policy must also allow `main`.
 
 The build job needs `contents: write` to publish a commit-specific GitHub
-release containing `datax-site.tar.gz`. Publication uses a draft until upload
-completes. Subsequent runs restore and verify the existing release rather than
-rebuilding or overwriting it. Do not replace published release assets: make a
-new commit when application bytes must change. If an upload fails and leaves
-an unpublished draft, remove that incomplete draft before retrying.
+release containing `datax-site.tar.gz`. The shared composite action
+`.github/actions/prepare-site` (also used by the Cloudflare workflow) restores
+and verifies that release if it exists; otherwise it runs `./build.sh -c`,
+verifies the result and publishes it with `deployment-artifact.py publish`.
+Publication uses a draft until upload completes. A stale draft left by an
+interrupted upload is removed automatically on the next run, a published
+release is never replaced, and a run that loses a race with a concurrent
+publisher accepts the winner's release. Make a new commit when application
+bytes must change. The action also fails when `dist/` contains hidden files,
+which GitHub Pages artifacts silently omit. After deployment, the live
+`deployment.json` is checked with retries to allow for CDN propagation.
 The archive is a deployment transport, not part of the published site's
 offline inventory or browser downloads.
 
@@ -582,17 +602,29 @@ well.
 
 ## Vercel deployment
 
-Vercel can build the same static JupyterLite site using the checked-in
-`vercel.json` configuration. It runs `./build.sh`, publishes `dist/`, and
-applies the cross-origin isolation headers required by the WebAssembly runtime.
+Vercel serves the same static JupyterLite site using the checked-in
+`vercel.json` configuration. Its build command, `scripts/platform-build.sh`,
+first restores the verified artifact published for the exact commit, so Vercel
+serves the same bytes as GitHub Pages and Read the Docs and finishes in
+seconds. Production builds wait up to 15 minutes for the GitHub Pages workflow
+to publish it; preview builds do not wait. If no artifact can be obtained
+(including any download or verification error) it falls back to an independent
+`./build.sh`, within Vercel's build limit. Set `DATAX_ARTIFACT_ONLY=1` to fail
+instead of building, or `DATAX_ARTIFACT_WAIT_SECONDS` to change the wait. It
+publishes `dist/` and applies the cross-origin isolation headers required by
+the WebAssembly runtime.
 The `.vercelignore` file excludes local environments and generated output while
 keeping the wheel, conda, runtime-wheel, and notebook inputs available to the
 build.
 
-Manifest generation uses Vercel's `VERCEL_GIT_COMMIT_SHA` because Vercel build
+Commit detection uses Vercel's `VERCEL_GIT_COMMIT_SHA` because Vercel build
 containers do not include the repository's `.git` directory. In Vercel project
 settings, enable **Environment Variables > Enable access to System Environment
-Variables** so the release manifest records the actual Git commit.
+Variables**; without it the build stops within seconds with an explicit error
+instead of after a long fallback build. The scripts need only the `python3`
+(3.9 or newer) and `node` already present in Vercel's build image. A leftover
+`SOURCE_DATE_EPOCH=0` is ignored with a warning so built-in files are not
+dated 1970.
 
 The Vercel project `datax-now-readthedocs` uses staged production deployments:
 automatic custom-domain assignment is disabled (`autoAssignCustomDomains: false`).
@@ -620,12 +652,22 @@ to 20,000 files per site and 25 MiB (26,214,400 bytes) per file. The workflow
 checks those limits against the exact upload on every deployment and fails
 before upload if a future build exceeds either one.
 
-The `deploy-cloudflare.yml` workflow uploads `dist/` directly with Wrangler;
-it does not use R2 or deploy a Worker. It prepares a Pages-only copy, gzip-
-compresses assets that exceed the per-file limit, and adds matching
+The `deploy-cloudflare.yml` workflow uploads the canonical site directly with
+Wrangler; it does not use R2 or deploy a Worker. It first restores the commit's
+verified artifact through `.github/actions/prepare-site` (building and
+publishing it only if no other host has), so the mirror matches GitHub Pages
+byte for byte. `scripts/prepare-cloudflare.py` then prepares a Pages-only copy:
+it gzip-compresses assets above the per-file limit, adds matching
 `Content-Encoding` rules plus the COOP/COEP isolation headers required by the
-WebAssembly runtime. The workflow verifies the deployed commit and isolation
-headers.
+WebAssembly runtime, and checks the 20,000-file, 25 MiB and 100-header-rule
+limits (and that no path needs a `*` or `:` in a rule). The workflow checks
+the secrets up front, retries the Wrangler upload, and verifies the deployed
+commit and isolation headers with retries.
+
+A Git-connected Cloudflare Pages project can use the same logic: set the build
+command to `bash scripts/platform-build.sh` and the output directory to `dist`.
+It restores the artifact (or falls back to `./build.sh`) and prepares `dist/`
+in place.
 
 1. Create a Cloudflare Pages **Direct Upload** project named `datax-now` and
   set its production branch to `main`.
@@ -658,3 +700,7 @@ their existing release assets are no longer needed.
 | `built-in-wheels/` | Checked-in Python wheels used by the build |
 | `built-in-conda/` | Checked-in WebAssembly conda packages |
 | `cloudflare/` | Cloudflare Pages response headers |
+| `scripts/platform-build.sh` | Vercel and Cloudflare Pages build entrypoint: reuse the canonical artifact, else build |
+| `scripts/deployment-artifact.py` | Pack, publish and restore the verified site artifact |
+| `scripts/prepare-cloudflare.py` | Apply Cloudflare Pages limits and headers to a built site |
+| `.github/actions/prepare-site/` | Shared restore-or-build-and-publish step for the workflows |

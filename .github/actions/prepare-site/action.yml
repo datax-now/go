@@ -1,0 +1,84 @@
+name: Prepare the canonical site
+description: >-
+  Restore the verified deployment already published for the checked-out commit.
+  If none exists, build it with build.sh and publish it, so every host
+  (GitHub Pages, Read the Docs, Vercel, Cloudflare Pages) serves identical bytes.
+
+inputs:
+  github-token:
+    description: Token with contents:write, used to publish the commit's release
+    required: true
+
+outputs:
+  commit:
+    description: Full Git commit SHA of the prepared site
+    value: ${{ steps.release.outputs.commit }}
+  restored:
+    description: Whether the site came from an already published release
+    value: ${{ steps.artifact.outputs.restored }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "24"
+
+    - name: Test deployment artifact transport
+      shell: bash
+      run: |
+        python3 -B -m unittest discover -s scripts -p 'test_*.py'
+        node --test --test-name-pattern='RTD restored artifacts' scripts/service-worker-cache.test.mjs
+        node --test scripts/pwa.test.mjs scripts/deployment-manifest.test.mjs scripts/build-environment.test.mjs
+
+    - name: Restore the canonical deployment if already published
+      id: artifact
+      shell: bash
+      run: |
+        set -euo pipefail
+        status=0
+        python3 scripts/deployment-artifact.py restore --wait-seconds 0 --allow-missing || status=$?
+        if [ "$status" -eq 0 ]; then
+          echo "restored=true" >> "$GITHUB_OUTPUT"
+        elif [ "$status" -ne 3 ]; then
+          exit "$status"
+        else
+          echo "restored=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Build JupyterLite deployment
+      if: steps.artifact.outputs.restored != 'true'
+      shell: bash
+      run: bash ./build.sh -c
+
+    - name: Verify deployment and record release
+      id: release
+      shell: bash
+      run: |
+        set -euo pipefail
+        test -s dist/deployment.json
+        test -f dist/cors_server.py
+        node scripts/pwa.cjs verify dist
+        commit="$(git rev-parse HEAD)"
+        test "$(jq -er '.commit' dist/deployment.json)" = "$commit"
+        # GitHub Pages artifacts omit dotfiles, which would silently diverge from the manifest.
+        hidden="$(find dist -name '.*' -print -quit)"
+        if [ -n "$hidden" ]; then
+          echo "::error::dist contains a hidden file that GitHub Pages would drop: $hidden"
+          exit 1
+        fi
+        echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+
+    - name: Publish the canonical deployment
+      if: steps.artifact.outputs.restored != 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        RELEASE_COMMIT: ${{ steps.release.outputs.commit }}
+      run: python3 scripts/deployment-artifact.py publish dist --commit "$RELEASE_COMMIT"

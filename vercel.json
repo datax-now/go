@@ -3,7 +3,7 @@
   "framework": null,
   "ignoreCommand": "exit 1",
   "installCommand": "true",
-  "buildCommand": "./build.sh",
+  "buildCommand": "bash scripts/platform-build.sh",
   "outputDirectory": "dist",
   "headers": [
     {

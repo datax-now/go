@@ -25,10 +25,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${SCRIPT_DIR}"
 BUILTIN_WHEELS_DIR="${BUILTIN_WHEELS_DIR:-${REPO_ROOT}/built-in-wheels}"
 # Defaults to this build's time. Never 0: that would stamp built-in files as 1970.
+# Hosts such as Vercel can inject SOURCE_DATE_EPOCH=0 for reproducible builds, so treat 0 as unset.
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(date +%s)}"
 if [[ ! "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]]; then
   echo "ERROR: SOURCE_DATE_EPOCH must be a nonnegative Unix timestamp." >&2
   exit 1
+fi
+if [ "$((10#$SOURCE_DATE_EPOCH))" -eq 0 ]; then
+  echo "WARNING: SOURCE_DATE_EPOCH=0 would stamp built-in files as 1970; using the build time instead." >&2
+  SOURCE_DATE_EPOCH="$(date +%s)"
 fi
 export SOURCE_DATE_EPOCH
 
@@ -418,6 +423,17 @@ fi
 
 cd "$REPO_ROOT"
 
+# Fail within seconds, not after a long build, when the manifest could not record a commit
+# (for example a Vercel project without system environment variables and without a .git directory).
+if command -v node >/dev/null 2>&1; then
+  if ! _early_commit="$(node "$REPO_ROOT/scripts/deployment-manifest.mjs" commit "$REPO_ROOT" 2>&1)"; then
+    echo "ERROR: cannot determine the build commit: ${_early_commit}" >&2
+    echo "Build from a Git checkout, or set VERCEL_GIT_COMMIT_SHA / GITHUB_SHA." >&2
+    exit 1
+  fi
+  echo "Building commit ${_early_commit}"
+fi
+
 if [ "$CLEAN_BUILD" = true ]; then
   echo ""
   echo "=========================================="
@@ -472,9 +488,9 @@ if [ ! -f "$PWD/bin/micromamba" ]; then
     trap cleanup_micromamba_archive EXIT
 
     if command -v curl >/dev/null 2>&1; then
-      curl -fsSL "$_micromamba_url" -o "$_micromamba_archive"
+      curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 "$_micromamba_url" -o "$_micromamba_archive"
     elif command -v wget >/dev/null 2>&1; then
-      wget -qO "$_micromamba_archive" "$_micromamba_url"
+      wget -qO "$_micromamba_archive" --tries=5 --waitretry=5 --timeout=60 "$_micromamba_url"
     else
       echo "ERROR: curl or wget is required to download Micromamba." >&2
       exit 1

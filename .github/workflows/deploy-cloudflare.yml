@@ -19,76 +19,72 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     environment:
       name: cloudflare-production
+    # Publishing the commit's release (when no other host has yet) needs write access.
+    permissions:
+      contents: write
     steps:
+      - name: Check Cloudflare credentials
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          missing=""
+          [ -n "${CLOUDFLARE_API_TOKEN:-}" ] || missing="${missing} CLOUDFLARE_API_TOKEN"
+          [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ] || missing="${missing} CLOUDFLARE_ACCOUNT_ID"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing GitHub secret(s) for the cloudflare-production environment:${missing}"
+            exit 1
+          fi
+
       - name: Check out repository
         uses: actions/checkout@v5
         with:
           ref: ${{ inputs.release_ref }}
 
-      - name: Build JupyterLite deployment
-        run: bash ./build.sh -c
+      - name: Prepare the canonical site
+        id: site
+        uses: ./.github/actions/prepare-site
+        with:
+          github-token: ${{ github.token }}
 
       - name: Prepare Cloudflare Pages assets
-        shell: bash
         run: |
           set -euo pipefail
-          pages_dir="$(mktemp -d "${RUNNER_TEMP}/datax-now-pages.XXXXXX")"
-          cp -a dist/. "$pages_dir/"
-          cp cloudflare/_headers "$pages_dir/_headers"
-          compressed_files=0
-          while IFS= read -r -d '' asset; do
-            compressed="${asset}.gzip"
-            gzip -1 -c -- "$asset" > "$compressed"
-            compressed_bytes="$(stat -c %s "$compressed")"
-            if [ "$compressed_bytes" -gt 26214400 ]; then
-              echo "Asset remains above the Cloudflare Pages 25 MiB limit after gzip: ${asset#"$pages_dir"/} (${compressed_bytes} bytes)" >&2
-              exit 1
-            fi
-            mv "$compressed" "$asset"
-            relative_path="${asset#"$pages_dir"/}"
-            printf '\n/%s\n  Content-Encoding: gzip\n' "$relative_path" >> "$pages_dir/_headers"
-            compressed_files=$((compressed_files + 1))
-          done < <(find "$pages_dir" -type f -size +26214400c -print0)
-          echo "PAGES_DIR=$pages_dir" >> "$GITHUB_ENV"
-          echo "COMPRESSED_FILES=$compressed_files" >> "$GITHUB_ENV"
-
-      - name: Verify release and Pages limits
-        run: |
-          set -euo pipefail
-          test -s dist/deployment.json
-          test -s "$PAGES_DIR/deployment.json"
-          release_commit="$(jq -er '.commit' dist/deployment.json)"
-          checked_out_commit="$(git rev-parse HEAD)"
-          test "$release_commit" = "$checked_out_commit"
-          file_count="$(find "$PAGES_DIR" -type f | wc -l)"
-          if [ "$file_count" -gt 20000 ]; then
-            echo "Cloudflare Pages Free allows up to 20,000 files; found $file_count" >&2
-            exit 1
-          fi
-          oversized_files="$(find "$PAGES_DIR" -type f -printf '%s %p\n' | awk '$1 > 26214400')"
-          if [ -n "$oversized_files" ]; then
-            echo "Cloudflare Pages assets must not exceed 25 MiB (26,214,400 bytes):" >&2
-            printf '%s\n' "$oversized_files" >&2
-            exit 1
-          fi
-          echo "RELEASE_COMMIT=$release_commit" >> "$GITHUB_ENV"
-          echo "FILE_COUNT=$file_count" >> "$GITHUB_ENV"
+          python3 scripts/prepare-cloudflare.py dist --output "$(mktemp -u "${RUNNER_TEMP}/datax-now-pages.XXXXXX")"
+          echo "RELEASE_COMMIT=${{ steps.site.outputs.commit }}" >> "$GITHUB_ENV"
 
       - name: Deploy to Cloudflare Pages
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: npx --yes wrangler@4.139.0 pages deploy "$PAGES_DIR" --project-name=datax-now --branch=main --commit-hash="${RELEASE_COMMIT}"
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if npx --yes wrangler@4.139.0 pages deploy "$PAGES_DIR" --project-name=datax-now --branch=main --commit-hash="${RELEASE_COMMIT}"; then
+              exit 0
+            fi
+            echo "wrangler attempt ${attempt} failed" >&2
+            sleep $((attempt * 20))
+          done
+          exit 1
 
       - name: Verify live Pages deployment
         run: |
           set -euo pipefail
           site_url="https://datax-now.pages.dev/"
-          deployed_commit="$(curl --fail --silent --show-error "${site_url}deployment.json" | jq -er '.commit')"
+          # Pages can take a moment to serve the new deployment on every edge location.
+          deployed_commit=""
+          for attempt in $(seq 1 12); do
+            deployed_commit="$(curl --fail --silent --show-error --max-time 30 "${site_url}deployment.json?verify=${GITHUB_RUN_ID}-${attempt}" | jq -er '.commit' || true)"
+            [ "$deployed_commit" = "$RELEASE_COMMIT" ] && break
+            echo "Attempt ${attempt}: ${site_url} serves '${deployed_commit}', expected ${RELEASE_COMMIT}"
+            sleep 10
+          done
           test "$deployed_commit" = "$RELEASE_COMMIT"
-          headers="$(curl --fail --silent --show-error --head "${site_url}lab/")"
+          headers="$(curl --fail --silent --show-error --max-time 30 --head "${site_url}lab/")"
           grep -iq '^Cross-Origin-Embedder-Policy: require-corp' <<< "$headers"
           grep -iq '^Cross-Origin-Opener-Policy: same-origin' <<< "$headers"
           {

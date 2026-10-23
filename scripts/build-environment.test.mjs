@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -12,16 +12,36 @@ const initialization = build.split("# Pinned dependency versions")[0];
 const liteBuild = build.split('echo "Building JupyterLite..."')[1]
   .split('rm -rf "$PWD/dist/extensions/@jupyterlite/pyodide-kernel-extension"')[0];
 
-test("Vercel initializes reproducible metadata without a Git checkout", t => {
+test("Vercel initializes build metadata without a Git checkout, ignoring an injected epoch of 0", t => {
   const directory = mkdtempSync(join(tmpdir(), "datax-vercel-build-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const script = join(directory, "build.sh");
   writeFileSync(script, initialization + '\nprintf "%s\\n" "$SOURCE_DATE_EPOCH"\n');
-  const env = { ...process.env, VERCEL_GIT_COMMIT_SHA: "a".repeat(40) };
-  delete env.SOURCE_DATE_EPOCH;
-  const result = spawnSync("bash", [script], { cwd: directory, env, encoding: "utf8" });
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout.trim(), "0", "all hosts must use the same Git-independent default");
+  const run = extra => {
+    const env = { ...process.env, VERCEL_GIT_COMMIT_SHA: "a".repeat(40), ...extra };
+    if (!extra.SOURCE_DATE_EPOCH) delete env.SOURCE_DATE_EPOCH;
+    return spawnSync("bash", [script], { cwd: directory, env, encoding: "utf8" });
+  };
+  const before = Math.floor(Date.now() / 1000);
+  for (const result of [run({}), run({ SOURCE_DATE_EPOCH: "0" })]) {
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(Number(result.stdout.trim()) >= before, "built-in files must never be stamped as 1970");
+  }
+  assert.match(run({ SOURCE_DATE_EPOCH: "0" }).stderr, /SOURCE_DATE_EPOCH=0/);
+});
+
+test("a build without any commit information fails immediately instead of after the long build", t => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-no-commit-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  mkdirSync(join(directory, "scripts"));
+  copyFileSync(new URL("../build.sh", import.meta.url), join(directory, "build.sh"));
+  copyFileSync(new URL("./deployment-manifest.mjs", import.meta.url), join(directory, "scripts/deployment-manifest.mjs"));
+  const env = { ...process.env };
+  for (const name of ["VERCEL_GIT_COMMIT_SHA", "CF_PAGES_COMMIT_SHA", "GITHUB_SHA", "GIT_DIR"]) delete env[name];
+  const result = spawnSync("bash", [join(directory, "build.sh")], { cwd: directory, env, encoding: "utf8", timeout: 30000 });
+  assert.equal(result.status, 1, result.stdout + result.stderr);
+  assert.match(result.stderr, /cannot determine the build commit/);
+  assert.doesNotMatch(result.stdout, /Micromamba|Downloading/);
 });
 
 test("metadata timestamp overrides are preserved and invalid overrides fail explicitly", t => {

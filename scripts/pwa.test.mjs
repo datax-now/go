@@ -708,8 +708,8 @@ test('host policies match the shared service-worker policies and do not disable 
   const rtd = readFileSync(new URL('../.readthedocs.yaml', import.meta.url), 'utf8');
   assert.ok(rtd.indexOf('python scripts/deployment-artifact.py restore') <
     rtd.indexOf('node scripts/pwa.cjs verify dist'), 'RTD verifies the restored artifact before Sphinx publishes it');
-  const pages = readFileSync(new URL('../.github/workflows/deploy-github-pages.yml', import.meta.url), 'utf8');
-  assert.match(pages, /node scripts\/pwa\.cjs verify dist/);
+  const prepareSite = readFileSync(new URL('../.github/actions/prepare-site/action.yml', import.meta.url), 'utf8');
+  assert.match(prepareSite, /node scripts\/pwa\.cjs verify dist/);
   const build = readFileSync(new URL('../build.sh', import.meta.url), 'utf8');
   assert.ok(build.indexOf('scripts/fingerprint-runtime.cjs') < build.indexOf('scripts/pwa.cjs" verify dist'));
 });

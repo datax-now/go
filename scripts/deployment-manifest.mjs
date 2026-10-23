@@ -40,7 +40,7 @@ export async function createDeploymentManifest(directory, commit) {
 }
 
 export function resolveCommit(env = process.env, cwd = process.cwd()) {
-  const environmentCommit = env.VERCEL_GIT_COMMIT_SHA || env.GITHUB_SHA;
+  const environmentCommit = env.VERCEL_GIT_COMMIT_SHA || env.CF_PAGES_COMMIT_SHA || env.GITHUB_SHA;
   if (environmentCommit && !/^[a-f0-9]{40,64}$/i.test(environmentCommit)) {
     throw new Error("Build environment supplied an invalid Git commit SHA");
   }
@@ -54,7 +54,7 @@ export function resolveCommit(env = process.env, cwd = process.cwd()) {
     }).trim();
   } catch {
     if (environmentCommit) return environmentCommit;
-    throw new Error("Could not determine build commit; set VERCEL_GIT_COMMIT_SHA or GITHUB_SHA outside a Git checkout");
+    throw new Error("Could not determine build commit; set VERCEL_GIT_COMMIT_SHA, CF_PAGES_COMMIT_SHA or GITHUB_SHA outside a Git checkout");
   }
 }
 

@@ -3,21 +3,31 @@
 import argparse
 import gzip
 import hashlib
+import http.client
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tarfile
 import tempfile
 import time
 from urllib.error import HTTPError, URLError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 
 ARCHIVE_NAME = "datax-site.tar.gz"
-RELEASE_BASE = "https://github.com/datax-now/go/releases/download"
+RELEASE_BASE = os.environ.get("DATAX_RELEASE_BASE", "https://github.com/datax-now/go/releases/download").rstrip("/")
+# Build hosts supply the commit themselves when they have no usable Git checkout.
+COMMIT_ENVIRONMENT = (
+    "VERCEL_GIT_COMMIT_SHA", "READTHEDOCS_GIT_COMMIT_HASH", "CF_PAGES_COMMIT_SHA", "GITHUB_SHA",
+)
+TRANSIENT_STATUS = (408, 429, 500, 502, 503, 504)
+TRANSIENT_RETRIES = 3
+NETWORK_ERRORS = (URLError, TimeoutError, ConnectionError, ssl.SSLError, http.client.HTTPException)
 
 
 def validate_path(name: str) -> None:
@@ -50,8 +60,12 @@ def read_manifest(data: bytes, commit: str) -> dict:
 
 
 def verify_file(path: Path, entry: dict) -> None:
+    # hashlib.file_digest needs Python 3.11; Vercel's default python3 is older.
+    hasher = hashlib.sha256()
     with path.open("rb") as source:
-        digest = hashlib.file_digest(source, "sha256").hexdigest()
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    digest = hasher.hexdigest()
     if path.stat().st_size != entry["bytes"] or digest != entry["sha256"]:
         raise ValueError(f"Artifact integrity mismatch: {path.name}")
 
@@ -85,8 +99,8 @@ def pack(directory: Path, archive: Path, commit: str) -> None:
     print(f"Packed {len(expected)} verified files for {commit}")
 
 
-def unpack(archive: Path, directory: Path, commit: str) -> None:
-    if directory.exists() or directory.is_symlink():
+def unpack(archive: Path, directory: Path, commit: str, force: bool = False) -> None:
+    if not force and (directory.exists() or directory.is_symlink()):
         raise FileExistsError(f"Refusing to replace existing deployment: {directory}")
     directory.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".datax-restore-", dir=directory.parent) as temporary:
@@ -123,40 +137,143 @@ def unpack(archive: Path, directory: Path, commit: str) -> None:
                 seen.add(member.name)
             if seen != {"deployment.json", *manifest["files"]}:
                 raise ValueError("Artifact is missing inventoried files")
+        if force and (directory.is_symlink() or directory.is_file()):
+            directory.unlink()
+        elif force and directory.exists():
+            shutil.rmtree(directory)
         staging.rename(directory)
     print(f"Restored {len(seen)} verified files for {commit}")
 
 
-def restore(commit: str, directory: Path, wait_seconds: int, allow_missing: bool = False) -> int:
-    if directory.exists() or directory.is_symlink():
+def download(url: str, archive: Path) -> None:
+    request = Request(url, headers={"User-Agent": "datax-now-deployment-artifact"})
+    with urlopen(request, timeout=60) as response, archive.open("wb") as output:
+        shutil.copyfileobj(response, output)
+        expected = response.headers.get("Content-Length")
+    # A connection dropped mid-stream can end the body early without an error.
+    if expected is not None and expected.isdigit() and archive.stat().st_size != int(expected):
+        raise http.client.IncompleteRead(b"", int(expected) - archive.stat().st_size)
+
+
+def restore(
+    commit: str, directory: Path, wait_seconds: int, allow_missing: bool = False, force: bool = False,
+) -> int:
+    if not force and (directory.exists() or directory.is_symlink()):
         raise FileExistsError(f"Refusing to replace existing deployment: {directory}")
     url = f"{RELEASE_BASE}/site-{commit}/{ARCHIVE_NAME}"
     deadline = time.monotonic() + wait_seconds
+    transient = 0
     with tempfile.TemporaryDirectory(prefix="datax-download-") as temporary:
         archive = Path(temporary) / ARCHIVE_NAME
         while True:
             try:
-                with urlopen(url, timeout=60) as response, archive.open("wb") as output:
-                    shutil.copyfileobj(response, output)
+                download(url, archive)
                 break
-            except (HTTPError, URLError, TimeoutError) as error:
+            except NETWORK_ERRORS as error:
+                missing = False
                 if isinstance(error, HTTPError):
                     error.close()
-                    if error.code == 404 and allow_missing:
-                        print(f"No published artifact for {commit}", file=sys.stderr)
-                        return 3
-                    if error.code not in (404, 429, 500, 502, 503, 504):
+                    missing = error.code == 404
+                    if not missing and error.code not in TRANSIENT_STATUS:
                         raise
                 remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if missing:
+                    if allow_missing and remaining <= 0:
+                        print(f"No published artifact for {commit}", file=sys.stderr)
+                        return 3
+                    delay = 15
+                else:
+                    transient += 1
+                    # Short outages are retried even when the caller does not want to wait for a release.
+                    delay = 5 * min(transient, 3)
+                if remaining <= 0 and (missing or transient > TRANSIENT_RETRIES):
                     raise RuntimeError(
                         f"Cannot download artifact for {commit}: {error}. "
-                        "Complete the GitHub Pages workflow for this commit, then retry the RTD build."
+                        "Complete the GitHub Pages workflow for this commit, then retry the RTD build "
+                        "(or the Vercel or Cloudflare build)."
                     ) from error
                 print(f"Artifact not available yet ({error}); waiting for site-{commit}", flush=True)
-                time.sleep(min(15, remaining))
-        unpack(archive, directory, commit)
+                time.sleep(min(delay, remaining) if remaining > 0 else delay)
+        unpack(archive, directory, commit, force)
     return 0
+
+
+def release_is_public(commit: str) -> bool:
+    request = Request(
+        f"{RELEASE_BASE}/site-{commit}/{ARCHIVE_NAME}", method="HEAD",
+        headers={"User-Agent": "datax-now-deployment-artifact"},
+    )
+    try:
+        with urlopen(request, timeout=60):
+            return True
+    except NETWORK_ERRORS:
+        return False
+
+
+def gh(*args: str, capture: bool = False) -> str:
+    result = subprocess.run(
+        ["gh", *args], check=True, text=True, stdout=subprocess.PIPE if capture else None,
+    )
+    return result.stdout if capture else ""
+
+
+def publish(directory: Path, commit: str, repo: "str | None" = None) -> int:
+    """Publish the verified site as an immutable release; tolerate a concurrent publisher."""
+    tag = f"site-{commit}"
+    scope = ["--repo", repo] if repo else []
+    with tempfile.TemporaryDirectory(prefix="datax-publish-") as temporary:
+        archive = Path(temporary) / ARCHIVE_NAME
+        pack(directory, archive, commit)
+        releases = json.loads(gh("release", "list", "--limit", "100", "--json", "tagName,isDraft", *scope, capture=True) or "[]")
+        for release in releases:
+            if release.get("tagName") != tag:
+                continue
+            if not release.get("isDraft"):
+                print(f"{tag} is already published; leaving it unchanged")
+                return 0
+            # An interrupted upload leaves an unpublished draft that would block this tag.
+            print(f"Removing incomplete draft release {tag}")
+            gh("release", "delete", tag, "--yes", *scope)
+        try:
+            gh(
+                "release", "create", tag, str(archive), "--target", commit, "--draft", "--latest=false",
+                "--title", f"JupyterLite site {commit}",
+                "--notes", "Canonical deployment shared by GitHub Pages, Read the Docs, Vercel and Cloudflare Pages. "
+                "Do not replace this artifact; publish a new commit instead.",
+                *scope,
+            )
+            gh("release", "edit", tag, "--draft=false", "--latest=false", *scope)
+        except subprocess.CalledProcessError:
+            if release_is_public(commit):
+                print(f"{tag} was published by a concurrent run")
+                return 0
+            raise
+    print(f"Published {tag}")
+    return 0
+
+
+def resolve_commit(explicit: "str | None" = None, environ=os.environ) -> str:
+    if explicit:
+        return explicit
+    # The checkout is authoritative: GITHUB_SHA names the dispatching ref, not a manually selected release_ref.
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    for name in COMMIT_ENVIRONMENT:
+        if environ.get(name):
+            return environ[name].strip().lower()
+    raise ValueError(
+        "Could not determine the Git commit; pass --commit or set VERCEL_GIT_COMMIT_SHA, "
+        "READTHEDOCS_GIT_COMMIT_HASH, CF_PAGES_COMMIT_SHA or GITHUB_SHA"
+    )
+
+
+def default_wait() -> int:
+    value = os.environ.get("DATAX_ARTIFACT_WAIT_SECONDS", "600")
+    return int(value) if value.isdigit() else -1
 
 
 def main() -> int:
@@ -165,27 +282,33 @@ def main() -> int:
     pack_parser = subparsers.add_parser("pack")
     pack_parser.add_argument("directory", type=Path)
     pack_parser.add_argument("archive", type=Path)
+    publish_parser = subparsers.add_parser("publish", help="pack a verified site and publish it as a GitHub release")
+    publish_parser.add_argument("directory", type=Path)
+    publish_parser.add_argument("--repo", help="owner/name; defaults to the current checkout's repository")
     restore_parser = subparsers.add_parser("restore")
     restore_parser.add_argument("--output", type=Path, default=Path("dist"))
-    restore_parser.add_argument("--wait-seconds", type=int, default=600)
+    restore_parser.add_argument("--wait-seconds", type=int, default=default_wait())
     restore_parser.add_argument("--allow-missing", action="store_true")
-    for command in (pack_parser, restore_parser):
+    restore_parser.add_argument("--force", action="store_true", help="replace an existing output directory")
+    for command in (pack_parser, publish_parser, restore_parser):
         command.add_argument("--commit")
     args = parser.parse_args()
-    commit = args.commit or subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    commit = resolve_commit(args.commit)
     if re.fullmatch(r"[0-9a-f]{40,64}", commit) is None:
         parser.error("Expected a full Git commit SHA")
     if args.command == "pack":
         pack(args.directory, args.archive, commit)
         return 0
+    if args.command == "publish":
+        return publish(args.directory, commit, args.repo)
     if args.wait_seconds < 0:
-        parser.error("--wait-seconds must be nonnegative")
-    return restore(commit, args.output, args.wait_seconds, args.allow_missing)
+        parser.error("--wait-seconds (or DATAX_ARTIFACT_WAIT_SECONDS) must be a nonnegative integer")
+    return restore(commit, args.output, args.wait_seconds, args.allow_missing, args.force)
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (OSError, ValueError, RuntimeError, tarfile.TarError) as error:
+    except (OSError, ValueError, RuntimeError, tarfile.TarError, subprocess.SubprocessError) as error:
         print(f"Deployment artifact error: {error}", file=sys.stderr)
         sys.exit(1)

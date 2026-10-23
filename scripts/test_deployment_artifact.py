@@ -144,7 +144,7 @@ class DeploymentArtifactTests(unittest.TestCase):
                 responses[:] = [403]
                 with self.assertRaises(artifact.HTTPError):
                     artifact.restore(COMMIT, self.root / "forbidden", 0, True)
-                responses[:] = [503]
+                responses[:] = [503] * (artifact.TRANSIENT_RETRIES + 1)
                 with self.assertRaisesRegex(RuntimeError, "Complete the GitHub Pages workflow"):
                     artifact.restore(COMMIT, self.root / "unavailable", 0, True)
                 responses[:] = [404]
@@ -155,17 +155,150 @@ class DeploymentArtifactTests(unittest.TestCase):
             server.server_close()
             thread.join()
 
+    def test_short_outages_are_retried_without_waiting_for_a_release(self):
+        artifact.pack(self.site, self.archive, COMMIT)
+        data = self.archive.read_bytes()
+        responses = [503, 502]
+        sleeps = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                status = responses.pop(0) if responses else 200
+                self.send_response(status)
+                self.end_headers()
+                if status == 200:
+                    self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch.object(artifact, "RELEASE_BASE", f"http://127.0.0.1:{server.server_port}"), \
+                 patch.object(artifact.time, "sleep", sleeps.append):
+                self.assertEqual(artifact.restore(COMMIT, self.output, 0, True), 0)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+        self.assertEqual(len(sleeps), 2)
+
+    def test_truncated_download_is_retried_instead_of_failing_the_build(self):
+        artifact.pack(self.site, self.archive, COMMIT)
+        data = self.archive.read_bytes()
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append(self.path)
+                body = data[: len(data) // 2] if len(requests) == 1 else data
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.close_connection = True
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch.object(artifact, "RELEASE_BASE", f"http://127.0.0.1:{server.server_port}"), \
+                 patch.object(artifact.time, "sleep"):
+                self.assertEqual(artifact.restore(COMMIT, self.output, 0), 0)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+        self.assertEqual(len(requests), 2)
+        self.assertTrue((self.output / "deployment.json").is_file())
+
+    def test_force_replaces_a_stale_output_only_after_a_verified_restore(self):
+        artifact.pack(self.site, self.archive, COMMIT)
+        self.output.mkdir()
+        (self.output / "stale").write_text("old")
+        artifact.unpack(self.archive, self.output, COMMIT, force=True)
+        self.assertFalse((self.output / "stale").exists())
+        self.assertTrue((self.output / "lab/index.html").is_file())
+
+        (self.output / "stale").write_text("old")
+        self.make_archive(self.valid_entries()[:-1])
+        with self.assertRaises(ValueError):
+            artifact.unpack(self.archive, self.output, COMMIT, force=True)
+        self.assertEqual((self.output / "stale").read_text(), "old")
+
+    def test_commit_resolution_supports_hosts_without_a_git_checkout(self):
+        other = "b" * 40
+        self.assertEqual(artifact.resolve_commit(other, {}), other)
+        with patch.object(artifact.subprocess, "check_output", side_effect=FileNotFoundError):
+            self.assertEqual(artifact.resolve_commit(None, {"VERCEL_GIT_COMMIT_SHA": COMMIT.upper()}), COMMIT)
+            self.assertEqual(artifact.resolve_commit(None, {"CF_PAGES_COMMIT_SHA": other}), other)
+            with self.assertRaisesRegex(ValueError, "VERCEL_GIT_COMMIT_SHA"):
+                artifact.resolve_commit(None, {})
+        with patch.object(artifact.subprocess, "check_output", return_value=other + "\n"):
+            self.assertEqual(artifact.resolve_commit(None, {"GITHUB_SHA": COMMIT}), other)
+
+    def test_publish_removes_incomplete_drafts_and_tolerates_a_concurrent_publisher(self):
+        calls = []
+
+        def fake_gh(*args, capture=False):
+            calls.append(args)
+            if args[:2] == ("release", "list"):
+                return json.dumps([{"tagName": f"site-{COMMIT}", "isDraft": True}])
+            if args[:2] == ("release", "create") and fail_create:
+                raise artifact.subprocess.CalledProcessError(1, "gh")
+            return ""
+
+        fail_create = False
+        with patch.object(artifact, "gh", fake_gh):
+            self.assertEqual(artifact.publish(self.site, COMMIT), 0)
+        verbs = [call[:2] for call in calls]
+        self.assertEqual(verbs, [("release", "list"), ("release", "delete"), ("release", "create"), ("release", "edit")])
+        create = next(call for call in calls if call[:2] == ("release", "create"))
+        self.assertIn("--draft", create)
+        self.assertEqual(calls[-1][3:], ("--draft=false", "--latest=false"))
+
+        calls.clear()
+        fail_create = True
+        with patch.object(artifact, "gh", fake_gh), patch.object(artifact, "release_is_public", return_value=True):
+            self.assertEqual(artifact.publish(self.site, COMMIT), 0)
+        with patch.object(artifact, "gh", fake_gh), patch.object(artifact, "release_is_public", return_value=False):
+            with self.assertRaises(artifact.subprocess.CalledProcessError):
+                artifact.publish(self.site, COMMIT)
+
+    def test_publish_never_replaces_a_published_release(self):
+        calls = []
+
+        def fake_gh(*args, capture=False):
+            calls.append(args[:2])
+            return json.dumps([{"tagName": f"site-{COMMIT}", "isDraft": False}])
+
+        with patch.object(artifact, "gh", fake_gh):
+            self.assertEqual(artifact.publish(self.site, COMMIT), 0)
+        self.assertEqual(calls, [("release", "list")])
+
     def test_workflows_share_the_artifact_instead_of_rebuilding_on_rtd(self):
         root = Path(__file__).resolve().parent.parent
         rtd = (root / ".readthedocs.yaml").read_text()
         pages = (root / ".github/workflows/deploy-github-pages.yml").read_text()
+        cloudflare = (root / ".github/workflows/deploy-cloudflare.yml").read_text()
+        action = (root / ".github/actions/prepare-site/action.yml").read_text()
         self.assertIn("deployment-artifact.py restore", rtd)
         self.assertNotIn("./build.sh", rtd)
-        self.assertIn("deployment-artifact.py restore", pages)
-        self.assertIn("deployment-artifact.py pack", pages)
-        self.assertLess(pages.index("gh release create"), pages.index("Upload Pages artifact"))
+        self.assertIn("deployment-artifact.py restore", action)
+        self.assertIn("deployment-artifact.py publish", action)
+        # Every GitHub-hosted mirror must serve the canonical bytes, not an independent rebuild.
+        for workflow in (pages, cloudflare):
+            self.assertIn("uses: ./.github/actions/prepare-site", workflow)
+            self.assertNotIn("build.sh", workflow)
+        self.assertLess(action.index("Verify deployment and record release"), action.index("deployment-artifact.py publish"))
+        self.assertLess(pages.index("prepare-site"), pages.index("Upload Pages artifact"))
         restore_script = textwrap.dedent(
-            pages.split("id: artifact\n", 1)[1].split("run: |\n", 1)[1].split("\n\n", 1)[0]
+            action.split("id: artifact\n", 1)[1].split("run: |\n", 1)[1].split("\n\n", 1)[0]
         )
         for status, expected, output in [(0, 0, "restored=true\n"), (3, 0, "restored=false\n"), (1, 1, "")]:
             with self.subTest(status=status):
@@ -178,6 +311,70 @@ class DeploymentArtifactTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, expected, result.stderr)
                 self.assertEqual(result_file.read_text(), output)
+
+
+class PlatformBuildTests(unittest.TestCase):
+    """scripts/platform-build.sh: reuse the canonical artifact on Vercel and Cloudflare, else build."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        scripts = self.root / "scripts"
+        scripts.mkdir()
+        source = Path(__file__).resolve().parent
+        (scripts / "platform-build.sh").write_text((source / "platform-build.sh").read_text())
+        (scripts / "deployment-artifact.py").write_text(
+            "import os, sys\n"
+            "from pathlib import Path\n"
+            "print('restore', os.environ.get('DATAX_ARTIFACT_WAIT_SECONDS'), *sys.argv[1:])\n"
+            "if os.environ['MOCK_RESTORE'] == '0':\n"
+            "    Path('dist').mkdir(exist_ok=True)\n"
+            "    Path('dist/deployment.json').write_text('{}')\n"
+            "sys.exit(int(os.environ['MOCK_RESTORE']))\n"
+        )
+        (scripts / "prepare-cloudflare.py").write_text("print('prepare-cloudflare')\n")
+        (scripts / "pwa.cjs").write_text("console.log('pwa verified');\n")
+        (self.root / "build.sh").write_text(
+            "#!/bin/bash\necho independent build\nmkdir -p dist\necho '{}' > dist/deployment.json\n"
+        )
+
+    def run_build(self, restore_status, **env):
+        environment = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith(("VERCEL", "CF_PAGES", "DATAX_"))
+        }
+        environment.update(MOCK_RESTORE=str(restore_status), **env)
+        return subprocess.run(
+            ["bash", str(self.root / "scripts/platform-build.sh")], cwd=self.root, env=environment,
+            capture_output=True, text=True,
+        )
+
+    def test_a_published_artifact_is_reused_without_building(self):
+        result = self.run_build(0, VERCEL="1", VERCEL_ENV="production")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("restore 900 restore --force --allow-missing", result.stdout)
+        self.assertNotIn("independent build", result.stdout)
+        self.assertIn("pwa verified", result.stdout)
+
+    def test_previews_do_not_wait_and_fall_back_to_an_independent_build(self):
+        result = self.run_build(3, VERCEL="1", VERCEL_ENV="preview")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("restore 0 restore", result.stdout)
+        self.assertIn("independent build", result.stdout)
+
+    def test_any_restore_failure_falls_back_unless_artifact_only(self):
+        self.assertIn("independent build", self.run_build(1, VERCEL="1").stdout)
+        strict = self.run_build(1, VERCEL="1", DATAX_ARTIFACT_ONLY="1")
+        self.assertEqual(strict.returncode, 1)
+        self.assertNotIn("independent build", strict.stdout)
+
+    def test_wait_can_be_overridden_and_cloudflare_builds_are_prepared_in_place(self):
+        result = self.run_build(0, CF_PAGES="1", CF_PAGES_BRANCH="main", DATAX_ARTIFACT_WAIT_SECONDS="30")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("restore 30 restore", result.stdout)
+        self.assertIn("prepare-cloudflare", result.stdout)
+        self.assertNotIn("prepare-cloudflare", self.run_build(0, VERCEL="1").stdout)
 
 
 if __name__ == "__main__":
