@@ -413,15 +413,14 @@ dependencies and are excluded from the offline inventory, like `deployment.json`
 Their bytes differ between builds on different hosts and cannot be recovered
 as integrity-verified runtime assets from a mirror.
 
-Bundled directory indexes use a fixed metadata timestamp (`SOURCE_DATE_EPOCH`,
-defaulting to `1792713600`, `2026-10-23T00:00:00Z`), not build time or checkout
-file timestamps. Every built-in entry's created and modified times are pinned to
-this value; the former default of `0` displayed built-in notebooks as 1970.
-This default is identical on all hosts and does not require `.git`, which Vercel
-excludes from its build context. To override it, use the same value on every
-mirror. Remove any `SOURCE_DATE_EPOCH=0` override from the Vercel project's
-environment variables, or the Vercel build will show 1970 again. The timestamp
-is excluded from the JupyterLite build subprocess:
+Bundled directory indexes are stamped with `SOURCE_DATE_EPOCH`, which defaults to
+the build's own Unix time, not checkout file timestamps. Every built-in entry's
+created and modified times are pinned to this value, so they never show the
+Unix epoch. Hosts that build at different times produce different values, and
+the kernel package tar mtimes (below) follow the same value. To make them match
+across mirrors, set the same `SOURCE_DATE_EPOCH` on every host. The Vercel
+project must not keep `SOURCE_DATE_EPOCH=0`, or built-in notebooks show 1970
+again. The timestamp is excluded from the JupyterLite build subprocess:
 JupyterLite 0.8.3 otherwise recursively timestamps the output directory's parent,
 including Micromamba caches and broken sysroot symlinks. It remains available to
 the post-build directory-index and offline-inventory normalization.
@@ -557,9 +556,10 @@ Its API rate limits are separate from documentation asset hosting limits.
 ## GitHub Pages deployment
 
 The `.github/workflows/deploy-github-pages.yml` workflow builds and publishes
-the complete `dist/` directory to GitHub Pages when `master` changes. It can
+the complete `dist/` directory to GitHub Pages when `main` changes. It can
 also be started manually with **Run workflow** and a `release_ref`. In the repository settings,
-set **Pages > Build and deployment > Source** to **GitHub Actions**.
+set **Pages > Build and deployment > Source** to **GitHub Actions**. The `github-pages`
+environment's deployment branch policy must also allow `main`.
 
 The build job needs `contents: write` to publish a commit-specific GitHub
 release containing `datax-site.tar.gz`. Publication uses a draft until upload
@@ -628,7 +628,7 @@ WebAssembly runtime. The workflow verifies the deployed commit and isolation
 headers.
 
 1. Create a Cloudflare Pages **Direct Upload** project named `datax-now` and
-  set its production branch to `master`.
+  set its production branch to `main`.
 2. Create an API token with **Account > Cloudflare Pages > Edit** permission.
    Store it and the account ID as GitHub Actions secrets
    `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`.

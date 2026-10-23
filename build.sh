@@ -24,8 +24,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${SCRIPT_DIR}"
 BUILTIN_WHEELS_DIR="${BUILTIN_WHEELS_DIR:-${REPO_ROOT}/built-in-wheels}"
-# Default is 2026-10-23T00:00:00Z; 0 would stamp every built-in file as 1970.
-SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1792713600}"
+# Defaults to this build's time. Never 0: that would stamp built-in files as 1970.
+SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(date +%s)}"
 if [[ ! "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]]; then
   echo "ERROR: SOURCE_DATE_EPOCH must be a nonnegative Unix timestamp." >&2
   exit 1
