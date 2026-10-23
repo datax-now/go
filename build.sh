@@ -24,7 +24,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${SCRIPT_DIR}"
 BUILTIN_WHEELS_DIR="${BUILTIN_WHEELS_DIR:-${REPO_ROOT}/built-in-wheels}"
-SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-0}"
+# Default is 2026-10-23T00:00:00Z; 0 would stamp every built-in file as 1970.
+SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1792713600}"
 if [[ ! "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]]; then
   echo "ERROR: SOURCE_DATE_EPOCH must be a nonnegative Unix timestamp." >&2
   exit 1
@@ -1506,6 +1507,36 @@ echo "Building JupyterLite..."
   mamba_run_deploy jupyter lite build "${JUPYTER_LITE_BUILD_ARGS[@]}"
 )
 rm -rf "$PWD/dist/extensions/@jupyterlite/pyodide-kernel-extension"
+
+# JupyterLite only lowers listing times newer than SOURCE_DATE_EPOCH, so older
+# checkouts keep host-specific mtimes. Pin every index entry for identical output.
+echo "Pinning contents index timestamps..."
+mamba_run_deploy python3 - <<'PYEOF'
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+now = datetime.fromtimestamp(int(os.environ["SOURCE_DATE_EPOCH"]), timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def pin(node):
+    for field in ("created", "last_modified"):
+        if field in node:
+            node[field] = now
+    for child in node.get("content") or []:
+        pin(child)
+
+
+indexes = sorted(Path("dist/api/contents").rglob("all.json"))
+if not indexes:
+    raise SystemExit("ERROR: no contents indexes found under dist/api/contents")
+for index in indexes:
+    listing = json.loads(index.read_text(encoding="utf-8"))
+    pin(listing)
+    index.write_text(json.dumps(listing, indent=1), encoding="utf-8")
+print(f"  Pinned {len(indexes)} contents indexes to {now}")
+PYEOF
 
 # JupyterLite 0.8.3 embeds the upstream JupyterLab security fixes.
 

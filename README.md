@@ -414,10 +414,14 @@ Their bytes differ between builds on different hosts and cannot be recovered
 as integrity-verified runtime assets from a mirror.
 
 Bundled directory indexes use a fixed metadata timestamp (`SOURCE_DATE_EPOCH`,
-defaulting to `0`, the Unix epoch), not build time or checkout file timestamps.
+defaulting to `1792713600`, `2026-10-23T00:00:00Z`), not build time or checkout
+file timestamps. Every built-in entry's created and modified times are pinned to
+this value; the former default of `0` displayed built-in notebooks as 1970.
 This default is identical on all hosts and does not require `.git`, which Vercel
 excludes from its build context. To override it, use the same value on every
-mirror. The timestamp is excluded from the JupyterLite build subprocess:
+mirror. Remove any `SOURCE_DATE_EPOCH=0` override from the Vercel project's
+environment variables, or the Vercel build will show 1970 again. The timestamp
+is excluded from the JupyterLite build subprocess:
 JupyterLite 0.8.3 otherwise recursively timestamps the output directory's parent,
 including Micromamba caches and broken sysroot symlinks. It remains available to
 the post-build directory-index and offline-inventory normalization.
