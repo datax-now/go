@@ -64,4 +64,4 @@ dependencies:
     - built-in-wheels/jupyterlite_xeus_x-20261005.1471.0-py3-none-any.whl
     - built-in-wheels/variable_inspector-1.4.4-py3-none-any.whl
     # Imports notebooks and files from local launcher links (jupyterlite-briefcase).
-    - built-in-wheels/jupyterlite_briefcase-2.0.2-py3-none-any.whl
+    - built-in-wheels/jupyterlite_briefcase-2.1.2-py3-none-any.whl
