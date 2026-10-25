@@ -2396,106 +2396,7 @@ test("offline download subscribers receive current progress immediately", async 
   assert.equal(first.at(-1).ready, true);
 });
 
-test("offline auto-download waits for five continuous idle minutes", () => {
-  let now = 0;
-  let nextId = 0;
-  const timers = new Map();
-  const timerApi = {
-    setTimeout(callback, delay) {
-      const id = ++nextId;
-      timers.set(id, { callback, due: now + delay });
-      return id;
-    },
-    clearTimeout(id) { timers.delete(id); },
-  };
-  const advance = milliseconds => {
-    now += milliseconds;
-    for (const [id, timer] of [...timers]) {
-      if (timer.due > now) continue;
-      timers.delete(id);
-      timer.callback();
-    }
-  };
-  let downloads = 0;
-  const scheduler = offline.createKernelIdleScheduler(
-    () => downloads++, 300000, () => now, timerApi,
-  );
-  scheduler.update(["idle"], true);
-  advance(299000);
-  scheduler.update(["busy"], true);
-  advance(10000);
-  scheduler.update(["idle"], true);
-  advance(299999);
-  assert.equal(downloads, 0);
-  advance(1);
-  assert.equal(downloads, 1);
-  scheduler.update(["idle"], true);
-  assert.equal(downloads, 1, "one idle period should trigger at most one automatic attempt");
-  scheduler.update(["busy"], true);
-  scheduler.update(["idle"], false);
-  advance(300000);
-  assert.equal(downloads, 1, "automatic downloads wait until they can start");
-  scheduler.update(["idle"], true);
-  assert.equal(downloads, 2, "a delayed start can proceed once downloading is available");
-  scheduler.dispose();
-});
-
-test("offline status distinguishes controller wait and automatic download lifecycle", () => {
-  assert.equal(offline.offlineStatusText({}, null, true, false), "Offline: waiting for app control");
-  assert.equal(offline.offlineStatusText({ downloading: true, completed: 2, total: 10 }, "automatic", true),
-    "Downloading offline automatically: 2/10");
-  assert.equal(offline.offlineStatusText({ ready: true }, "automatic", true), "Offline ready (automatic)");
-  assert.equal(offline.offlineStatusText({ ready: true }, null, false), "Offline ready (disconnected)");
-  assert.equal(offline.offlineStatusText({ ready: true }, "automatic", false), "Offline ready (disconnected)");
-  assert.equal(offline.offlineStatusText({ error: "quota exceeded" }, "automatic", true),
-    "Automatic offline download failed");
-  assert.equal(offline.offlineStatusText({}, null, false), "Offline: incomplete");
-});
-
-test("kernel activity monitor tracks every running kernel and disposes removed connections", () => {
-  const models = [{ id: "first", status: "idle" }];
-  const connections = new Map();
-  let refresh;
-  const manager = {
-    running: () => models,
-    connectTo({ model, handleComms }) {
-      assert.equal(handleComms, false, "the offline observer must not claim notebook widget comms during cold startup");
-      const listeners = new Set();
-      const connection = {
-        get status() { return model.status; },
-        statusChanged: {
-          connect(listener) { listeners.add(listener); },
-          disconnect(listener) { listeners.delete(listener); },
-        },
-        dispose() { this.disposed = true; },
-        emit() { for (const listener of listeners) listener(); },
-      };
-      connections.set(model.id, connection);
-      return connection;
-    },
-  };
-  const updates = [];
-  const stop = offline.monitorKernelActivity(
-    statuses => updates.push(statuses),
-    () => ({ serviceManager: { kernels: manager } }),
-    { setInterval(callback) { refresh = callback; return 1; }, clearInterval() {} },
-  );
-  assert.deepEqual(updates.at(-1), ["idle"]);
-  models.push({ id: "second", status: "busy" });
-  refresh();
-  assert.deepEqual(updates.at(-1), ["idle", "busy"]);
-  models[1].status = "idle";
-  connections.get("second").emit();
-  assert.deepEqual(updates.at(-1), ["idle", "idle"]);
-  models.shift();
-  refresh();
-  assert.deepEqual(updates.at(-1), ["idle"]);
-  assert.equal(connections.get("first").disposed, true);
-  stop();
-  assert.equal(connections.get("second").disposed, true);
-});
-
-test("generated offline client includes the kernel idle monitor", async () => {
+test("generated offline client does not trigger bulk downloads from kernel activity", async () => {
   const directory = mkdtempSync(join(tmpdir(), "datax-offline-client-"));
   try {
     mkdirSync(join(directory, "lab"), { recursive: true });
@@ -2503,9 +2404,8 @@ test("generated offline client includes the kernel idle monitor", async () => {
     offline.prepareOffline(directory);
     const client = join(directory, "datax-offline.js");
     const source = readFileSync(client, "utf8");
-    assert.match(source, /function createKernelIdleScheduler/);
-    assert.match(source, /function monitorKernelActivity/);
     assert.match(source, /function offlineStatusText/);
+    assert.doesNotMatch(source, /createKernelIdleScheduler|monitorKernelActivity|navigator\.connection|automatic offline download/);
     const result = spawnSync(process.execPath, ["--check", client], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
     const elements = [];
@@ -2540,10 +2440,7 @@ test("generated offline client includes the kernel idle monitor", async () => {
     const context = vm.createContext({
       document,
       navigator: { onLine: true, serviceWorker },
-      window: {
-        jupyterapp: { serviceManager: { kernels: { running: () => [] } } },
-        addEventListener() {},
-      },
+      window: { addEventListener() {} },
       MutationObserver: class { observe() {} disconnect() {} },
       MessageChannel: class {
         constructor() {

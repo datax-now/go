@@ -21,22 +21,32 @@ body {
   z-index: 10000;
   transform: translate3d(0, 0, 0);
   display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  max-width: min(480px, calc(100vw - var(--datax-safe-left) - var(--datax-safe-right) - 16px));
+  flex-direction: column;
+  gap: 12px;
+  width: 360px;
+  max-width: calc(100vw - var(--datax-safe-left) - var(--datax-safe-right) - 16px);
+  max-height: calc(100dvh - var(--datax-safe-top) - var(--datax-safe-bottom) - 16px);
+  overflow: auto;
   box-sizing: border-box;
-  padding: 8px;
+  padding: 16px;
   border: 1px solid var(--jp-border-color1, #999);
-  border-radius: 4px;
+  border-radius: 12px;
+  box-shadow: 0 6px 24px rgb(0 0 0 / 16%);
   color: var(--jp-ui-font-color1, #222);
   background: var(--jp-layout-color1, #fff);
   font: 13px/1.5 var(--jp-ui-font-family, sans-serif);
 }
 
 #datax-pwa-control[hidden],
-#datax-pwa-control button[hidden] {
+#datax-pwa-control [hidden],
+#datax-pwa-control > [role="status"]:empty {
   display: none;
+}
+
+#datax-pwa-control .datax-pwa-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 #datax-pwa-control button,
@@ -47,12 +57,12 @@ body {
 }
 
 #datax-pwa-control button {
-  padding: 8px;
+  padding: 8px 12px;
   cursor: pointer;
   color: inherit;
   background: var(--jp-layout-color2, #eee);
   border: 1px solid var(--jp-border-color1, #999);
-  border-radius: 4px;
+  border-radius: 6px;
   font: inherit;
 }
 
@@ -64,6 +74,20 @@ body {
 
 #datax-pwa-control button:hover {
   background: var(--jp-layout-color3, #ddd);
+}
+
+#datax-pwa-control button:last-child {
+  background: transparent;
+  border-color: transparent;
+}
+
+#datax-pwa-control button:last-child:hover {
+  background: var(--jp-layout-color2, #eee);
+}
+
+#datax-pwa-control button:disabled {
+  cursor: wait;
+  opacity: 0.65;
 }
 
 @media (min-width: 601px) {

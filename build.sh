@@ -1494,8 +1494,8 @@ done
 
 # Validate notebook fallback settings against the published JupyterLite
 # contents layout before building. build.sh serves notebooks/ at the root,
-# so values like "00_agent_features.ipynb" are valid while
-# "notebooks/00_agent_features.ipynb" are not.
+# so values like "examples/00_agent_features.ipynb" are valid while
+# "notebooks/examples/00_agent_features.ipynb" are not.
 python3 "$PWD/scripts/verify-startup-notebook.py"
 
 JUPYTER_LITE_BUILD_ARGS=(
@@ -1663,95 +1663,94 @@ for target_path in app_target_paths:
 print(f"  ✓ Restored runtime config in {patched} jupyter-lite.json file(s)")
 EOFPATCH
 
-# Work around intermittent jupyter_server schema resolution issues when the
-# data/ folder is indexed via the ContentsAddon. We copy it in after build.
-if [ -d "$PWD/notebooks/data" ]; then
-  mkdir -p "$PWD/dist/files/data"
-  cp -a "$PWD/notebooks/data/." "$PWD/dist/files/data/"
-  # Update the contents index so the file browser can see the data/ folder.
-  # JupyterLite needs:
-  #   - root all.json: contains only direct children (the data/ directory entry)
-  #   - api/contents/data/all.json: the per-directory listing for data/
-  mamba_run_deploy python3 - <<'PYEOF'
+# Work around intermittent jupyter_server schema resolution issues when data/
+# folders are indexed via the ContentsAddon. Every notebooks/**/data folder is
+# copied into dist/files and registered in its parent directory's contents index
+# (e.g. notebooks/examples/data -> examples/data), so the file browser lists it.
+mamba_run_deploy python3 - <<'PYEOF'
 import json
-from datetime import datetime, timezone
 import os
+import posixpath
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
-data_dir = Path("dist/files/data")
-root_all_json = Path("dist/api/contents/all.json")
-data_all_json = Path("dist/api/contents/data/all.json")
+notebooks_root = Path("notebooks")
+contents_root = Path("dist/api/contents")
 now = datetime.fromtimestamp(int(os.environ["SOURCE_DATE_EPOCH"]), timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
-# Fix root all.json: keep only direct children (no '/' in path)
-with open(root_all_json) as f:
-    root = json.load(f)
+for source_dir in sorted(p for p in notebooks_root.rglob("data") if p.is_dir()):
+    rel = source_dir.relative_to(notebooks_root).as_posix()
+    parent = posixpath.dirname(rel)
+    files_dir = Path("dist/files") / rel
+    shutil.copytree(source_dir, files_dir, dirs_exist_ok=True)
 
-root["content"] = [e for e in root["content"] if "/" not in e["path"]]
-
-# Ensure the data directory entry exists at root
-if not any(e["path"] == "data" for e in root["content"]):
-    root["content"].append({
-        "content": None,
-        "created": now,
-        "format": None,
-        "hash": None,
-        "hash_algorithm": None,
-        "last_modified": now,
-        "mimetype": None,
-        "name": "data",
-        "path": "data",
-        "size": None,
-        "type": "directory",
-        "writable": True,
-    })
-
-with open(root_all_json, "w") as f:
-    json.dump(root, f, indent=1)
-print(f"  Root all.json: {len(root['content'])} entries")
-
-# Create api/contents/data/all.json with the data files
-data_files = []
-for fp in sorted(data_dir.iterdir()):
-    if fp.is_file():
-        stat = fp.stat()
-        mimetype = "text/plain" if fp.suffix in (".txt", ".csv", ".tsv", ".data") else None
-        data_files.append({
+    # Parent listing: keep direct children only and make sure the data/ directory entry exists.
+    parent_all_json = contents_root / parent / "all.json"
+    with open(parent_all_json) as f:
+        parent_listing = json.load(f)
+    parent_listing["content"] = [e for e in parent_listing["content"] if posixpath.dirname(e["path"]) == parent]
+    if not any(e["path"] == rel for e in parent_listing["content"]):
+        parent_listing["content"].append({
             "content": None,
             "created": now,
             "format": None,
             "hash": None,
             "hash_algorithm": None,
             "last_modified": now,
-            "mimetype": mimetype,
-            "name": fp.name,
-            "path": f"data/{fp.name}",
-            "size": stat.st_size,
-            "type": "file",
+            "mimetype": None,
+            "name": posixpath.basename(rel),
+            "path": rel,
+            "size": None,
+            "type": "directory",
             "writable": True,
         })
+    with open(parent_all_json, "w") as f:
+        json.dump(parent_listing, f, indent=1)
+    print(f"  {parent or '/'} all.json: {len(parent_listing['content'])} entries")
 
-data_listing = {
-    "content": data_files,
-    "created": now,
-    "format": "json",
-    "hash": None,
-    "hash_algorithm": None,
-    "last_modified": now,
-    "mimetype": None,
-    "name": "data",
-    "path": "data",
-    "size": None,
-    "type": "directory",
-    "writable": True,
-}
+    # Per-directory listing for the data folder itself.
+    data_files = []
+    for fp in sorted(files_dir.iterdir()):
+        if fp.is_file():
+            stat = fp.stat()
+            mimetype = "text/plain" if fp.suffix in (".txt", ".csv", ".tsv", ".data") else None
+            data_files.append({
+                "content": None,
+                "created": now,
+                "format": None,
+                "hash": None,
+                "hash_algorithm": None,
+                "last_modified": now,
+                "mimetype": mimetype,
+                "name": fp.name,
+                "path": f"{rel}/{fp.name}",
+                "size": stat.st_size,
+                "type": "file",
+                "writable": True,
+            })
 
-data_all_json.parent.mkdir(parents=True, exist_ok=True)
-with open(data_all_json, "w") as f:
-    json.dump(data_listing, f, indent=1)
-print(f"  data/all.json: {len(data_files)} file entries")
+    data_listing = {
+        "content": data_files,
+        "created": now,
+        "format": "json",
+        "hash": None,
+        "hash_algorithm": None,
+        "last_modified": now,
+        "mimetype": None,
+        "name": posixpath.basename(rel),
+        "path": rel,
+        "size": None,
+        "type": "directory",
+        "writable": True,
+    }
+
+    data_all_json = contents_root / rel / "all.json"
+    data_all_json.parent.mkdir(parents=True, exist_ok=True)
+    with open(data_all_json, "w") as f:
+        json.dump(data_listing, f, indent=1)
+    print(f"  {rel}/all.json: {len(data_files)} file entries")
 PYEOF
-fi
 
 # Ensure kernels.json exists (fallback if XeusAddon produced it in a temp dir
 # but the copy task didn't land it in the expected location)

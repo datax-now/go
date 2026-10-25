@@ -260,126 +260,13 @@ function installUpdateLifecycle() {
   });
 }
 
-// Browser timers throw "Illegal invocation" when called as methods of another object.
-function createKernelIdleScheduler(onIdle, delayMs = 300000, now = () => Date.now(),
-  timerApi = { setTimeout: (callback, delay) => setTimeout(callback, delay), clearTimeout: id => clearTimeout(id) }) {
-  let idleSince = null;
-  let timer = null;
-  let attempted = false;
-  let statuses = null;
-  let canStart = false;
-  function clearTimer() {
-    if (timer !== null) timerApi.clearTimeout(timer);
-    timer = null;
-  }
-  function evaluate() {
-    clearTimer();
-    if (statuses === null || statuses.some(status => status !== 'idle')) {
-      idleSince = null;
-      attempted = false;
-      return;
-    }
-    if (idleSince === null) idleSince = now();
-    if (!canStart || attempted) return;
-    const remaining = delayMs - (now() - idleSince);
-    if (remaining <= 0) {
-      attempted = true;
-      onIdle();
-      return;
-    }
-    timer = timerApi.setTimeout(() => {
-      timer = null;
-      evaluate();
-    }, remaining);
-  }
-  return {
-    update(nextStatuses, allowed) {
-      statuses = nextStatuses;
-      canStart = allowed;
-      evaluate();
-    },
-    dispose: clearTimer,
-  };
-}
-
-function monitorKernelActivity(onChange, getApp = () => window.jupyterapp,
-  timerApi = { setInterval: (callback, delay) => setInterval(callback, delay), clearInterval: id => clearInterval(id) }) {
-  let manager = null;
-  let models = [];
-  const connections = new Map();
-  function publish() {
-    onChange(models.map(model => connections.get(model.id)?.connection.status ?? 'unknown'));
-  }
-  function clearConnections() {
-    for (const { connection, onStatusChanged } of connections.values()) {
-      connection.statusChanged.disconnect(onStatusChanged);
-      connection.dispose();
-    }
-    connections.clear();
-  }
-  function refresh() {
-    const nextManager = getApp()?.serviceManager?.kernels;
-    if (!nextManager) {
-      manager = null;
-      models = [];
-      clearConnections();
-      onChange(null);
-      return;
-    }
-    if (manager !== nextManager) {
-      clearConnections();
-      manager = nextManager;
-    }
-    try {
-      models = Array.from(manager.running());
-    } catch {
-      models = [];
-      onChange(null);
-      return;
-    }
-    const ids = new Set(models.map(model => model.id));
-    for (const [id, { connection, onStatusChanged }] of connections) {
-      if (!ids.has(id)) {
-        connection.statusChanged.disconnect(onStatusChanged);
-        connection.dispose();
-        connections.delete(id);
-      }
-    }
-    for (const model of models) {
-      if (connections.has(model.id)) continue;
-      try {
-        const connection = manager.connectTo({ model, handleComms: false });
-        const onStatusChanged = publish;
-        connection.statusChanged.connect(onStatusChanged);
-        connections.set(model.id, { connection, onStatusChanged });
-      } catch {}
-    }
-    publish();
-  }
-  refresh();
-  const interval = timerApi.setInterval(refresh, 1000);
-  return () => {
-    timerApi.clearInterval(interval);
-    clearConnections();
-  };
-}
-
-function offlineStatusText(state, mode, online, controlled = true) {
+function offlineStatusText(state, online, controlled = true) {
   if (!controlled) return 'Offline: waiting for app control';
-  if (state.error) {
-    return mode === 'automatic' ? 'Automatic offline download failed' : 'Offline download incomplete';
-  }
+  if (state.error) return 'Offline download incomplete';
   if (state.checking) return 'Offline: checking cached files';
-  if (state.downloading) {
-    const qualifier = mode === 'automatic' ? ' automatically' : '';
-    return 'Downloading offline' + qualifier + ': ' + state.completed + '/' + state.total;
-  }
-  if (state.ready) return 'Offline ready' + (!online ? ' (disconnected)' : mode === 'automatic' ? ' (automatic)' : '');
+  if (state.downloading) return 'Downloading offline: ' + state.completed + '/' + state.total;
+  if (state.ready) return 'Offline ready' + (!online ? ' (disconnected)' : '');
   return online ? 'Offline: not downloaded' : 'Offline: incomplete';
-}
-
-function allowsAutomaticOfflineDownload(connection) {
-  return !connection?.saveData && !['slow-2g', '2g', '3g'].includes(connection?.effectiveType);
 }
 
 function installOfflineUI() {
@@ -393,7 +280,7 @@ function installOfflineUI() {
   const button = document.createElement('button');
   button.type = 'button';
   button.textContent = 'Download for offline use';
-  button.title = 'Automatically downloads after all kernels stay idle for five minutes.';
+  button.title = 'Downloads the complete offline copy after you confirm its size.';
   button.disabled = true;
   panel.append(label, button);
   const style = document.createElement('style');
@@ -415,21 +302,10 @@ function installOfflineUI() {
   narrow?.addEventListener?.('change', place);
   let current = null;
   let channel = null;
-  let kernelStatuses = null;
-  let downloadMode = null;
-  let lastLoggedProgress = 0;
   let lastLoggedError = null;
-  let completionLogged = false;
   let stallTimer = null;
   let responseTimeout = null;
   let startingDownload = false;
-  function canAutoDownload() {
-    return navigator.onLine && allowsAutomaticOfflineDownload(navigator.connection)
-      && !startingDownload && !!navigator.serviceWorker.controller && !!current
-      && !current.ready && !current.checking && !current.downloading && !current.unavailable;
-  }
-  const idleScheduler = createKernelIdleScheduler(() => startDownload(true));
-  const updateIdleScheduler = () => idleScheduler.update(kernelStatuses, canAutoDownload());
   function request(type) {
     if (!navigator.serviceWorker.controller) {
       if (type === 'datax-offline-status') {
@@ -455,7 +331,6 @@ function installOfflineUI() {
       button.textContent = 'Retry offline check';
       button.disabled = false;
       button.hidden = false;
-      updateIdleScheduler();
       console.error('[DataX.now] ' + error);
     }
     responseTimeout = setTimeout(() => {
@@ -470,9 +345,8 @@ function installOfflineUI() {
       clearTimeout(stallTimer);
       if (state.checking) {
         button.disabled = true;
-        label.textContent = offlineStatusText(state, downloadMode, navigator.onLine);
+        label.textContent = offlineStatusText(state, navigator.onLine);
         panel.title = 'The service worker is checking cached files.';
-        updateIdleScheduler();
         responseTimeout = setTimeout(() => failRequest('Offline cache check did not finish within 60 seconds.'), 60000);
         return;
       }
@@ -480,11 +354,10 @@ function installOfflineUI() {
       stallTimer = state.downloading ? setTimeout(() => request('datax-offline-download'), 60000) : null;
       button.disabled = !!(state.downloading || state.ready || state.unavailable);
       button.hidden = state.ready;
-      updateIdleScheduler();
       if (state.error) {
         label.textContent = state.unavailable
           ? 'Offline cache unavailable'
-          : offlineStatusText(state, downloadMode, navigator.onLine);
+          : offlineStatusText(state, navigator.onLine);
         panel.title = state.error;
         button.textContent = 'Retry offline download';
         if (lastLoggedError !== state.error) {
@@ -492,26 +365,15 @@ function installOfflineUI() {
           lastLoggedError = state.error;
         }
       } else if (state.downloading) {
-        label.textContent = offlineStatusText(state, downloadMode, navigator.onLine);
-        if (downloadMode === 'automatic' && state.total > 0) {
-          const progress = Math.floor(state.completed * 100 / state.total / 10) * 10;
-          if (progress >= 10 && progress > lastLoggedProgress) {
-            console.info('[DataX.now] Automatic offline download ' + progress + '% complete.');
-            lastLoggedProgress = progress;
-          }
-        }
+        label.textContent = offlineStatusText(state, navigator.onLine);
       } else {
         button.textContent = 'Download for offline use';
         panel.title = state.ready
           ? 'The bundled app and runtime are cached. New packages, remote APIs, and AI providers still require a connection. Export important notebooks as a backup.'
           : 'Installing the app does not download its runtime. ' + state.total + ' files; '
             + Math.ceil(state.totalBytes / 1048576)
-            + ' MiB; automatic download after 5 minutes with every kernel idle';
-        label.textContent = offlineStatusText(state, downloadMode, navigator.onLine);
-        if (state.ready && downloadMode === 'automatic' && !completionLogged) {
-          console.info('[DataX.now] Automatic offline download complete. Offline use is ready.');
-          completionLogged = true;
-        }
+            + ' MiB. Select the button to download after confirming the size.';
+        label.textContent = offlineStatusText(state, navigator.onLine);
       }
     };
     requestChannel.port1.onmessageerror = () => {
@@ -519,21 +381,13 @@ function installOfflineUI() {
     };
     navigator.serviceWorker.controller.postMessage({ type }, [requestChannel.port2]);
   }
-  async function startDownload(automatic = false) {
-    if (automatic && !canAutoDownload()) return;
+  async function startDownload() {
     if (startingDownload || current?.downloading) return;
     const remaining = Math.ceil(((current?.totalBytes ?? 0) - (current?.bytes ?? 0)) / 1048576);
-    if (!automatic && !confirm('Download ' + remaining + ' MiB for offline use on this device?')) return;
+    if (!confirm('Download ' + remaining + ' MiB for offline use on this device?')) return;
     startingDownload = true;
     button.disabled = true;
-    downloadMode = automatic ? 'automatic' : 'manual';
-    lastLoggedProgress = 0;
     lastLoggedError = null;
-    completionLogged = false;
-    if (automatic) {
-      label.textContent = 'Starting automatic offline download';
-      console.info('[DataX.now] Starting automatic offline download after five minutes with all kernels idle.');
-    }
     try {
       let estimate;
       try { estimate = await navigator.storage?.estimate?.(); }
@@ -556,7 +410,6 @@ function installOfflineUI() {
       request('datax-offline-download');
     } finally {
       startingDownload = false;
-      updateIdleScheduler();
     }
   }
   button.addEventListener('click', () => {
@@ -569,28 +422,16 @@ function installOfflineUI() {
   });
   navigator.serviceWorker.addEventListener('controllerchange', () => {
     request(current?.downloading ? 'datax-offline-download' : 'datax-offline-status');
-    updateIdleScheduler();
   });
   window.addEventListener('online', () => {
     if (!current?.downloading) request('datax-offline-status');
-    updateIdleScheduler();
   });
   window.addEventListener('offline', () => { if (!current?.downloading) request('datax-offline-status'); });
-  navigator.connection?.addEventListener('change', updateIdleScheduler);
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') {
-      request(current?.downloading ? 'datax-offline-download' : 'datax-offline-status');
-      updateIdleScheduler();
-    }
-  });
-  const stopKernelMonitor = monitorKernelActivity(statuses => {
-    kernelStatuses = statuses;
-    updateIdleScheduler();
+    if (document.visibilityState === 'visible') request(current?.downloading ? 'datax-offline-download' : 'datax-offline-status');
   });
   window.addEventListener('pagehide', event => {
     if (event.persisted) return;
-    stopKernelMonitor();
-    idleScheduler.dispose();
     clearTimeout(stallTimer);
     clearTimeout(responseTimeout);
     channel?.port1.close();
@@ -741,7 +582,7 @@ function prepareOffline(directory, sourceDateEpoch = process.env.SOURCE_DATE_EPO
   const heartbeat = 'fetch("/api/service-worker-heartbeat")';
   const localHeartbeat = 'fetch(typeof document==="undefined"?"/api/service-worker-heartbeat":new URL("api/service-worker-heartbeat",new URL(JSON.parse(document.getElementById("jupyter-config-data").textContent).baseUrl||"../",document.baseURI)).href)';
   const client = 'datax-offline.js';
-  fs.writeFileSync(path.join(directory, client), `${createKernelIdleScheduler.toString()}\n${monitorKernelActivity.toString()}\n${offlineStatusText.toString()}\n${allowsAutomaticOfflineDownload.toString()}\n(${installOfflineUI.toString()})();\n`);
+  fs.writeFileSync(path.join(directory, client), `${offlineStatusText.toString()}\n(${installOfflineUI.toString()})();\n`);
   function patchJavaScript(folder) {
     for (const entry of fs.readdirSync(folder, { withFileTypes: true })) {
       const filename = path.join(folder, entry.name);
@@ -800,4 +641,4 @@ function prepareOffline(directory, sourceDateEpoch = process.env.SOURCE_DATE_EPO
   return assets;
 }
 
-module.exports = { allowsAutomaticOfflineDownload, createKernelIdleScheduler, installOfflineCache, installOfflineUI, installUpdateLifecycle, monitorKernelActivity, offlineStatusText, patchContentsManager, patchServiceWorkerManager, patchSessionClient, prepareOffline };
+module.exports = { installOfflineCache, installOfflineUI, installUpdateLifecycle, offlineStatusText, patchContentsManager, patchServiceWorkerManager, patchSessionClient, prepareOffline };

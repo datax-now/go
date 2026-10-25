@@ -14,7 +14,7 @@
     "saveState": true
   },
   "datax-now-front:plugin": {
-    "startupNotebook": "00_agent_features.ipynb"
+    "startupNotebook": "examples/00_agent_features.ipynb"
   },
   "@jupyterlite/ai:settings-model": {
     "useSecretsManager": false,

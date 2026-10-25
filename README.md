@@ -140,10 +140,12 @@ URL, shortcuts, icons, screenshots, file handlers, and scope stay relative to th
 the lab directly. The manifest allows either orientation and prefers standalone
 display with a minimal-UI fallback. Notebook storage remains separate on each origin.
 
-Browsers that emit `beforeinstallprompt` get an **Install app** button; no
-installation dialog is opened automatically. On iOS, the UI explains Safari's
-**Share > Add to Home Screen** workflow instead. Installation does not guarantee
-that the complete application or kernel is cached.
+Installation uses the browser's own install controls and confirmation dialog;
+there is no custom installation card or button. The app does not intercept
+`beforeinstallprompt`, leaving native installation UI to the browser. On iOS,
+use Safari's **Share > Add to Home Screen** workflow. Installation does not
+guarantee that the complete application or kernel is cached. The in-app
+notification panel remains available for updates and notebook file-launch results.
 
 On Chromium desktop browsers, the installed app is registered as a handler for
 `.ipynb` files. A notebook opened from the operating system is validated,
@@ -154,9 +156,8 @@ changes outside the browser. No `launch_handler` is set, so manifest shortcuts
 still open their own window.
 
 The build copies `exposeAppInBrowser` into JupyterLite's `jupyter-config-data`,
-which is the only place JupyterLite reads it. File launches and the automatic
-offline download after five idle kernel minutes both depend on the resulting
-`window.jupyterapp`.
+which is the only place JupyterLite reads it. File launches depend on the
+resulting `window.jupyterapp`.
 
 A small, versioned offline explanation page and its icon are cached during
 service-worker installation. They provide a fallback when a navigation cannot
@@ -350,12 +351,11 @@ again. PWA installation alone does not guarantee offline availability.
 ### Offline use
 
 While online, open the app and select **Download for offline use** in the status
-bar, or leave all running kernels idle for five minutes to start the download
-automatically. Manual downloads ask you to confirm the download size. Wait for
-**Offline ready** before disconnecting. The status bar identifies automatic
-downloads and reports their progress or failure; the browser console logs when
-they start, reach progress milestones, complete, or fail. If the service worker
-does not control the page yet, the status bar reports that while waiting.
+bar to start a download. You must confirm the download size; downloads do not
+start automatically when kernels are idle. Wait for **Offline ready** before
+disconnecting. The status bar reports download progress or failure. If the
+service worker does not control the page yet, the status bar reports that while
+waiting.
 The worker acknowledges offline requests before scanning Cache Storage, so a
 slow cache check is not mistaken for an unresponsive worker. Cache checks show
 **Offline: checking cached files** and have a 60-second deadline. If the worker
@@ -367,13 +367,12 @@ notebooks and data, and the WebAssembly kernel packages. The installed PWA can
 then reopen, start a fresh kernel, run Python, and access locally saved
 notebooks without an internet connection.
 App navigation remains available when notebook query parameters change.
-The idle monitor's kernel connections do not handle widget comms, leaving
-comm ownership with notebook connections even when monitoring starts first.
 
-Where the Network Information API is available, automatic downloads are paused
-on data-saver and slow (`slow-2g`, `2g`, or `3g`) connections; manual downloads
-remain available. Before starting, the app checks the storage estimate when
-supported and reports insufficient space without deleting saved notebooks.
+The browser does not consistently expose whether a connection is Wi-Fi or
+mobile data, so the full offline download is only started after you explicitly
+select the button and confirm its size. Before starting, the app checks the
+storage estimate when supported and reports insufficient space without
+deleting saved notebooks.
 Persistent-storage failures or declined requests are logged with a reminder to
 export important notebooks. Returning to the foreground refreshes the offline
 check or resumes an interrupted download. Storage estimates are advisory:

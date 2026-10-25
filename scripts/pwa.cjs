@@ -95,13 +95,9 @@ function installPwaNavigation(fallbackAssets, contentSecurityPolicy, permissions
 function installPwaUI() {
   const panel = document.createElement('aside');
   panel.id = 'datax-pwa-control';
-  panel.setAttribute('aria-label', 'App installation and updates');
+  panel.setAttribute('aria-label', 'App updates and notifications');
   const status = document.createElement('span');
   status.setAttribute('role', 'status');
-  const install = document.createElement('button');
-  install.type = 'button';
-  install.textContent = 'Install app';
-  install.hidden = true;
   const update = document.createElement('button');
   update.type = 'button';
   update.textContent = 'Save work and update';
@@ -111,11 +107,12 @@ function installPwaUI() {
   dismiss.textContent = 'Dismiss';
   dismiss.setAttribute('aria-label', 'Dismiss app notification');
   dismiss.addEventListener('click', () => { panel.hidden = true; });
+  const actions = document.createElement('div');
+  actions.className = 'datax-pwa-actions';
+  actions.append(update, dismiss);
   panel.hidden = true;
-  panel.append(status, install, update, dismiss);
+  panel.append(status, actions);
   document.body.append(panel);
-  let prompt = null;
-  let installing = false;
   let updating = false;
   let registration = null;
   let reloadOnChange = false;
@@ -123,44 +120,9 @@ function installPwaUI() {
   let lastUpdateCheck = 0;
   const watchedWorkers = new WeakSet();
   const reloadKey = 'datax-sw-update-reload';
-  const render = () => { panel.hidden = install.hidden && update.hidden && !status.textContent; };
-  window.addEventListener('beforeinstallprompt', event => {
-    event.preventDefault();
-    prompt = event;
-    install.hidden = false;
-    render();
-  });
-  window.addEventListener('appinstalled', () => {
-    prompt = null;
-    install.hidden = true;
-    status.textContent = update.hidden ? '' : status.textContent;
-    render();
-  });
-  install.addEventListener('click', async () => {
-    if (!prompt || installing) return;
-    installing = true;
-    install.disabled = true;
-    const current = prompt;
-    try {
-      await current.prompt();
-      await current.userChoice;
-      prompt = null;
-      install.hidden = true;
-    } catch (error) {
-      status.textContent = 'Installation failed. Try again.';
-      console.error('[DataX.now] Could not show the installation prompt.', error);
-    } finally {
-      installing = false;
-      install.disabled = false;
-      render();
-    }
-  });
-  const standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone;
-  if (!standalone && (/iPad|iPhone|iPod/.test(navigator.userAgent) ||
-      (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1))) {
-    status.textContent = 'Install with Safari: Share, then Add to Home Screen.';
-    render();
-  }
+  const render = () => {
+    panel.hidden = update.hidden && !status.textContent;
+  };
   const report = message => { status.textContent = message; render(); };
   const openLaunchedFiles = async files => {
     let app = window.jupyterapp;

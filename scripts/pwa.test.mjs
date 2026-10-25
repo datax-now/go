@@ -179,7 +179,8 @@ function uiHarness({ userAgent = 'Chrome', standalone = false, reply = { activat
   initialWaiting = true, updateImpl = async () => {}, windowExtras = {} } = {}) {
   const elements = [];
   const element = tag => {
-    const value = { ...emitter(), tag, children: [], setAttribute() {},
+    const value = { ...emitter(), tag, children: [], attributes: {},
+      setAttribute(name, value) { this.attributes[name] = value; },
       append(...children) { this.children.push(...children); } };
     elements.push(value);
     return value;
@@ -223,40 +224,53 @@ function uiHarness({ userAgent = 'Chrome', standalone = false, reply = { activat
     setTimeout, clearTimeout, console: { error: (...args) => errors.push(args), warn: (...args) => warnings.push(args) },
   });
   vm.runInContext(`(${pwa.installPwaUI.toString()})();`, context);
-  const [panel, status, install, update] = elements;
-  return { panel, status, install, update, window, document, navigator, worker, registration, waiting, values, errors, warnings,
+  const [panel, status, update, dismiss, actions] = elements;
+  return { panel, status, update, dismiss, actions,
+    window, document, navigator, worker, registration, waiting, values, errors, warnings,
     advance: milliseconds => { now += milliseconds; },
     get updateChecks() { return updateChecks; },
     get messages() { return messages; }, get reloads() { return reloads; } };
 }
 
-test('installation UI is user-initiated and guards repeated clicks', async () => {
+test('installation is left to the browser without a custom prompt on desktop or iOS', async () => {
+  for (const options of [{}, { userAgent: 'iPhone' }, { userAgent: 'iPhone', standalone: true }]) {
+    const ui = uiHarness({ ...options, initialWaiting: false });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(ui.panel.hidden, true);
+    assert.equal(ui.status.textContent || '', '');
+    assert.deepEqual(ui.panel.children, [ui.status, ui.actions]);
+    assert.deepEqual(ui.actions.children, [ui.update, ui.dismiss], 'no custom installation button');
+    let prevented = false;
+    let prompts = 0;
+    ui.window.emit('beforeinstallprompt', {
+      preventDefault() { prevented = true; },
+      async prompt() { prompts++; },
+    });
+    assert.equal(prevented, false, 'native browser installation UI is not suppressed');
+    assert.equal(prompts, 0, 'the app does not trigger an installation dialog');
+    assert.equal(ui.panel.hidden, true);
+    ui.window.emit('appinstalled');
+    assert.equal(ui.panel.hidden, true);
+  }
+});
+
+test('browser installation events do not interrupt update notifications', async () => {
   const ui = uiHarness({ initialWaiting: false });
-  assert.equal(ui.panel.hidden, true);
-  let prompts = 0;
-  let accept;
-  let prevented = false;
-  ui.window.emit('beforeinstallprompt', {
-    preventDefault() { prevented = true; },
-    async prompt() { prompts++; await new Promise(resolve => { accept = resolve; }); },
-    userChoice: Promise.resolve({ outcome: 'accepted' }),
-  });
-  assert.equal(prevented, true);
-  assert.equal(ui.install.hidden, false);
-  assert.equal(prompts, 0, 'no automatic browser prompt');
-  const clicked = ui.install.emitAsync('click');
-  await ui.install.emitAsync('click');
-  assert.equal(prompts, 1);
-  accept();
-  await clicked;
+  await new Promise(resolve => setImmediate(resolve));
+  ui.registration.waiting = ui.waiting;
+  const next = { ...emitter(), state: 'installed' };
+  ui.registration.installing = next;
+  ui.registration.emit('updatefound');
+  assert.equal(ui.panel.hidden, false);
+  assert.equal(ui.dismiss.textContent, 'Dismiss');
+  assert.equal(ui.dismiss.attributes['aria-label'], 'Dismiss app notification');
+  assert.equal(ui.update.hidden, false);
+  ui.window.emit('beforeinstallprompt');
   ui.window.emit('appinstalled');
-  assert.equal(ui.panel.hidden, true);
-  const ios = uiHarness({ userAgent: 'iPhone', initialWaiting: false });
-  assert.match(ios.status.textContent, /Share, then Add to Home Screen/);
-  ios.panel.children[3].emit('click');
-  assert.equal(ios.panel.hidden, true, 'install guidance can be dismissed without blocking the app');
-  const installed = uiHarness({ userAgent: 'iPhone', standalone: true, initialWaiting: false });
-  assert.equal(installed.panel.hidden, true);
+  assert.equal(ui.panel.hidden, false);
+  assert.match(ui.status.textContent, /Save notebooks before updating/);
+  ui.dismiss.emit('click');
+  assert.equal(ui.panel.hidden, true, 'update notifications can still be dismissed');
 });
 
 test('notebooks launched from the operating system open as unique browser copies once the app is ready', async () => {
@@ -564,15 +578,6 @@ test('full offline download stores assets already cached by the PWA fallback', a
   }
 });
 
-test('automatic offline downloads respect slow and data-saver connections', () => {
-  for (const connection of [undefined, {}, { effectiveType: '4g', saveData: false }]) {
-    assert.equal(offline.allowsAutomaticOfflineDownload(connection), true);
-  }
-  for (const connection of [{ saveData: true }, { effectiveType: '2g' }, { effectiveType: 'slow-2g' }, { effectiveType: '3g' }]) {
-    assert.equal(offline.allowsAutomaticOfflineDownload(connection), false);
-  }
-});
-
 test('offline download checks quota, reports persistence failures, and prevents concurrent starts', async () => {
   for (const enoughStorage of [false, true]) {
     const elements = [];
@@ -610,10 +615,7 @@ test('offline download checks quota, reports persistence failures, and prevents 
       },
       setTimeout, clearTimeout, setInterval: () => 1, clearInterval() {},
     });
-    vm.runInContext(`${offline.createKernelIdleScheduler.toString()}
-      ${offline.monitorKernelActivity.toString()}
-      ${offline.offlineStatusText.toString()}
-      ${offline.allowsAutomaticOfflineDownload.toString()}
+    vm.runInContext(`${offline.offlineStatusText.toString()}
       (${offline.installOfflineUI.toString()})();`, context);
     await new Promise(resolve => setImmediate(resolve));
     const panel = elements.find(element => element.id === 'datax-offline-control');
@@ -664,10 +666,7 @@ test('offline control floats above the status bar on narrow screens and docks in
     },
     setTimeout, clearTimeout, setInterval: () => 1, clearInterval() {},
   });
-  vm.runInContext(`${offline.createKernelIdleScheduler.toString()}
-    ${offline.monitorKernelActivity.toString()}
-    ${offline.offlineStatusText.toString()}
-    ${offline.allowsAutomaticOfflineDownload.toString()}
+  vm.runInContext(`${offline.offlineStatusText.toString()}
     (${offline.installOfflineUI.toString()})();`, context);
   const panel = document.body.children.find(element => element.id === 'datax-offline-control');
   assert.equal(panel.dataset.floating, '');
