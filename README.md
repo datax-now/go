@@ -606,7 +606,8 @@ Vercel serves the same static JupyterLite site using the checked-in
 first restores the verified artifact published for the exact commit, so Vercel
 serves the same bytes as GitHub Pages and Read the Docs and finishes in
 seconds. Production builds wait up to 15 minutes for the GitHub Pages workflow
-to publish it; preview builds do not wait. If no artifact can be obtained
+to publish it, stopping early if that workflow has already failed for the
+commit; preview builds do not wait. If no artifact can be obtained
 (including any download or verification error) it falls back to an independent
 `./build.sh`, within Vercel's build limit. Set `DATAX_ARTIFACT_ONLY=1` to fail
 instead of building, or `DATAX_ARTIFACT_WAIT_SECONDS` to change the wait. It

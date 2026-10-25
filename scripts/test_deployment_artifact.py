@@ -24,6 +24,10 @@ class DeploymentArtifactTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
+        # Keep restore() tests offline; tests that exercise the publish-status check override this.
+        api = patch.object(artifact, "GITHUB_API_BASE", "http://127.0.0.1:9")
+        api.start()
+        self.addCleanup(api.stop)
         self.root = Path(self.temporary.name)
         self.site = self.root / "pages"
         self.site.mkdir()
@@ -150,6 +154,53 @@ class DeploymentArtifactTests(unittest.TestCase):
                 responses[:] = [404]
                 with self.assertRaisesRegex(RuntimeError, "retry the RTD build"):
                     artifact.restore(COMMIT, self.root / "timeout", 0)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_a_failed_pages_publish_stops_waiting_for_the_artifact(self):
+        runs = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path.startswith(f"/actions/runs?head_sha={COMMIT}"):
+                    body = json.dumps({"workflow_runs": runs}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        def run(status, conclusion, run_id=1, path=artifact.PAGES_WORKFLOW_PATH):
+            return {"id": run_id, "path": path, "status": status, "conclusion": conclusion}
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            with patch.object(artifact, "RELEASE_BASE", base), \
+                 patch.object(artifact, "GITHUB_API_BASE", base), \
+                 patch.object(artifact.time, "sleep") as sleep:
+                runs[:] = [run("completed", "failure"), run("completed", "success", 2, ".github/workflows/other.yml")]
+                self.assertTrue(artifact.pages_publish_failed(COMMIT))
+                runs[:] = [run("completed", "failure", 1), run("in_progress", None, 3)]
+                self.assertFalse(artifact.pages_publish_failed(COMMIT))
+                runs[:] = [run("completed", "failure", 1), run("completed", "success", 3)]
+                self.assertFalse(artifact.pages_publish_failed(COMMIT))
+                runs[:] = []
+                self.assertFalse(artifact.pages_publish_failed(COMMIT))
+                runs[:] = [run("completed", "failure")]
+                self.assertEqual(artifact.restore(COMMIT, self.root / "failed", 900, True), 3)
+                with self.assertRaisesRegex(RuntimeError, "GitHub Pages publish failed"):
+                    artifact.restore(COMMIT, self.root / "failed-strict", 900)
+                sleep.assert_not_called()
         finally:
             server.shutdown()
             server.server_close()

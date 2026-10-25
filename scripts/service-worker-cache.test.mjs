@@ -309,7 +309,7 @@ const runtimeConfigPatch = build.split('echo "Restoring custom runtime config in
   .split("python3 << 'EOFPATCH'\n")[1].split("\nEOFPATCH")[0];
 const configStaging = "for lite_file in " + build.split("for lite_file in ")[1]
   .split("# Validate notebook fallback")[0];
-const dataIndexPatch = build.split("mamba_run_deploy python3 - <<'PYEOF'\nimport json\nfrom datetime")[1]
+const dataIndexPatch = build.split("mamba_run_deploy python3 - <<'PYEOF'\nimport json\nimport os\nimport posixpath\nimport shutil\nfrom datetime")[1]
   .split("\nPYEOF")[0];
 const upstream = `const CACHE="precache";let enableCache=!1;
 function onActivate(e){enableCache="true"===new URL(location.href).searchParams.get("enableCache"),e.waitUntil(self.clients.claim())}
@@ -1541,13 +1541,13 @@ test("data directory listings are byte-identical across clean deployments and re
   const listings = [];
   for (const [host, mtime] of [["github", 1000000000], ["rtd", 1700000000]]) {
     const folder = join(directory, host);
-    mkdirSync(join(folder, "dist/files/data"), { recursive: true });
+    mkdirSync(join(folder, "notebooks/data"), { recursive: true });
     mkdirSync(join(folder, "dist/api/contents"), { recursive: true });
-    const file = join(folder, "dist/files/data/titanic.csv");
+    const file = join(folder, "notebooks/data/titanic.csv");
     writeFileSync(file, "PassengerId,Survived\n1,0\n");
     utimesSync(file, mtime, mtime);
     writeFileSync(join(folder, "dist/api/contents/all.json"), '{"content":[]}');
-    const result = spawnSync("python3", ["-c", "import json\nfrom datetime" + dataIndexPatch], {
+    const result = spawnSync("python3", ["-c", "import json\nimport os\nimport posixpath\nimport shutil\nfrom datetime" + dataIndexPatch], {
       cwd: folder, encoding: "utf8", env: { ...process.env, SOURCE_DATE_EPOCH: "1780000000" },
     });
     assert.equal(result.status, 0, result.stderr);

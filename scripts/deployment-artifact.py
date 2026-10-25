@@ -27,6 +27,10 @@ COMMIT_ENVIRONMENT = (
 )
 TRANSIENT_STATUS = (408, 429, 500, 502, 503, 504)
 TRANSIENT_RETRIES = 3
+GITHUB_API_BASE = os.environ.get("DATAX_GITHUB_API", "https://api.github.com/repos/datax-now/go").rstrip("/")
+PAGES_WORKFLOW_PATH = ".github/workflows/deploy-github-pages.yml"
+# Unauthenticated GitHub API calls are rate-limited, so the publish status is checked at most this often.
+PAGES_CHECK_INTERVAL = 60
 NETWORK_ERRORS = (URLError, TimeoutError, ConnectionError, ssl.SSLError, http.client.HTTPException)
 
 
@@ -155,6 +159,24 @@ def download(url: str, archive: Path) -> None:
         raise http.client.IncompleteRead(b"", int(expected) - archive.stat().st_size)
 
 
+def pages_publish_failed(commit: str) -> bool:
+    # The newest run decides, so a manual re-run that is still in progress keeps the build waiting.
+    request = Request(
+        f"{GITHUB_API_BASE}/actions/runs?head_sha={commit}&per_page=100",
+        headers={"User-Agent": "datax-now-deployment-artifact", "Accept": "application/vnd.github+json"},
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            runs = json.load(response).get("workflow_runs", [])
+    except (*NETWORK_ERRORS, ValueError):
+        return False
+    runs = [run for run in runs if run.get("path") == PAGES_WORKFLOW_PATH]
+    if not runs:
+        return False
+    latest = max(runs, key=lambda run: run.get("id", 0))
+    return latest.get("status") == "completed" and latest.get("conclusion") != "success"
+
+
 def restore(
     commit: str, directory: Path, wait_seconds: int, allow_missing: bool = False, force: bool = False,
 ) -> int:
@@ -162,6 +184,7 @@ def restore(
         raise FileExistsError(f"Refusing to replace existing deployment: {directory}")
     url = f"{RELEASE_BASE}/site-{commit}/{ARCHIVE_NAME}"
     deadline = time.monotonic() + wait_seconds
+    next_pages_check = 0.0
     transient = 0
     with tempfile.TemporaryDirectory(prefix="datax-download-") as temporary:
         archive = Path(temporary) / ARCHIVE_NAME
@@ -178,6 +201,19 @@ def restore(
                         raise
                 remaining = deadline - time.monotonic()
                 if missing:
+                    if time.monotonic() >= next_pages_check:
+                        next_pages_check = time.monotonic() + PAGES_CHECK_INTERVAL
+                        if pages_publish_failed(commit):
+                            # The publisher has finished without an artifact, so waiting longer cannot help.
+                            if allow_missing:
+                                print(
+                                    f"GitHub Pages publish failed for {commit}; no artifact will appear",
+                                    file=sys.stderr,
+                                )
+                                return 3
+                            raise RuntimeError(
+                                f"GitHub Pages publish failed for {commit}. Fix the workflow, then retry the build."
+                            ) from error
                     if allow_missing and remaining <= 0:
                         print(f"No published artifact for {commit}", file=sys.stderr)
                         return 3
