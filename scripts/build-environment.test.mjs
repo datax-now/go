@@ -62,7 +62,7 @@ test("metadata timestamp overrides are preserved and invalid overrides fail expl
   assert.match(invalid.stderr, /SOURCE_DATE_EPOCH must be a nonnegative Unix timestamp/);
 });
 
-test("public files are copied outside notebook contents into the deployment root", async t => {
+test("public files are copied to the direct-access root and JupyterLite files route", async t => {
   const directory = mkdtempSync(join(tmpdir(), "datax-public-files-build-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   mkdirSync(join(directory, "public-files/videos"), { recursive: true });
@@ -72,10 +72,12 @@ test("public files are copied outside notebook contents into the deployment root
   const result = spawnSync("python3", ["-c", publicFilesPatch], { cwd: directory, encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(readFileSync(join(directory, "dist/public-files/videos/demo.mp4"), "utf8"), "video bytes");
+  assert.equal(readFileSync(join(directory, "dist/files/public-files/videos/demo.mp4"), "utf8"), "video bytes");
   assert.equal(readFileSync(join(directory, "dist/files/examples/data/notebook-content.txt"), "utf8"), "notebook data");
-  assert.match(result.stdout, /Published 1 files under dist\/public-files\//);
+  assert.match(result.stdout, /Published 1 files under dist\/public-files\/ and dist\/files\/public-files\//);
   const manifest = await createDeploymentManifest(join(directory, "dist"), "a".repeat(40));
   assert.ok(manifest.files["public-files/videos/demo.mp4"], "public files are included in the published deployment inventory");
+  assert.ok(manifest.files["files/public-files/videos/demo.mp4"], "the notebook route duplicate is included in the published deployment inventory");
 
   const collision = spawnSync("python3", ["-c", publicFilesPatch], { cwd: directory, encoding: "utf8" });
   assert.notEqual(collision.status, 0);

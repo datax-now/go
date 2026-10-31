@@ -63,15 +63,20 @@ recover verified configuration files from a mirror when RTD serves a challenge.
 ## Customize the site
 
 - Put notebooks and data files in `notebooks/`.
-- Put downloadable files that should stay outside JupyterLite notebook contents
-  in `public-files/`. The build publishes them under `dist/public-files/`,
-  outside the service-worker cache. For example,
+- Put downloadable files in `public-files/`. The build publishes them under
+  `dist/public-files/` for direct access and duplicates them under
+  `dist/files/public-files/` for notebook `IFrame` cells. Both routes bypass the
+  service-worker cache. For example,
   `public-files/videos/demo.mp4` is available at
-  `https://datax.now/public-files/videos/demo.mp4`. The same relative path works on
-  the other hosts:
+  `https://datax.now/public-files/videos/demo.mp4`. The asset path is the same
+  across hosts, though deployment prefixes differ:
   - GitHub Pages: `https://datax-now.github.io/go/public-files/videos/demo.mp4`
   - Read the Docs: `https://datax-now.readthedocs.io/en/latest/_static/public-files/videos/demo.mp4`
   - Cloudflare Pages: `https://datax-now.pages.dev/public-files/videos/demo.mp4`
+- In notebook `IFrame` cells, use an app-relative URL such as
+  `../public-files/videos/demo.mp4`. JupyterLite resolves it through the
+  `/files/` contents route, which is backed by the duplicate and works on both
+  root-hosted deployments and Read the Docs.
 - Change the first-visit notebook in `jupyter-lite.json` and `overrides.json`.
 - Adjust application settings in `jupyter-lite.json`.
 - Local launcher-link imports are configured by `briefcaseImport` in

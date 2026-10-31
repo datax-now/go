@@ -1836,8 +1836,21 @@ test("direct-access files bypass service-worker caching and browser HTTP cache",
     assert.equal(requests[0].headers.get("Range"), "bytes=0-9");
     assert.equal(cacheOpens, 0, "public assets must not use the service-worker cache");
 
-    let notebookResponse;
     const pending = [];
+    let notebookVideoResponse;
+    await context.onFetch({
+      request: new Request("https://example.com/go/files/public-files/videos/demo.mp4", {
+        headers: { Range: "bytes=0-9" },
+      }),
+      respondWith(response) { notebookVideoResponse = response; },
+      waitUntil(task) { pending.push(task); },
+    });
+    assert.equal(await (await notebookVideoResponse).text(), "video bytes");
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1].cache, "no-store");
+    assert.equal(requests[1].headers.get("Range"), "bytes=0-9");
+    assert.equal(cacheOpens, 0, "the notebook-content alias must also bypass the service-worker cache");
+    let notebookResponse;
     await context.onFetch({
       request: new Request("https://example.com/go/files/examples/data/demo.csv"),
       respondWith(response) { notebookResponse = response; },
@@ -1846,7 +1859,7 @@ test("direct-access files bypass service-worker caching and browser HTTP cache",
     assert.equal(await (await notebookResponse).text(), "video bytes");
     await Promise.all(pending);
     assert.ok(cacheOpens > 0, "JupyterLite's generated files route should retain its cache behavior");
-    assert.notEqual(requests[1].cache, "no-store");
+    assert.notEqual(requests[2].cache, "no-store");
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
