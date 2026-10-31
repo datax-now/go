@@ -2800,6 +2800,12 @@ print("  ✓ Service worker patched: conda .tar.gz URLs now fallback to .tar.bz2
 EOFPATCH
 
 # ==============================================================================
+# Route embedded public-file URLs before navigation and version the cache for the rewritten core bundle.
+# ==============================================================================
+echo "Patching HTML output iframe URLs..."
+node "$REPO_ROOT/scripts/patch-public-file-iframes.mjs" dist/build
+
+# ==============================================================================
 # Version service-worker cache by deployed runtime bundle hashes
 # ==============================================================================
 echo "Patching service worker cache version..."
@@ -2820,7 +2826,8 @@ if not xpython_js.exists():
   raise SystemExit(0)
 
 content = sw_file.read_text()
-digest_input_paths = [xpython_js]
+core_bundles = sorted(Path('dist/build').glob('jlab_core.*.js'))
+digest_input_paths = [xpython_js, *core_bundles]
 if extensions_root.exists():
   digest_input_paths.extend(sorted(extensions_root.glob('*/static/remoteEntry*.js')))
 
@@ -2835,18 +2842,47 @@ digest = hasher.hexdigest()[:12]
 cache_name = f"precache-{digest}"
 
 updated = re.sub(r'const CACHE="precache(?:-[0-9a-f]+)?"', f'const CACHE="{cache_name}"', content, count=1)
-if 'origin!==location.origin)return;' not in updated:
+
+def cross_origin_public_files_handler(event_name: str) -> str:
+  return (
+    f'const requestUrl=new URL({event_name}.request.url);'
+    'if(requestUrl.origin!==location.origin){'
+    'const localPath=requestUrl.hostname==="datax-now.github.io"&&requestUrl.pathname.startsWith("/go/public-files/")?requestUrl.pathname.slice("/go".length):'
+    '(requestUrl.hostname==="datax.now"&&requestUrl.pathname.startsWith("/public-files/")?requestUrl.pathname:null);'
+    'if(localPath){const localUrl=new URL(localPath.slice(1),location.href);localUrl.search=requestUrl.search;'
+    f'const localRequest=new Request(localUrl.href,{{method:{event_name}.request.method,'
+    f'headers:{event_name}.request.headers,credentials:"same-origin",cache:"no-store"}});'
+    f'{event_name}.respondWith(fetch(localRequest).then(response=>{{const headers=new Headers(response.headers);'
+    'headers.set("Cross-Origin-Resource-Policy","cross-origin");'
+    'headers.delete("Content-Encoding");headers.delete("Content-Length");'
+    'return new Response(response.body,{status:response.status,statusText:response.statusText,headers});}));}'
+    'return;}'
+  )
+
+def add_cross_origin_public_files_handler(match: re.Match) -> str:
+  event_name = match.group(2)
+  return (
+    match.group(1) + cross_origin_public_files_handler(event_name) +
+    'const publicFilesPath=new URL("./public-files/",location.href).pathname;'
+    'const notebookPublicFilesPath=new URL("./files/public-files/",location.href).pathname;'
+    'if(requestUrl.pathname.startsWith(publicFilesPath)||requestUrl.pathname.startsWith(notebookPublicFilesPath)){'
+    f'{event_name}.respondWith(fetch(new Request({event_name}.request,{{cache:"no-store"}})));return;'
+    '}'
+  )
+
+old_external_guard = re.compile(
+  r'const requestUrl=new URL\((\w+)\.request\.url\);if\(requestUrl\.origin!==location\.origin\)return;'
+)
+if old_external_guard.search(updated):
+  updated = old_external_guard.sub(
+    lambda match: cross_origin_public_files_handler(match.group(1)),
+    updated,
+    count=1,
+  )
+elif 'if(requestUrl.origin!==location.origin){' not in updated:
   updated, fetch_count = re.subn(
     r'((?:async )?function onFetch\((\w+)\)\s*\{)',
-    lambda match: (
-      f'{match.group(1)}const requestUrl=new URL({match.group(2)}.request.url);'
-      'if(requestUrl.origin!==location.origin)return;'
-      'const publicFilesPath=new URL("./public-files/",location.href).pathname;'
-      'const notebookPublicFilesPath=new URL("./files/public-files/",location.href).pathname;'
-      'if(requestUrl.pathname.startsWith(publicFilesPath)||requestUrl.pathname.startsWith(notebookPublicFilesPath)){'
-      f'{match.group(2)}.respondWith(fetch(new Request({match.group(2)}.request,{{cache:"no-store"}})));return;'
-      '}'
-    ),
+    add_cross_origin_public_files_handler,
     updated,
     count=1,
   )
@@ -2886,7 +2922,10 @@ updated = updated.replace(
   'return response;}'
 )
 required = [
-  'requestUrl.origin!==location.origin)return;',
+  'requestUrl.origin!==location.origin){',
+  'requestUrl.hostname==="datax-now.github.io"&&requestUrl.pathname.startsWith("/go/public-files/")',
+  'requestUrl.hostname==="datax.now"&&requestUrl.pathname.startsWith("/public-files/")',
+  'headers.set("Cross-Origin-Resource-Policy","cross-origin")',
   'const publicFilesPath=new URL("./public-files/",location.href).pathname;',
   'const notebookPublicFilesPath=new URL("./files/public-files/",location.href).pathname;',
   'requestUrl.pathname.startsWith(publicFilesPath)||requestUrl.pathname.startsWith(notebookPublicFilesPath)',

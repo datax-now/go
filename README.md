@@ -73,10 +73,13 @@ recover verified configuration files from a mirror when RTD serves a challenge.
   - GitHub Pages: `https://datax-now.github.io/go/public-files/videos/demo.mp4`
   - Read the Docs: `https://datax-now.readthedocs.io/en/latest/_static/public-files/videos/demo.mp4`
   - Cloudflare Pages: `https://datax-now.pages.dev/public-files/videos/demo.mp4`
-- In notebook `IFrame` cells, use an app-relative URL such as
-  `../public-files/videos/demo.mp4`. JupyterLite resolves it through the
-  `/files/` contents route, which is backed by the duplicate and works on both
-  root-hosted deployments and Read the Docs.
+- In notebook `IFrame` cells that must work on both deployments, use a fully
+  qualified canonical URL such as
+  `https://datax.now/public-files/videos/demo.mp4`. This avoids JupyterLite
+  rewriting relative iframe sources through the `/files/` contents route. The
+  HTML output renderer rewrites supported public-file iframe URLs to the
+  current deployment's same-origin copy before navigation, which works with
+  the app's cross-origin isolation policy.
 - Change the first-visit notebook in `jupyter-lite.json` and `overrides.json`.
 - Adjust application settings in `jupyter-lite.json`.
 - Local launcher-link imports are configured by `briefcaseImport` in

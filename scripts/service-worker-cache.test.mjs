@@ -475,8 +475,14 @@ test("controlled app navigations add COOP and COEP without changing other respon
     const fetchCalls = [];
     let queuedResponses = [];
     const context = vm.createContext({
+      URL,
+      Request,
       Headers,
       Response,
+      location: {
+        href: "https://datax-now.readthedocs.io/en/latest/_static/service-worker.js?enableCache=true",
+        origin: "https://datax-now.readthedocs.io",
+      },
       async fetch(input, options) {
         fetchCalls.push([input, options]);
         return queuedResponses.shift() ?? sourceResponse;
@@ -1799,12 +1805,48 @@ test("range requests bypass both runtime and upstream caches", async () => {
   assert.equal(await response.text(), "part");
 });
 
+test("service-worker precache version changes when the JupyterLab core bundle changes", () => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-core-cache-version-"));
+  try {
+    mkdirSync(join(directory, "dist/xeus/xeus-python-wasm-host"), { recursive: true });
+    mkdirSync(join(directory, "dist/build"), { recursive: true });
+    writeFileSync(join(directory, "dist/xeus/xeus-python-wasm-host/xpython.js"), "runtime");
+    const coreBundle = join(directory, "dist/build/jlab_core.abc123.js");
+    writeFileSync(coreBundle, "core bundle v1");
+    writeFileSync(join(directory, "dist/service-worker.js"), upstream);
+
+    let firstCacheName;
+    for (const coreContents of ["core bundle v1", "core bundle v2"]) {
+      writeFileSync(coreBundle, coreContents);
+      const result = spawnSync("python3", ["-c", patch], { cwd: directory, encoding: "utf8" });
+      assert.equal(result.status, 0, result.stderr);
+      const worker = readFileSync(join(directory, "dist/service-worker.js"), "utf8");
+      const cacheName = worker.match(/const CACHE="(precache-[a-f0-9]+)"/)?.[1];
+      assert.ok(cacheName, "service-worker cache name should be versioned");
+      if (coreContents.endsWith("v1")) firstCacheName = cacheName;
+      else assert.notEqual(cacheName, firstCacheName);
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("direct-access files bypass service-worker caching and browser HTTP cache", async () => {
   const directory = mkdtempSync(join(tmpdir(), "datax-public-files-"));
   try {
     mkdirSync(join(directory, "dist/xeus/xeus-python-wasm-host"), { recursive: true });
     writeFileSync(join(directory, "dist/xeus/xeus-python-wasm-host/xpython.js"), "runtime");
-    writeFileSync(join(directory, "dist/service-worker.js"), upstream);
+    const legacyWorker = upstream.replace(
+      "async function onFetch(event){event.respondWith(maybeFromCache(event))}",
+      'async function onFetch(event){const requestUrl=new URL(event.request.url);if(requestUrl.origin!==location.origin)return;'
+        + 'const publicFilesPath=new URL("./public-files/",location.href).pathname;'
+        + 'const notebookPublicFilesPath=new URL("./files/public-files/",location.href).pathname;'
+        + 'if(requestUrl.pathname.startsWith(publicFilesPath)||requestUrl.pathname.startsWith(notebookPublicFilesPath)){'
+        + 'event.respondWith(fetch(new Request(event.request,{cache:"no-store"})));return;}'
+        + 'event.respondWith(maybeFromCache(event))}',
+    );
+    assert.notEqual(legacyWorker, upstream, "fixture should contain the previous cross-origin bypass");
+    writeFileSync(join(directory, "dist/service-worker.js"), legacyWorker);
     const result = spawnSync("python3", ["-c", patch], { cwd: directory, encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
     const requests = [];
@@ -1819,6 +1861,12 @@ test("direct-access files bypass service-worker caching and browser HTTP cache",
       } },
       async fetch(request) {
         requests.push(request);
+        if (request.headers.has("Range")) {
+          return new Response("video bytes", {
+            status: 206,
+            headers: { "Content-Range": "bytes 0-9/10", "Content-Length": "10" },
+          });
+        }
         return new Response("video bytes");
       },
     });
@@ -1836,6 +1884,30 @@ test("direct-access files bypass service-worker caching and browser HTTP cache",
     assert.equal(requests[0].headers.get("Range"), "bytes=0-9");
     assert.equal(cacheOpens, 0, "public assets must not use the service-worker cache");
 
+    let remoteVideoResponse;
+    await context.onFetch({
+      request: new Request("https://datax-now.github.io/go/public-files/videos/demo.mp4", {
+        headers: { Range: "bytes=0-9" },
+      }),
+      respondWith(response) { remoteVideoResponse = response; },
+    });
+    const githubVideo = await remoteVideoResponse;
+    assert.equal(requests[1].url, "https://example.com/go/public-files/videos/demo.mp4");
+    assert.equal(requests[1].headers.get("Range"), "bytes=0-9");
+    assert.equal(githubVideo.status, 206);
+    assert.equal(githubVideo.headers.get("Cross-Origin-Resource-Policy"), "cross-origin");
+    assert.equal(githubVideo.headers.get("Content-Range"), "bytes 0-9/10");
+    assert.equal(githubVideo.headers.get("Content-Length"), null);
+    assert.equal(await githubVideo.text(), "video bytes");
+
+    await context.onFetch({
+      request: new Request("https://datax.now/public-files/videos/demo.mp4"),
+      respondWith(response) { remoteVideoResponse = response; },
+    });
+    const canonicalVideo = await remoteVideoResponse;
+    assert.equal(requests[2].url, "https://example.com/go/public-files/videos/demo.mp4");
+    assert.equal(canonicalVideo.headers.get("Cross-Origin-Resource-Policy"), "cross-origin");
+
     const pending = [];
     let notebookVideoResponse;
     await context.onFetch({
@@ -1846,9 +1918,9 @@ test("direct-access files bypass service-worker caching and browser HTTP cache",
       waitUntil(task) { pending.push(task); },
     });
     assert.equal(await (await notebookVideoResponse).text(), "video bytes");
-    assert.equal(requests.length, 2);
-    assert.equal(requests[1].cache, "no-store");
-    assert.equal(requests[1].headers.get("Range"), "bytes=0-9");
+    assert.equal(requests.length, 4);
+    assert.equal(requests[3].cache, "no-store");
+    assert.equal(requests[3].headers.get("Range"), "bytes=0-9");
     assert.equal(cacheOpens, 0, "the notebook-content alias must also bypass the service-worker cache");
     let notebookResponse;
     await context.onFetch({
@@ -1857,9 +1929,10 @@ test("direct-access files bypass service-worker caching and browser HTTP cache",
       waitUntil(task) { pending.push(task); },
     });
     assert.equal(await (await notebookResponse).text(), "video bytes");
+    assert.equal(requests.length, 5);
     await Promise.all(pending);
     assert.ok(cacheOpens > 0, "JupyterLite's generated files route should retain its cache behavior");
-    assert.notEqual(requests[2].cache, "no-store");
+    assert.notEqual(requests[4].cache, "no-store");
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -1873,9 +1946,13 @@ test("cross-origin fonts bypass service-worker caching", async () => {
     writeFileSync(join(directory, "dist/service-worker.js"), upstream);
     const result = spawnSync("python3", ["-c", patch], { cwd: directory, encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
+    const patchedWorker = readFileSync(join(directory, "dist/service-worker.js"), "utf8");
     const second = spawnSync("python3", ["-c", patch], { cwd: directory, encoding: "utf8" });
     assert.equal(second.status, 0, second.stderr);
-    assert.equal(readFileSync(join(directory, "dist/service-worker.js"), "utf8").split("origin!==location.origin)return;").length, 2);
+    assert.equal(patchedWorker.split('requestUrl.hostname==="datax-now.github.io"').length, 2);
+    assert.equal(readFileSync(join(directory, "dist/service-worker.js"), "utf8")
+      .split('requestUrl.hostname==="datax-now.github.io"').length, 2,
+    "the cross-origin public-file handler should remain idempotent");
     const context = vm.createContext({
       URL, Request, Response, Headers,
       location: { href: "https://example.com/service-worker.js?enableCache=true", origin: "https://example.com" },
