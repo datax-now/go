@@ -319,6 +319,15 @@ async function openCache(){return await caches.open("precache")}
 async function fromCache(e){let a=await openCache(),t=await a.match(e);return t&&404!==t.status?t:null}
 async function updateCache(request,response){return (await openCache()).put(request,response)}
 async function refetch(e){let a=await fetch(e);return await updateCache(e,a),a}`;
+const legacyPublicFilesWorker = upstream.replace(
+  "async function onFetch(event){event.respondWith(maybeFromCache(event))}",
+  'async function onFetch(event){const requestUrl=new URL(event.request.url);if(requestUrl.origin!==location.origin)return;'
+    + 'const publicFilesPath=new URL("./public-files/",location.href).pathname;'
+    + 'const notebookPublicFilesPath=new URL("./files/public-files/",location.href).pathname;'
+    + 'if(requestUrl.pathname.startsWith(publicFilesPath)||requestUrl.pathname.startsWith(notebookPublicFilesPath)){'
+    + 'event.respondWith(fetch(new Request(event.request,{cache:"no-store"})));return;}'
+    + 'event.respondWith(maybeFromCache(event))}',
+);
 
 test("built app configs preserve service-worker caching from the source config", () => {
   const directory = mkdtempSync(join(tmpdir(), "datax-offline-config-"));
@@ -1831,22 +1840,86 @@ test("service-worker precache version changes when the JupyterLab core bundle ch
   }
 });
 
+test("public-file navigations carry isolation headers so iframe documents load on static hosts", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-public-file-navigation-"));
+  try {
+    mkdirSync(join(directory, "dist/xeus/xeus-python-wasm-host"), { recursive: true });
+    writeFileSync(join(directory, "dist/xeus/xeus-python-wasm-host/xpython.js"), "runtime");
+    writeFileSync(join(directory, "dist/service-worker.js"), legacyPublicFilesWorker);
+    const result = spawnSync("python3", ["-c", patch], { cwd: directory, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    const requests = [];
+    const context = vm.createContext({
+      URL, Request, Response, Headers,
+      location: { href: "https://datax-now.readthedocs.io/en/latest/_static/service-worker.js?enableCache=true", origin: "https://datax-now.readthedocs.io" },
+      self: { clients: { async claim() {} } },
+      caches: { async open() { return { async match() { return null; }, async put() {} }; } },
+      async fetch(request) {
+        requests.push(request);
+        return new Response("video bytes", { headers: { "Content-Type": "video/mp4" } });
+      },
+    });
+    vm.runInContext(readFileSync(join(directory, "dist/service-worker.js"), "utf8"), context);
+
+    async function fetchThroughWorker(mode) {
+      const request = new Request("https://datax-now.readthedocs.io/en/latest/_static/public-files/videos/demo.mp4");
+      Object.defineProperty(request, "mode", { value: mode });
+      let intercepted;
+      await context.onFetch({ request, respondWith(response) { intercepted = response; } });
+      return intercepted;
+    }
+
+    const navigation = await fetchThroughWorker("navigate");
+    assert.equal(navigation.headers.get("Cross-Origin-Embedder-Policy"), "require-corp");
+    assert.equal(navigation.headers.get("Cross-Origin-Opener-Policy"), "same-origin");
+    assert.equal(navigation.headers.get("Cross-Origin-Resource-Policy"), "same-origin");
+    assert.equal(navigation.headers.get("Content-Type"), "video/mp4");
+    assert.equal(await navigation.text(), "video bytes");
+
+    const subresource = await fetchThroughWorker("no-cors");
+    assert.equal(subresource.headers.get("Cross-Origin-Embedder-Policy"), null);
+    assert.equal(await subresource.text(), "video bytes");
+    assert.equal(requests.length, 2);
+    assert.ok(requests.every((request) => request.cache === "no-store"));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("isolation headers patch runs after the public-file cache patch in build order", () => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-sw-build-order-"));
+  try {
+    mkdirSync(join(directory, "dist/xeus/xeus-python-wasm-host"), { recursive: true });
+    writeFileSync(join(directory, "dist/xeus/xeus-python-wasm-host/xpython.js"), "runtime");
+    writeFileSync(
+      join(directory, "dist/service-worker.js"),
+      legacyPublicFilesWorker.replace(
+        "event.respondWith(maybeFromCache(event))}\nasync function maybeFromCache",
+        "let n=maybeFromCache(event);n&&event.respondWith(n)}async function maybeFromCache",
+      ),
+    );
+    for (const script of [patch, isolationHeadersPatch]) {
+      const result = spawnSync("python3", ["-c", script], { cwd: directory, encoding: "utf8" });
+      assert.equal(result.status, 0, result.stderr);
+    }
+    const built = readFileSync(join(directory, "dist/service-worker.js"), "utf8");
+    assert.match(built, /\.then\(async response=>\{/, "isolation wrapper should be installed");
+    assert.match(built, /Cross-Origin-Embedder-Policy/);
+    const rerun = spawnSync("python3", ["-c", isolationHeadersPatch], { cwd: directory, encoding: "utf8" });
+    assert.equal(rerun.status, 0, rerun.stderr);
+    assert.equal(readFileSync(join(directory, "dist/service-worker.js"), "utf8"), built, "patch should be idempotent");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("direct-access files bypass service-worker caching and browser HTTP cache", async () => {
   const directory = mkdtempSync(join(tmpdir(), "datax-public-files-"));
   try {
     mkdirSync(join(directory, "dist/xeus/xeus-python-wasm-host"), { recursive: true });
     writeFileSync(join(directory, "dist/xeus/xeus-python-wasm-host/xpython.js"), "runtime");
-    const legacyWorker = upstream.replace(
-      "async function onFetch(event){event.respondWith(maybeFromCache(event))}",
-      'async function onFetch(event){const requestUrl=new URL(event.request.url);if(requestUrl.origin!==location.origin)return;'
-        + 'const publicFilesPath=new URL("./public-files/",location.href).pathname;'
-        + 'const notebookPublicFilesPath=new URL("./files/public-files/",location.href).pathname;'
-        + 'if(requestUrl.pathname.startsWith(publicFilesPath)||requestUrl.pathname.startsWith(notebookPublicFilesPath)){'
-        + 'event.respondWith(fetch(new Request(event.request,{cache:"no-store"})));return;}'
-        + 'event.respondWith(maybeFromCache(event))}',
-    );
-    assert.notEqual(legacyWorker, upstream, "fixture should contain the previous cross-origin bypass");
-    writeFileSync(join(directory, "dist/service-worker.js"), legacyWorker);
+    assert.notEqual(legacyPublicFilesWorker, upstream, "fixture should contain the previous cross-origin bypass");
+    writeFileSync(join(directory, "dist/service-worker.js"), legacyPublicFilesWorker);
     const result = spawnSync("python3", ["-c", patch], { cwd: directory, encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
     const requests = [];

@@ -79,7 +79,9 @@ recover verified configuration files from a mirror when RTD serves a challenge.
   rewriting relative iframe sources through the `/files/` contents route. The
   HTML output renderer rewrites supported public-file iframe URLs to the
   current deployment's same-origin copy before navigation, which works with
-  the app's cross-origin isolation policy.
+  the app's cross-origin isolation policy. Read the Docs cannot set response
+  headers, so the service worker adds the isolation headers to public-file
+  navigations (such as iframe documents) that do not already include them.
 - Change the first-visit notebook in `jupyter-lite.json` and `overrides.json`.
 - Adjust application settings in `jupyter-lite.json`.
 - Local launcher-link imports are configured by `briefcaseImport` in

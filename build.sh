@@ -2859,6 +2859,17 @@ def cross_origin_public_files_handler(event_name: str) -> str:
     'return;}'
   )
 
+def same_origin_public_files_response(event_name: str) -> str:
+  return (
+    f'{event_name}.respondWith(fetch(new Request({event_name}.request,{{cache:"no-store"}})).then(response=>{{'
+    f'if({event_name}.request.mode!=="navigate"||response.headers.has("Cross-Origin-Embedder-Policy"))return response;'
+    'const headers=new Headers(response.headers);'
+    'headers.set("Cross-Origin-Embedder-Policy","require-corp");'
+    'headers.set("Cross-Origin-Opener-Policy","same-origin");'
+    'headers.set("Cross-Origin-Resource-Policy","same-origin");'
+    'return new Response(response.body,{status:response.status,statusText:response.statusText,headers});}));return;'
+  )
+
 def add_cross_origin_public_files_handler(match: re.Match) -> str:
   event_name = match.group(2)
   return (
@@ -2866,7 +2877,7 @@ def add_cross_origin_public_files_handler(match: re.Match) -> str:
     'const publicFilesPath=new URL("./public-files/",location.href).pathname;'
     'const notebookPublicFilesPath=new URL("./files/public-files/",location.href).pathname;'
     'if(requestUrl.pathname.startsWith(publicFilesPath)||requestUrl.pathname.startsWith(notebookPublicFilesPath)){'
-    f'{event_name}.respondWith(fetch(new Request({event_name}.request,{{cache:"no-store"}})));return;'
+    + same_origin_public_files_response(event_name) +
     '}'
   )
 
@@ -2874,10 +2885,16 @@ old_external_guard = re.compile(
   r'const requestUrl=new URL\((\w+)\.request\.url\);if\(requestUrl\.origin!==location\.origin\)return;'
 )
 if old_external_guard.search(updated):
+  guard_event_name = old_external_guard.search(updated).group(1)
   updated = old_external_guard.sub(
     lambda match: cross_origin_public_files_handler(match.group(1)),
     updated,
     count=1,
+  )
+  updated = updated.replace(
+    f'{guard_event_name}.respondWith(fetch(new Request({guard_event_name}.request,{{cache:"no-store"}})));return;',
+    same_origin_public_files_response(guard_event_name),
+    1,
   )
 elif 'if(requestUrl.origin!==location.origin){' not in updated:
   updated, fetch_count = re.subn(
@@ -2976,13 +2993,15 @@ local_mirror_response = (
   'headers.delete("Content-Encoding");headers.delete("Content-Length");'
   'response=new Response(response.body,{status:response.status,statusText:response.statusText,headers});}'
 )
-if coep_header in content:
+# Only this patch writes the async wrapper, so it marks a worker already patched here. The COEP header
+# alone is not a marker: the public-file navigation branch sets it too.
+isolation_wrapper = '.then(async response=>{'
+if isolation_wrapper in content:
   updated = content
   if local_mirror_response not in updated:
-    wrapper = '.then(async response=>{'
-    if wrapper not in updated:
+    if isolation_wrapper not in updated:
       raise SystemExit("Error: Could not upgrade the service worker mirror response wrapper")
-    updated = updated.replace(wrapper, wrapper + local_mirror_response, 1)
+    updated = updated.replace(isolation_wrapper, isolation_wrapper + local_mirror_response, 1)
   if coop_header not in updated:
     updated = updated.replace(coep_header, coep_header + coop_header, 1)
   if corp_header not in updated:
