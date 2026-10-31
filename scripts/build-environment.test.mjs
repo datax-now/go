@@ -11,6 +11,8 @@ const build = readFileSync(new URL("../build.sh", import.meta.url), "utf8");
 const initialization = build.split("# Pinned dependency versions")[0];
 const liteBuild = build.split('echo "Building JupyterLite..."')[1]
   .split('rm -rf "$PWD/dist/extensions/@jupyterlite/pyodide-kernel-extension"')[0];
+const publicFilesPatch = build.split('echo "Publishing directly accessible files..."')[1]
+  .split("python3 <<'PY'\n")[1].split("\nPY")[0];
 
 test("Vercel initializes build metadata without a Git checkout, ignoring an injected epoch of 0", t => {
   const directory = mkdtempSync(join(tmpdir(), "datax-vercel-build-"));
@@ -58,6 +60,26 @@ test("metadata timestamp overrides are preserved and invalid overrides fail expl
   const invalid = run("not-a-timestamp");
   assert.notEqual(invalid.status, 0);
   assert.match(invalid.stderr, /SOURCE_DATE_EPOCH must be a nonnegative Unix timestamp/);
+});
+
+test("public files are copied outside notebook contents into the deployment root", async t => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-public-files-build-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  mkdirSync(join(directory, "public-files/videos"), { recursive: true });
+  mkdirSync(join(directory, "dist/files/examples/data"), { recursive: true });
+  writeFileSync(join(directory, "public-files/videos/demo.mp4"), "video bytes");
+  writeFileSync(join(directory, "dist/files/examples/data/notebook-content.txt"), "notebook data");
+  const result = spawnSync("python3", ["-c", publicFilesPatch], { cwd: directory, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readFileSync(join(directory, "dist/public-files/videos/demo.mp4"), "utf8"), "video bytes");
+  assert.equal(readFileSync(join(directory, "dist/files/examples/data/notebook-content.txt"), "utf8"), "notebook data");
+  assert.match(result.stdout, /Published 1 files under dist\/public-files\//);
+  const manifest = await createDeploymentManifest(join(directory, "dist"), "a".repeat(40));
+  assert.ok(manifest.files["public-files/videos/demo.mp4"], "public files are included in the published deployment inventory");
+
+  const collision = spawnSync("python3", ["-c", publicFilesPatch], { cwd: directory, encoding: "utf8" });
+  assert.notEqual(collision.status, 0);
+  assert.match(collision.stderr, /public files destination already exists/);
 });
 
 test("JupyterLite does not inherit the metadata epoch, and later normalization still does", () => {

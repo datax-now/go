@@ -1799,6 +1799,59 @@ test("range requests bypass both runtime and upstream caches", async () => {
   assert.equal(await response.text(), "part");
 });
 
+test("direct-access files bypass service-worker caching and browser HTTP cache", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "datax-public-files-"));
+  try {
+    mkdirSync(join(directory, "dist/xeus/xeus-python-wasm-host"), { recursive: true });
+    writeFileSync(join(directory, "dist/xeus/xeus-python-wasm-host/xpython.js"), "runtime");
+    writeFileSync(join(directory, "dist/service-worker.js"), upstream);
+    const result = spawnSync("python3", ["-c", patch], { cwd: directory, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    const requests = [];
+    let cacheOpens = 0;
+    const context = vm.createContext({
+      URL, Request, Response, Headers,
+      location: { href: "https://example.com/go/service-worker.js?enableCache=true", origin: "https://example.com" },
+      self: { clients: { async claim() {} } },
+      caches: { async open() {
+        cacheOpens++;
+        return { async match() { return null; }, async put() {} };
+      } },
+      async fetch(request) {
+        requests.push(request);
+        return new Response("video bytes");
+      },
+    });
+    vm.runInContext(readFileSync(join(directory, "dist/service-worker.js"), "utf8"), context);
+    let responsePromise;
+    await context.onFetch({
+      request: new Request("https://example.com/go/public-files/videos/demo.mp4", {
+        headers: { Range: "bytes=0-9" },
+      }),
+      respondWith(response) { responsePromise = response; },
+    });
+    assert.equal(await (await responsePromise).text(), "video bytes");
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].cache, "no-store");
+    assert.equal(requests[0].headers.get("Range"), "bytes=0-9");
+    assert.equal(cacheOpens, 0, "public assets must not use the service-worker cache");
+
+    let notebookResponse;
+    const pending = [];
+    await context.onFetch({
+      request: new Request("https://example.com/go/files/examples/data/demo.csv"),
+      respondWith(response) { notebookResponse = response; },
+      waitUntil(task) { pending.push(task); },
+    });
+    assert.equal(await (await notebookResponse).text(), "video bytes");
+    await Promise.all(pending);
+    assert.ok(cacheOpens > 0, "JupyterLite's generated files route should retain its cache behavior");
+    assert.notEqual(requests[1].cache, "no-store");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("cross-origin fonts bypass service-worker caching", async () => {
   const directory = mkdtempSync(join(tmpdir(), "datax-external-"));
   try {

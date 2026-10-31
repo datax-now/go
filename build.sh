@@ -2838,7 +2838,13 @@ updated = re.sub(r'const CACHE="precache(?:-[0-9a-f]+)?"', f'const CACHE="{cache
 if 'origin!==location.origin)return;' not in updated:
   updated, fetch_count = re.subn(
     r'((?:async )?function onFetch\((\w+)\)\s*\{)',
-    lambda match: f'{match.group(1)}if(new URL({match.group(2)}.request.url).origin!==location.origin)return;',
+    lambda match: (
+      f'{match.group(1)}const requestUrl=new URL({match.group(2)}.request.url);'
+      'if(requestUrl.origin!==location.origin)return;'
+      'if(requestUrl.pathname.startsWith(new URL("./public-files/",location.href).pathname)){'
+      f'{match.group(2)}.respondWith(fetch(new Request({match.group(2)}.request,{{cache:"no-store"}})));return;'
+      '}'
+    ),
     updated,
     count=1,
   )
@@ -2878,7 +2884,10 @@ updated = updated.replace(
   'return response;}'
 )
 required = [
-  'origin!==location.origin)return;',
+  'requestUrl.origin!==location.origin)return;',
+  'new URL("./public-files/",location.href).pathname',
+  'new Request(',
+  '{cache:"no-store"}',
   'let enableCache="true"===new URL(location.href).searchParams.get("enableCache")',
   'caches.open(CACHE)',
   'caches.keys()',
@@ -3958,6 +3967,29 @@ SAFE_ASM_EXT="$SAFE_ASM_EXT" node "$REPO_ROOT/scripts/patch-wasm-startup.cjs" di
 node "$REPO_ROOT/scripts/pwa.cjs" dist
 DATAX_BUILD_PYTHON="$DEPLOY_PREFIX/bin/python" node "$REPO_ROOT/scripts/fingerprint-runtime.cjs" dist
 node "$REPO_ROOT/scripts/pwa.cjs" verify dist
+
+# Publish direct-access files outside JupyterLite's generated files tree and
+# service-worker offline cache. The service worker sends this route network-only.
+echo "Publishing directly accessible files..."
+python3 <<'PY'
+from pathlib import Path
+import shutil
+
+source = Path("public-files")
+destination = Path("dist/public-files")
+if not source.is_dir():
+    raise SystemExit(f"ERROR: required public files directory not found: {source}")
+if destination.exists():
+    raise SystemExit(f"ERROR: public files destination already exists: {destination}")
+if any(path.is_symlink() for path in source.rglob("*")):
+    raise SystemExit(f"ERROR: public files directory must not contain symlinks: {source}")
+
+file_count = sum(1 for path in source.rglob("*") if path.is_file())
+if not file_count:
+    raise SystemExit(f"ERROR: public files directory contains no files: {source}")
+shutil.copytree(source, destination)
+print(f"  Published {file_count} files under {destination}/")
+PY
 
   # Include the local CORS server for users serving the generated directory.
   cp "$REPO_ROOT/cors_server.py" "dist/cors_server.py"

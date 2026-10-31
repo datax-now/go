@@ -63,6 +63,15 @@ recover verified configuration files from a mirror when RTD serves a challenge.
 ## Customize the site
 
 - Put notebooks and data files in `notebooks/`.
+- Put downloadable files that should stay outside JupyterLite notebook contents
+  in `public-files/`. The build publishes them under `dist/public-files/`,
+  outside the service-worker cache. For example,
+  `public-files/videos/demo.mp4` is available at
+  `https://datax.now/public-files/videos/demo.mp4`. The same relative path works on
+  the other hosts:
+  - GitHub Pages: `https://datax-now.github.io/go/public-files/videos/demo.mp4`
+  - Read the Docs: `https://datax-now.readthedocs.io/en/latest/_static/public-files/videos/demo.mp4`
+  - Cloudflare Pages: `https://datax-now.pages.dev/public-files/videos/demo.mp4`
 - Change the first-visit notebook in `jupyter-lite.json` and `overrides.json`.
 - Adjust application settings in `jupyter-lite.json`.
 - Local launcher-link imports are configured by `briefcaseImport` in
@@ -695,6 +704,7 @@ their existing release assets are no longer needed.
 | `build.sh` | Clean or incremental JupyterLite build |
 | `docs/` | Minimal RTD documentation shell |
 | `notebooks/` | Content published into JupyterLite |
+| `public-files/` | Public assets published separately from notebook contents |
 | `environment-deploy.yml` | Build-time Python and JupyterLite dependencies |
 | `environment-wasm-host.yml` | Browser kernel runtime packages |
 | `built-in-wheels/` | Checked-in Python wheels used by the build |
